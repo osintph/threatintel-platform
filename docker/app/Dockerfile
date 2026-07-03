@@ -38,6 +38,11 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 RUN mkdir -p /app/data
 
+RUN useradd -m -u 1000 appuser \
+    && chown -R appuser:appuser /app
+
+USER appuser
+
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app/src
 
