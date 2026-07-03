@@ -1,5 +1,5 @@
 """Dark Web Scanner — keyword monitoring tool for .onion sites."""
 
-__version__ = "0.1.0"
+__version__ = "1.0.1"
 __author__ = "osintph"
-__license__ = "MIT"
+__license__ = "AGPL-3.0"
