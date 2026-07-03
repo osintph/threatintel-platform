@@ -312,8 +312,36 @@ class Storage:
         Base.metadata.create_all(self.engine)
         logger.info("Database tables ready")
 
-    def get_session(self) -> Session:
-        return self._SessionFactory()
+    @contextmanager
+    def get_session(self):
+        """Context manager that yields a SQLAlchemy Session.
+
+        Inside a Flask request context: yields the request-scoped session
+        stashed in flask.g (creating it on the first call).  The session is
+        NOT closed on exit — close_db() teardown handles that at request end.
+
+        Outside Flask (CLI / tests): yields a brand-new Session that is
+        closed (and rolled back on error) when the ``with`` block exits,
+        preserving the original per-call behaviour.
+        """
+        try:
+            from flask import has_request_context, g
+            if has_request_context():
+                if not hasattr(g, _FLASK_SESSION_KEY):
+                    setattr(g, _FLASK_SESSION_KEY, self._SessionFactory())
+                yield getattr(g, _FLASK_SESSION_KEY)
+                return
+        except ImportError:
+            pass
+        # CLI / non-Flask path: own the session for the duration of the call
+        session = self._SessionFactory()
+        try:
+            yield session
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
     # --- Crawl Sessions ---
 
