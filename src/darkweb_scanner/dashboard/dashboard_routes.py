@@ -624,8 +624,16 @@ def api_crawl_status():
                                for t in __import__("threading").enumerate())
             if not thread_alive:
                 from sqlalchemy import text as _text
+                from datetime import datetime as _dt
                 with storage.get_session() as sess:
-                    sess.execute(_text("UPDATE crawl_sessions SET status='completed', ended_at=datetime('now') WHERE status='running'"))
+                    sess.execute(
+                        _text(
+                            "UPDATE crawl_sessions"
+                            " SET status='completed', ended_at=:now"
+                            " WHERE status='running'"
+                        ),
+                        {"now": _dt.utcnow()},
+                    )
                     sess.commit()
         stats = storage.get_stats()
         active = storage.get_active_session()
