@@ -30,11 +30,13 @@ def create_app() -> Flask:
     from .dashboard_routes import dashboard_bp
     from .channel_monitor_routes import channel_monitor_bp
     from .ransomware_live_routes import rw_live_bp
+    from .storage_helper import close_db
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(dashboard_bp)
     app.register_blueprint(channel_monitor_bp)
     app.register_blueprint(rw_live_bp)
+    app.teardown_appcontext(close_db)
 
     @app.route("/")
     def root():

@@ -6,6 +6,7 @@ Stores crawl results, keyword hits, and crawl session metadata.
 import json
 import logging
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -13,6 +14,10 @@ from sqlalchemy import Boolean, Column, DateTime, Index, Integer, String, Text, 
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 logger = logging.getLogger(__name__)
+
+# Key used to stash the request-scoped session in flask.g.
+# Defined here so storage_helper.py can import it without a circular dep.
+_FLASK_SESSION_KEY = "storage_session"
 
 
 class Base(DeclarativeBase):
