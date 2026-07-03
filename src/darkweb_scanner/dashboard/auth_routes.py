@@ -26,6 +26,13 @@ logger = logging.getLogger(__name__)
 auth_bp = Blueprint("auth", __name__)
 
 
+def _safe_next(next_url: str, default: str) -> str:
+    """Return next_url only when it is a safe same-site path."""
+    if next_url and next_url.startswith("/") and not next_url.startswith("//"):
+        return next_url
+    return default
+
+
 # ── Registration ───────────────────────────────────────────────────────────────
 
 
@@ -111,7 +118,7 @@ def login():
         if getattr(user, "must_change_password", False):
             session["must_change_password"] = True
             return redirect(url_for("auth.force_change_password"))
-        next_url = request.args.get("next") or url_for("dashboard.index")
+        next_url = _safe_next(request.args.get("next", ""), url_for("dashboard.index"))
         return redirect(next_url)
 
     return render_template("login.html", oauth_providers=oauth_providers)
@@ -181,7 +188,7 @@ def totp_verify():
 
         login_user(user.id, user.username)
         storage.update_user_login(user.id)
-        next_url = request.args.get("next") or url_for("dashboard.index")
+        next_url = _safe_next(request.args.get("next", ""), url_for("dashboard.index"))
         return redirect(next_url)
 
     return render_template("totp_verify.html", username=session.get("totp_pending_username"))
