@@ -72,6 +72,12 @@ services:
     networks:
       - scanner_net
     command: ["python", "-m", "darkweb_scanner.dashboard.app"]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   # ── Nginx SSL reverse proxy ─────────────────────────────────────────────────
   nginx:
