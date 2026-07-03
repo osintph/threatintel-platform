@@ -69,6 +69,11 @@ class TorClient:
             with Controller.from_port(port=self.control_port) as controller:
                 try:
                     controller.authenticate()
+                    logger.warning(
+                        "Tor control port %s accepted unauthenticated connection; "
+                        "set HashedControlPassword in torrc to require authentication",
+                        self.control_port,
+                    )
                 except Exception:
                     controller.authenticate(password=self.control_password)
                 controller.signal(Signal.NEWNYM)
