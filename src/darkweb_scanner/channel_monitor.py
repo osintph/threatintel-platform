@@ -66,8 +66,9 @@ def check_disk_space(min_gb: float, path: str = "/") -> None:
     used_pct = (used / total) * 100
     print(f"[i] Disk space — Free: {free_gb:.2f} GB / Total: {total_gb:.2f} GB ({used_pct:.1f}% used)")
     if free_gb < min_gb:
-        print(f"\n[✗] ABORT: Less than {min_gb} GB free ({free_gb:.2f} GB remaining).")
-        exit(1)
+        raise RuntimeError(
+            f"ABORT: Less than {min_gb} GB free ({free_gb:.2f} GB remaining)."
+        )
 
 
 def assert_disk_space(min_gb: float, path: str = "/") -> bool:
