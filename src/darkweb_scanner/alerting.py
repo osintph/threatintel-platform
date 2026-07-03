@@ -3,6 +3,7 @@ Alerting module — sends notifications via webhook (Slack/Discord) or email
 when keyword hits are found.
 """
 
+import html
 import json
 import logging
 import os
@@ -121,18 +122,18 @@ class Alerter:
             text_content = self._format_hit_text(hit)
             html_content = f"""
             <html><body>
-            <h2 style="color:#cc0000;">🚨 Dark Web Keyword Alert</h2>
+            <h2 style="color:#cc0000;">&#x1F6A8; Dark Web Keyword Alert</h2>
             <table style="border-collapse:collapse;width:100%">
                 <tr><td style="font-weight:bold;padding:8px;background:#f5f5f5">Keyword</td>
-                    <td style="padding:8px">{hit.keyword}</td></tr>
+                    <td style="padding:8px">{html.escape(hit.keyword)}</td></tr>
                 <tr><td style="font-weight:bold;padding:8px;background:#f5f5f5">Category</td>
-                    <td style="padding:8px">{hit.category}</td></tr>
+                    <td style="padding:8px">{html.escape(hit.category)}</td></tr>
                 <tr><td style="font-weight:bold;padding:8px;background:#f5f5f5">URL</td>
-                    <td style="padding:8px;word-break:break-all">{hit.url}</td></tr>
+                    <td style="padding:8px;word-break:break-all">{html.escape(hit.url)}</td></tr>
                 <tr><td style="font-weight:bold;padding:8px;background:#f5f5f5">Depth</td>
                     <td style="padding:8px">{hit.depth}</td></tr>
                 <tr><td style="font-weight:bold;padding:8px;background:#f5f5f5">Context</td>
-                    <td style="padding:8px;font-family:monospace;white-space:pre-wrap">{hit.context}</td></tr>
+                    <td style="padding:8px;font-family:monospace;white-space:pre-wrap">{html.escape(hit.context)}</td></tr>
             </table>
             </body></html>
             """
