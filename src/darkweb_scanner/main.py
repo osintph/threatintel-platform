@@ -110,6 +110,7 @@ async def run_scan(
     session_id = storage.create_crawl_session(seeds)
     pages_crawled = 0
     hits_found = 0
+    _final_status = "failed"
 
     try:
         async for page in crawler.crawl(seeds):
@@ -146,14 +147,14 @@ async def run_scan(
             if pages_crawled % 10 == 0:
                 logger.info(f"Progress: {pages_crawled} pages crawled, {hits_found} hits found")
 
+        _final_status = "completed"
     except KeyboardInterrupt:
         logger.info("Scan interrupted by user")
     except Exception as e:
         logger.error(f"Scan error: {e}", exc_info=True)
-        storage.update_crawl_session(session_id, pages_crawled, hits_found, status="failed")
         raise
     finally:
-        storage.update_crawl_session(session_id, pages_crawled, hits_found, status="completed")
+        storage.update_crawl_session(session_id, pages_crawled, hits_found, status=_final_status)
         await tor.close()
 
     logger.info(f"Scan complete. Pages: {pages_crawled} | Hits: {hits_found}")
