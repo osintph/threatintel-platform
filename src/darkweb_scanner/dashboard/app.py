@@ -12,7 +12,15 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 def create_app() -> Flask:
     app = Flask(__name__)
 
-    app.secret_key = os.getenv("DASHBOARD_SECRET_KEY", "change-me-in-production")
+    _secret = os.getenv("DASHBOARD_SECRET_KEY", "")
+    _PLACEHOLDER = "change-me-in-production"
+    if not _secret or _secret == _PLACEHOLDER or _secret == "change-me-to-a-long-random-string":
+        raise RuntimeError(
+            "DASHBOARD_SECRET_KEY is not set or still uses the placeholder value. "
+            "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\" "
+            "and set it in .env before starting the dashboard."
+        )
+    app.secret_key = _secret
     app.permanent_session_lifetime = timedelta(hours=12)
 
     # Trust X-Forwarded-Proto from nginx so url_for generates https:// URLs
