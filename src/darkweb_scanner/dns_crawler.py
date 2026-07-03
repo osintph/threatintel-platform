@@ -10,7 +10,7 @@ import socket
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import requests
@@ -362,7 +362,7 @@ def run_dns_recon(domain: str) -> dict:
     Returns structured result dict suitable for storage and display.
     """
     domain = _clean_domain(domain)
-    started_at = datetime.utcnow().isoformat()
+    started_at = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
     logger.info(f"Starting DNS recon for {domain}")
 
     result = {
@@ -455,7 +455,7 @@ def run_dns_recon(domain: str) -> dict:
         result["services"] = {}
         result["errors"].append(f"Service probe: {e}")
 
-    result["completed_at"] = datetime.utcnow().isoformat()
+    result["completed_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
     result["subdomain_count"] = len(all_subs)
     result["resolved_count"] = len(result["subdomains_resolved"])
 
@@ -767,7 +767,7 @@ def run_port_and_dir_scan(domain: str, ips: list[str]) -> dict:
     """
     result = {
         "domain": domain,
-        "started_at": datetime.utcnow().isoformat(),
+        "started_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         "port_scan": {},
         "dir_enum": {},
         "errors": [],
@@ -787,7 +787,7 @@ def run_port_and_dir_scan(domain: str, ips: list[str]) -> dict:
         except Exception as e:
             result["errors"].append(f"Dir enum {target}: {e}")
 
-    result["completed_at"] = datetime.utcnow().isoformat()
+    result["completed_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
     return result
 
 

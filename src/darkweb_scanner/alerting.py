@@ -9,7 +9,7 @@ import logging
 import os
 import smtplib
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
@@ -61,7 +61,7 @@ class Alerter:
             f"Category: {hit.category}\n"
             f"URL: {hit.url}\n"
             f"Depth: {hit.depth}\n"
-            f"Found at: {datetime.utcnow().isoformat()}Z\n\n"
+            f"Found at: {datetime.now(timezone.utc).replace(tzinfo=None).isoformat()}Z\n\n"
             f"Context:\n{hit.context}"
         )
 
@@ -83,7 +83,7 @@ class Alerter:
                             "short": False,
                         },
                     ],
-                    "ts": int(datetime.utcnow().timestamp()),
+                    "ts": int(datetime.now(timezone.utc).replace(tzinfo=None).timestamp()),
                 }
             ],
         }

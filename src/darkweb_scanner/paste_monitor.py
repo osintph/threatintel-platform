@@ -17,7 +17,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import requests
@@ -278,6 +278,6 @@ def run_paste_monitor(storage, single_run: bool = False) -> dict:
         "scanned": total_scanned,
         "new_pastes": total_new,
         "hits": total_hits,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
     }
 

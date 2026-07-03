@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Blueprint, Response, jsonify, request, session, stream_with_context
@@ -136,7 +136,7 @@ def api_cm_job_download(job_id: str):
         return jsonify({"error": "Output directory not found"}), 404
 
     channel = j["config"].get("channel", "channel").replace("/", "_").replace("@", "")
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M")
+    ts = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y%m%d_%H%M")
     zip_filename = f"channel_monitor_{channel}_{ts}.zip"
 
     files = sorted([f for f in output_dir.rglob("*") if f.is_file()])
@@ -219,7 +219,7 @@ def api_cm_start():
         "status":     "running",
         "config":     config,
         "output_dir": str(output_dir),
-        "started_at": datetime.utcnow().isoformat(),
+        "started_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         "ended_at":   None,
         "log":        [],
         "error":      None,
@@ -240,7 +240,7 @@ def api_cm_start():
             with _jobs_lock:
                 _jobs[job_id]["status"] = "error"
                 _jobs[job_id]["error"] = str(e)
-                _jobs[job_id]["ended_at"] = datetime.utcnow().isoformat()
+                _jobs[job_id]["ended_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
                 _jobs[job_id]["log"].append(f"[✗] Fatal error: {e}")
                 _jobs[job_id]["log"].append(traceback.format_exc())
         finally:
@@ -280,7 +280,7 @@ async def _run_channel_monitor(job_id: str, config: dict, output_dir: Path, cred
         with _jobs_lock:
             _jobs[job_id]["status"] = "error"
             _jobs[job_id]["error"] = str(e)
-            _jobs[job_id]["ended_at"] = datetime.utcnow().isoformat()
+            _jobs[job_id]["ended_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         return
 
     session_file = CHANNEL_MONITOR_DIR / "channel_monitor"
@@ -299,7 +299,7 @@ async def _run_channel_monitor(job_id: str, config: dict, output_dir: Path, cred
         with _jobs_lock:
             _jobs[job_id]["status"] = "error"
             _jobs[job_id]["error"] = str(e)
-            _jobs[job_id]["ended_at"] = datetime.utcnow().isoformat()
+            _jobs[job_id]["ended_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         return
 
     try:
@@ -339,7 +339,7 @@ async def _run_channel_monitor(job_id: str, config: dict, output_dir: Path, cred
     finally:
         builtins.print = _orig_print
         with _jobs_lock:
-            _jobs[job_id]["ended_at"] = datetime.utcnow().isoformat()
+            _jobs[job_id]["ended_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         try:
             await client.disconnect()
         except Exception:

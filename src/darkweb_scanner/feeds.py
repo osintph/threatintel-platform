@@ -6,7 +6,7 @@ API keys are read from environment — never hardcoded.
 
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 import requests
 
@@ -55,7 +55,7 @@ def fetch_otx_pulses(limit: int = 20) -> list[dict]:
     data = _safe_get(
         "https://otx.alienvault.com/api/v1/pulses/subscribed",
         headers=headers,
-        params={"limit": 50, "modified_since": (datetime.utcnow() - timedelta(days=2)).strftime("%Y-%m-%dT00:00:00")},
+        params={"limit": 50, "modified_since": (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=2)).strftime("%Y-%m-%dT00:00:00")},
     )
     if data:
         for p in data.get("results", []):
@@ -132,7 +132,7 @@ def fetch_cisa_kev(days_back: int = 7) -> list[dict]:
     data = _safe_get("https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json")
     if not data:
         return []
-    cutoff = datetime.utcnow() - timedelta(days=days_back)
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days_back)
     results = []
     for v in data.get("vulnerabilities", []):
         try:
@@ -303,5 +303,5 @@ def fetch_all_feeds() -> dict:
         "urlhaus": fetch_urlhaus_recent(limit=8),
         "feodo": fetch_feodo_c2s(limit=8),
         "rss": fetch_rss_items(days_back=1, limit_per_source=4),
-        "fetched_at": datetime.utcnow().isoformat(),
+        "fetched_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
     }

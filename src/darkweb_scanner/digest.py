@@ -6,7 +6,7 @@ API keys loaded from environment only — never hardcoded.
 
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -41,7 +41,7 @@ def add_subscriber(email: str, name: str = "", org: str = "") -> bool:
     SUBSCRIBERS_FILE.write_text("\n".join(existing) + "\n")
     meta_file = DATA_DIR / "digest_subscribers_meta.txt"
     with open(meta_file, "a") as f:
-        f.write(f"{email}\t{name}\t{org}\t{datetime.utcnow().isoformat()}\n")
+        f.write(f"{email}\t{name}\t{org}\t{datetime.now(timezone.utc).replace(tzinfo=None).isoformat()}\n")
     return True
 
 
@@ -62,7 +62,7 @@ def build_digest_pdf(feed_data: dict, scanner_summary: dict = None, date: dateti
     from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
     if date is None:
-        date = datetime.utcnow() + timedelta(hours=8)
+        date = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=8)
 
     date_str = date.strftime("%B %d, %Y")
     date_label = date.strftime("%Y-%m-%d")
@@ -106,7 +106,7 @@ def build_digest_pdf(feed_data: dict, scanner_summary: dict = None, date: dateti
     text_cell = Table(
         [[Paragraph("Daily Threat Intelligence", s_h1)],
          [Paragraph("powered by OSINT PH  ·  osintph.info", s_tagline)],
-         [Paragraph(f"Edition: {date_str} (PHT)  ·  Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", s_meta)]],
+         [Paragraph(f"Edition: {date_str} (PHT)  ·  Generated: {datetime.now(timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M UTC')}", s_meta)]],
         colWidths=[PW - 16 * mm],
     )
     text_cell.setStyle(TableStyle([
@@ -369,7 +369,7 @@ def send_digest(storage, recipients: list = None, date: datetime = None) -> dict
     if not recipients:
         return {"ok": False, "error": "No subscribers configured"}
     if date is None:
-        date = datetime.utcnow() + timedelta(hours=8)
+        date = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=8)
 
     date_str = date.strftime("%B %d, %Y")
     date_label = date.strftime("%Y-%m-%d")

@@ -8,7 +8,7 @@ import ssl
 import urllib.error
 import urllib.request
 import urllib3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Blueprint, Response, jsonify, render_template, request, session
@@ -607,7 +607,7 @@ def api_crawl_start():
 def api_crawl_stop():
     try:
         _ensure_data_dir()
-        STOP_FLAG.write_text(datetime.utcnow().isoformat())
+        STOP_FLAG.write_text(datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
         return jsonify({"ok": True, "message": "Stop signal sent — crawl will halt after current page."})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -632,7 +632,7 @@ def api_crawl_status():
                             " SET status='completed', ended_at=:now"
                             " WHERE status='running'"
                         ),
-                        {"now": _dt.utcnow()},
+                        {"now": _dt.now(timezone.utc).replace(tzinfo=None)},
                     )
                     sess.commit()
         stats = storage.get_stats()
@@ -1003,7 +1003,7 @@ def api_report_pdf():
             wordWrap="CJK",
         )
 
-        generated_at = dt.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        generated_at = dt.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M UTC")
         story = []
 
         # ── Cover header ──
@@ -1138,7 +1138,7 @@ def api_report_pdf():
         doc.build(story, onFirstPage=dark_page, onLaterPages=dark_page)
         buf.seek(0)
 
-        filename = f"threat-intel-report-{dt.utcnow().strftime('%Y%m%d-%H%M')}.pdf"
+        filename = f"threat-intel-report-{dt.now(timezone.utc).replace(tzinfo=None).strftime('%Y%m%d-%H%M')}.pdf"
         return Response(
             buf.read(),
             mimetype="application/pdf",
@@ -1593,7 +1593,7 @@ def api_digest_preview():
         }
         pdf = build_digest_pdf(feed_data, scanner_summary=scanner_summary)
         from datetime import datetime as dt
-        filename = f"digest-preview-{dt.utcnow().strftime('%Y%m%d')}.pdf"
+        filename = f"digest-preview-{dt.now(timezone.utc).replace(tzinfo=None).strftime('%Y%m%d')}.pdf"
         return Response(
             pdf,
             mimetype="application/pdf",
@@ -1853,7 +1853,7 @@ def api_dns_certs(domain: str):
         return jsonify({"error": f"crt.sh returned non-JSON: {preview}"}), 502
 
     from datetime import datetime as dt
-    now = dt.utcnow()
+    now = dt.now(timezone.utc).replace(tzinfo=None)
 
     certs = []
     seen_ids = set()
@@ -2440,7 +2440,7 @@ window._ready = true;
                 [Paragraph(f'<font color="#f85149">OSINT PH  ·  osintph.info</font>',
                             S("tl", fontSize=9, fontName="Helvetica-Bold", textColor=C_RED, leading=13))],
                 [Paragraph(f'Target: <font color="#58a6ff"><b>{domain}</b></font>  ·  '
-                           f'Investigated: {created}  ·  Generated: {dt.utcnow().strftime("%Y-%m-%d %H:%M UTC")}',
+                           f'Investigated: {created}  ·  Generated: {dt.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M UTC")}',
                            S("meta", fontSize=7.5, textColor=C_MUTED, leading=11))],
             ], colWidths=[PW - 20 * mm]),
         ]
@@ -2726,7 +2726,7 @@ window._ready = true;
             )
             if _cr.status_code == 200:
                 from datetime import datetime as _dt
-                _now = _dt.utcnow()
+                _now = _dt.now(timezone.utc).replace(tzinfo=None)
                 _raw = _cr.json()
                 _certs = []
                 _seen = set()
@@ -2991,7 +2991,7 @@ window._ready = true;
     story.append(Spacer(1, 4))
     story.append(Paragraph(
         f"CONFIDENTIAL — Infrastructure Recon Report  ·  OSINT PH / osintph.info  ·  "
-        f"Target: {domain}  ·  Report ID: OSINTPH-DNS-{inv_id}-{dt.utcnow().strftime('%Y%m%d')}",
+        f"Target: {domain}  ·  Report ID: OSINTPH-DNS-{inv_id}-{dt.now(timezone.utc).replace(tzinfo=None).strftime('%Y%m%d')}",
         s_foot))
 
     doc.build(story, onFirstPage=dark_page, onLaterPages=dark_page)
@@ -2999,7 +2999,7 @@ window._ready = true;
     return Response(
         buf.read(),
         mimetype="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=osintph-dns-{domain}-{dt.utcnow().strftime('%Y%m%d')}.pdf"},
+        headers={"Content-Disposition": f"attachment; filename=osintph-dns-{domain}-{dt.now(timezone.utc).replace(tzinfo=None).strftime('%Y%m%d')}.pdf"},
     )
 
 
@@ -3570,4 +3570,4 @@ def whiteintel_search():
 
 @dashboard_bp.route("/api/health")
 def health():
-    return jsonify({"status": "ok", "timestamp": datetime.utcnow().isoformat()})
+    return jsonify({"status": "ok", "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat()})

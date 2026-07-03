@@ -8,7 +8,7 @@ Set in .env: RANSOMWARE_LIVE_API_KEY=your_key
 
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 import requests
 
@@ -374,7 +374,7 @@ def build_group_profile(group_name: str) -> dict:
         "yara":         get_group_yara(group_name),
         "sea_victims":  [v for v in get_victims(group=group_name, limit=100)
                          if (v.get("country") or "").upper() in SEA_ISO2],
-        "fetched_at":   datetime.utcnow().isoformat(),
+        "fetched_at":   datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
     }
 
 
@@ -387,7 +387,7 @@ def get_home_dashboard_data() -> dict:
         "sea_victims":   [v for v in recent if (v.get("country") or "").upper() in SEA_ISO2],
         "press_recent":  get_press_recent()[:10],
         "has_pro_key":   has_pro_key(),
-        "fetched_at":    datetime.utcnow().isoformat(),
+        "fetched_at":    datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
     }
 
 
@@ -401,5 +401,5 @@ def get_ransomware_tab_data() -> dict:
         "ransomnote_groups":   get_ransomnote_groups(),
         "yara_groups":         get_yara_groups(),
         "has_pro_key":         has_pro_key(),
-        "fetched_at":          datetime.utcnow().isoformat(),
+        "fetched_at":          datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
     }

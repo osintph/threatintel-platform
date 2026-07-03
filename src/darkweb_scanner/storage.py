@@ -6,7 +6,7 @@ Stores crawl results, keyword hits, and crawl session metadata.
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import Boolean, Column, DateTime, Index, Integer, String, Text, create_engine, func
@@ -32,7 +32,7 @@ class User(Base):
     oauth_id = Column(String(255), nullable=True)
     is_admin = Column(Boolean, default=False)
     must_change_password = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     last_login = Column(DateTime, nullable=True)
 
     __table_args__ = (
@@ -46,7 +46,7 @@ class CrawlSession(Base):
     __tablename__ = "crawl_sessions"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    started_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     ended_at = Column(DateTime, nullable=True)
     seed_urls = Column(Text)  # JSON list
     pages_crawled = Column(Integer, default=0)
@@ -60,7 +60,7 @@ class CrawledPage(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(Integer, nullable=True)
     url = Column(Text, nullable=False)
-    crawled_at = Column(DateTime, default=datetime.utcnow)
+    crawled_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     status_code = Column(Integer)
     depth = Column(Integer, default=0)
     had_error = Column(Boolean, default=False)
@@ -83,7 +83,7 @@ class KeywordHitRecord(Base):
     context = Column(Text)
     position = Column(Integer)
     depth = Column(Integer, default=0)
-    found_at = Column(DateTime, default=datetime.utcnow)
+    found_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     alerted = Column(Boolean, default=False)
 
     __table_args__ = (
@@ -101,7 +101,7 @@ class Investigation(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(255), nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     completed_at = Column(DateTime, nullable=True)
     status = Column(String(50), default="running")  # running | completed
     target_count = Column(Integer, default=0)
@@ -119,7 +119,7 @@ class InvestigationTarget(Base):
     breach_count = Column(Integer, default=0)
     darkweb_count = Column(Integer, default=0)
     error = Column(Text, nullable=True)
-    checked_at = Column(DateTime, default=datetime.utcnow)
+    checked_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 
 
@@ -128,7 +128,7 @@ class IPInvestigation(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     ip = Column(String(64), nullable=False, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     status = Column(String(50), default="running")
     abuseipdb_data = Column(Text, nullable=True)   # JSON
     virustotal_data = Column(Text, nullable=True)  # JSON
@@ -143,7 +143,7 @@ class DNSInvestigation(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     domain = Column(String(255), nullable=False, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     status = Column(String(50), default="running")  # running | complete | error
     result_json = Column(Text, nullable=True)        # full result dict as JSON
     subdomain_count = Column(Integer, nullable=True)
@@ -167,8 +167,8 @@ class Project(Base):
     description = Column(Text, nullable=True)
     status = Column(String(20), default="active")  # active | paused | archived
     owner_id = Column(Integer, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     alert_threshold = Column(Integer, default=1)
     color = Column(String(7), default="#f85149")
     tags = Column(Text, default="[]")  # JSON array
@@ -223,7 +223,7 @@ class ProjectHit(Base):
     hit_id = Column(Integer, nullable=False)
     matched_on = Column(String(20), nullable=False)  # keyword|domain|entity
     matched_value = Column(String(200), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
     __table_args__ = (
         Index("ix_project_hits_project", "project_id"),
@@ -241,7 +241,7 @@ class SeenPaste(Base):
     source = Column(String(50), nullable=False)       # pastebin|rentry|pastesio|controlc|ghostbin
     paste_id = Column(String(200), nullable=False)
     url = Column(Text, nullable=False)
-    fetched_at = Column(DateTime, default=datetime.utcnow)
+    fetched_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     had_hits = Column(Boolean, default=False)
 
     __table_args__ = (
@@ -260,7 +260,7 @@ class PasteHit(Base):
     matched_pattern = Column(String(100), nullable=False)  # pattern name e.g. ph_mobile
     matched_value = Column(String(500), nullable=True)     # the actual matched string
     context = Column(Text, nullable=True)
-    found_at = Column(DateTime, default=datetime.utcnow)
+    found_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
     __table_args__ = (
         Index("ix_paste_hits_found_at", "found_at"),
@@ -278,7 +278,7 @@ class CustomIntel(Base):
     slug = Column(String(200), nullable=False, unique=True)
     data = Column(Text, nullable=False)               # JSON blob
     created_by = Column(String(200), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
     __table_args__ = (
         Index("ix_custom_intel_type", "intel_type"),
@@ -328,7 +328,7 @@ class Storage:
         with self.get_session() as session:
             record = session.get(CrawlSession, session_id)
             if record:
-                record.ended_at = datetime.utcnow()
+                record.ended_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 record.pages_crawled = pages_crawled
                 record.hits_found = hits_found
                 record.status = status
@@ -483,7 +483,7 @@ class Storage:
         with self.get_session() as session:
             user = session.get(User, user_id)
             if user:
-                user.last_login = datetime.utcnow()
+                user.last_login = datetime.now(timezone.utc).replace(tzinfo=None)
                 session.commit()
 
     def enable_totp(self, user_id: int, secret: str):
@@ -626,7 +626,7 @@ class Storage:
             record = session.get(Investigation, investigation_id)
             if record:
                 record.status = "completed"
-                record.completed_at = datetime.utcnow()
+                record.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 session.commit()
 
     def get_investigations(self, limit: int = 50) -> list[dict]:
@@ -965,7 +965,7 @@ class Storage:
                     v = json.dumps(v)
                 if hasattr(p, k):
                     setattr(p, k, v)
-            p.updated_at = datetime.utcnow()
+            p.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
             return True
 
