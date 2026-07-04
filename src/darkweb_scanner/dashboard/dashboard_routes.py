@@ -1425,29 +1425,32 @@ def api_threat_actors():
     custom = storage.get_custom_intel("threat-actor")
     static_slugs = {a["slug"] for a in THREAT_ACTORS}
     all_actors = list(THREAT_ACTORS) + [a for a in custom if a["slug"] not in static_slugs]
+
+    # Bulk-fetch hits and last-seen dates for every keyword in one query each
+    # instead of issuing one query per keyword per actor.
+    all_keywords = list({kw for a in all_actors for kw in a.get("keywords", [])})
+    hits_by_kw = storage.get_hits_by_keywords(all_keywords, limit_per_keyword=5)
+    last_date_by_kw = storage.get_last_hit_dates_bulk(all_keywords)
+
     enriched = []
     for actor in all_actors:
-        hit_count = 0
-        recent_hits = []
         keywords = actor.get("keywords", [])
+        recent_hits = []
         for kw in keywords:
-            hits = storage.get_hits_by_keyword(kw, limit=5)
-            hit_count += len(hits)
-            for h in hits:
+            for h in hits_by_kw.get(kw, []):
                 recent_hits.append({
                     "keyword": h.keyword,
                     "url": h.url,
                     "found_at": h.found_at.isoformat() if h.found_at else None,
                     "context": (h.context or "")[:200],
                 })
-        last_seen = storage.get_last_hit_date(keywords)
-        is_custom = actor.get("slug") not in static_slugs
+        dates = [last_date_by_kw[kw] for kw in keywords if kw in last_date_by_kw]
         enriched.append({
             **actor,
-            "hit_count": hit_count,
+            "hit_count": sum(len(hits_by_kw.get(kw, [])) for kw in keywords),
             "recent_hits": recent_hits[:10],
-            "last_seen": last_seen,
-            "is_custom": is_custom,
+            "last_seen": max(dates) if dates else None,
+            "is_custom": actor.get("slug") not in static_slugs,
         })
     enriched.sort(key=lambda a: (
         a["risk_level"] not in ("critical", "high"),
