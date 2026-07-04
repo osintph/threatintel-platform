@@ -75,6 +75,10 @@ ALLOWED_EXTERNAL_HOSTS: frozenset = frozenset({
     "whiteintel.io",
     # Mail infrastructure
     "api.mailgun.net",
+    # Quick Scan clearnet paste sources (see quick_scan_sources.py). The dpaste
+    # source ships disabled pending a search endpoint; the host is pre-allowlisted
+    # so enabling it is a one-line change rather than a security review.
+    "dpaste.org",
 })
 
 # Supplementary networks not fully covered by ipaddress stdlib classifiers on all
