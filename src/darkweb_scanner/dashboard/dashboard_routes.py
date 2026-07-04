@@ -1293,29 +1293,32 @@ def api_ransomware_groups():
     custom = storage.get_custom_intel("ransomware")
     static_slugs = {g["slug"] for g in RANSOMWARE_GROUPS}
     all_groups = list(RANSOMWARE_GROUPS) + [g for g in custom if g["slug"] not in static_slugs]
+
+    # Bulk-fetch hits and last-seen dates for every keyword in one query each
+    # instead of issuing one query per keyword per group.
+    all_keywords = list({kw for g in all_groups for kw in g.get("keywords", [])})
+    hits_by_kw = storage.get_hits_by_keywords(all_keywords, limit_per_keyword=5)
+    last_date_by_kw = storage.get_last_hit_dates_bulk(all_keywords)
+
     enriched = []
     for group in all_groups:
-        hit_count = 0
-        recent_hits = []
         keywords = group.get("keywords", [])
+        recent_hits = []
         for kw in keywords:
-            hits = storage.get_hits_by_keyword(kw, limit=5)
-            hit_count += len(hits)
-            for h in hits:
+            for h in hits_by_kw.get(kw, []):
                 recent_hits.append({
                     "keyword": h.keyword,
                     "url": h.url,
                     "found_at": h.found_at.isoformat() if h.found_at else None,
                     "context": (h.context or "")[:200],
                 })
-        last_seen = storage.get_last_hit_date(keywords)
-        is_custom = group.get("slug") not in static_slugs
+        dates = [last_date_by_kw[kw] for kw in keywords if kw in last_date_by_kw]
         enriched.append({
             **group,
-            "hit_count": hit_count,
+            "hit_count": sum(len(hits_by_kw.get(kw, [])) for kw in keywords),
             "recent_hits": recent_hits[:10],
-            "last_seen": last_seen,
-            "is_custom": is_custom,
+            "last_seen": max(dates) if dates else None,
+            "is_custom": group.get("slug") not in static_slugs,
         })
     enriched.sort(key=lambda g: (
         g["status"] != "active",

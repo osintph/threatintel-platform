@@ -442,6 +442,45 @@ class Storage:
                 .all()
             )
 
+    def get_hits_by_keywords(
+        self, keywords: list[str], limit_per_keyword: int = 5
+    ) -> dict[str, list[KeywordHitRecord]]:
+        """Fetch up to `limit_per_keyword` most-recent hits for every keyword in
+        `keywords` using a single SQL query. Returns a dict keyed by keyword."""
+        if not keywords:
+            return {}
+        with self.get_session() as session:
+            rows = (
+                session.query(KeywordHitRecord)
+                .filter(KeywordHitRecord.keyword.in_(keywords))
+                .order_by(KeywordHitRecord.keyword, KeywordHitRecord.found_at.desc())
+                .all()
+            )
+        result: dict[str, list[KeywordHitRecord]] = {}
+        for hit in rows:
+            bucket = result.setdefault(hit.keyword, [])
+            if len(bucket) < limit_per_keyword:
+                bucket.append(hit)
+        return result
+
+    def get_last_hit_dates_bulk(self, keywords: list[str]) -> dict[str, str]:
+        """Return the ISO timestamp of the most-recent hit for each keyword that
+        has at least one hit. Keywords with no hits are absent from the result.
+        Uses a single GROUP BY query regardless of keyword count."""
+        if not keywords:
+            return {}
+        with self.get_session() as session:
+            rows = (
+                session.query(
+                    KeywordHitRecord.keyword,
+                    func.max(KeywordHitRecord.found_at).label("last_hit"),
+                )
+                .filter(KeywordHitRecord.keyword.in_(keywords))
+                .group_by(KeywordHitRecord.keyword)
+                .all()
+            )
+        return {kw: ts.isoformat() for kw, ts in rows if ts}
+
     def get_stats(self) -> dict:
         with self.get_session() as session:
             total_hits = session.query(func.count(KeywordHitRecord.id)).scalar()
