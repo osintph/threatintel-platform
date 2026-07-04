@@ -291,6 +291,48 @@ class CustomIntel(Base):
     )
 
 
+# ── Quick Scan Models ───────────────────────────────────────────────────────────
+
+class QuickScanSession(Base):
+    __tablename__ = "quick_scan_sessions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=False)
+    target_value = Column(String(512), nullable=False)
+    target_type = Column(String(50), nullable=False)  # email | domain | url | company_name
+    normalized_variants = Column(Text, default="[]")   # JSON list of strings searched
+    sources_used = Column(Text, default="[]")          # JSON list of source names
+    status = Column(String(50), default="pending")     # pending|running|completed|failed|cancelled
+    started_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    completed_at = Column(DateTime, nullable=True)
+    urls_visited = Column(Integer, default=0)
+    findings_count = Column(Integer, default=0)
+    error_message = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_quick_scan_sessions_target", "target_value"),
+        Index("ix_quick_scan_sessions_user", "user_id"),
+    )
+
+
+class QuickScanFinding(Base):
+    __tablename__ = "quick_scan_findings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(Integer, nullable=False)
+    source_name = Column(String(200), nullable=False)
+    url = Column(Text, nullable=False)
+    matched_variant = Column(String(512), nullable=False)
+    context = Column(Text)
+    high_signal = Column(Boolean, default=False)
+    found_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+    __table_args__ = (
+        Index("ix_quick_scan_findings_session", "session_id"),
+        Index("ix_quick_scan_findings_source", "source_name"),
+    )
+
+
 class Storage:
     def __init__(self, database_url: Optional[str] = None):
         self.database_url = database_url or os.getenv(
@@ -1321,3 +1363,107 @@ class Storage:
                 .scalar()
             )
             return result.isoformat() if result else None
+
+    # --- Quick Scan Sessions & Findings ---
+
+    def create_quick_scan_session(
+        self,
+        user_id: int,
+        target_value: str,
+        target_type: str,
+        normalized_variants: list[str],
+        sources_used: list[str],
+    ) -> int:
+        with self.get_session() as session:
+            record = QuickScanSession(
+                user_id=user_id,
+                target_value=target_value,
+                target_type=target_type,
+                normalized_variants=json.dumps(normalized_variants),
+                sources_used=json.dumps(sources_used),
+                status="pending",
+            )
+            session.add(record)
+            session.commit()
+            session.refresh(record)
+            return record.id
+
+    def update_quick_scan_session(self, session_id: int, **kwargs) -> None:
+        with self.get_session() as session:
+            record = session.get(QuickScanSession, session_id)
+            if not record:
+                return
+            for key, value in kwargs.items():
+                if key in ("normalized_variants", "sources_used") and isinstance(value, (list, dict)):
+                    value = json.dumps(value)
+                setattr(record, key, value)
+            session.commit()
+
+    def add_quick_scan_finding(
+        self,
+        session_id: int,
+        source_name: str,
+        url: str,
+        matched_variant: str,
+        context: str,
+        high_signal: bool,
+    ) -> int:
+        with self.get_session() as session:
+            record = QuickScanFinding(
+                session_id=session_id,
+                source_name=source_name,
+                url=url,
+                matched_variant=matched_variant,
+                context=context,
+                high_signal=high_signal,
+            )
+            session.add(record)
+            session.commit()
+            session.refresh(record)
+            return record.id
+
+    def get_quick_scan_session(self, session_id: int) -> Optional["QuickScanSession"]:
+        with self.get_session() as session:
+            record = session.get(QuickScanSession, session_id)
+            if record is not None:
+                session.expunge(record)
+            return record
+
+    def list_quick_scan_sessions(self, user_id: int, limit: int = 50) -> list["QuickScanSession"]:
+        with self.get_session() as session:
+            records = (
+                session.query(QuickScanSession)
+                .filter(QuickScanSession.user_id == user_id)
+                .order_by(QuickScanSession.id.desc())
+                .limit(limit)
+                .all()
+            )
+            for record in records:
+                session.expunge(record)
+            return records
+
+    def list_quick_scan_findings(
+        self, session_id: int, high_signal_only: bool = False
+    ) -> list["QuickScanFinding"]:
+        with self.get_session() as session:
+            query = session.query(QuickScanFinding).filter(
+                QuickScanFinding.session_id == session_id
+            )
+            if high_signal_only:
+                query = query.filter(QuickScanFinding.high_signal.is_(True))
+            records = query.order_by(QuickScanFinding.id.asc()).all()
+            for record in records:
+                session.expunge(record)
+            return records
+
+    def has_active_quick_scan(self, user_id: int) -> bool:
+        with self.get_session() as session:
+            record = (
+                session.query(QuickScanSession.id)
+                .filter(
+                    QuickScanSession.user_id == user_id,
+                    QuickScanSession.status.in_(("pending", "running")),
+                )
+                .first()
+            )
+            return record is not None
