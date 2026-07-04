@@ -187,6 +187,12 @@ def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _is_cancelled(storage, session_id: int) -> bool:
+    """Re-read the session and report whether it has been cancelled."""
+    session = storage.get_quick_scan_session(session_id)
+    return session is not None and session.status == "cancelled"
+
+
 def _is_onion(url: str) -> bool:
     return (urlparse(url).hostname or "").endswith(".onion")
 
@@ -271,7 +277,9 @@ async def run_quick_scan(session_id: int, storage, tor_client) -> None:
 
     Per-URL errors are logged and skipped. A total-time overrun finalizes the session
     as ``completed`` with a warning in error_message. Only failures that prevent the
-    scan from running at all mark it ``failed``.
+    scan from running at all mark it ``failed``. A cancel (status flipped to
+    ``cancelled`` by the cancel endpoint) is honored at every source and fetch
+    boundary: the scan stops early, syncs counters, and leaves status untouched.
     """
     from .quick_scan_sources import resolve_sources
 
@@ -285,28 +293,50 @@ async def run_quick_scan(session_id: int, storage, tor_client) -> None:
     source_names = json.loads(session.sources_used or "[]")
     sources = resolve_sources(source_names)
 
+    if session.status == "cancelled":
+        logger.info("Quick scan %s: cancellation detected before start; aborting", session_id)
+        return
+
     storage.update_quick_scan_session(session_id, status="running", started_at=_now())
 
     deadline = time.monotonic() + TOTAL_TIMEOUT
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     visited: set = set()
     counters = {"urls_visited": 0, "findings": 0}
+    cancel_state = {"cancelled": False}
     timed_out = False
+
+    def _cancel_requested() -> bool:
+        """Check (and cache) whether the session has been cancelled."""
+        if not cancel_state["cancelled"] and _is_cancelled(storage, session_id):
+            cancel_state["cancelled"] = True
+            logger.info("Quick scan %s: cancellation detected", session_id)
+        return cancel_state["cancelled"]
 
     async def _process(url: str, depth: int, source_name: str) -> list:
         """Fetch one URL, record findings, return discovered links."""
         async with semaphore:
             if time.monotonic() > deadline:
                 return []
+            if _cancel_requested():
+                return []
             await asyncio.sleep(_rate_limit_delay())
+            logger.info(
+                "Quick scan %s: fetch start %s (source %s, depth %d)",
+                session_id, url, source_name, depth,
+            )
             try:
                 status, html = await asyncio.wait_for(
                     _fetch(url, tor_client), timeout=PER_SOURCE_TIMEOUT
                 )
+            except asyncio.TimeoutError:
+                logger.info("Quick scan %s: fetch timed out for %s", session_id, url)
+                return []
             except Exception as exc:  # noqa: BLE001 — per-URL errors must not abort the scan
-                logger.info("Quick scan fetch failed for %s: %s", url, exc)
+                logger.info("Quick scan %s: fetch failed for %s: %s", session_id, url, exc)
                 return []
             counters["urls_visited"] += 1
+            logger.info("Quick scan %s: fetch complete %s (HTTP %s)", session_id, url, status)
             text = _extract_page_text(html)
             for match in find_matches(text, variants):
                 storage.add_quick_scan_finding(
@@ -318,11 +348,19 @@ async def run_quick_scan(session_id: int, storage, tor_client) -> None:
                     high_signal=match["high_signal"],
                 )
                 counters["findings"] += 1
+                logger.info(
+                    "Quick scan %s: finding created for variant %r at %s (high_signal=%s)",
+                    session_id, match["variant"], url, match["high_signal"],
+                )
             return _extract_links(html, url)
 
     # Seed the frontier with each enabled source's query URLs (depth 0).
     queue: list = []
     for source in sources:
+        if _cancel_requested():
+            break
+        logger.info("Quick scan %s: source query start for %s", session_id, source.name)
+        queued = 0
         for url in source.build_urls(target_value):
             norm = _normalize_url(url)
             if norm in visited:
@@ -331,9 +369,16 @@ async def run_quick_scan(session_id: int, storage, tor_client) -> None:
                 break
             visited.add(norm)
             queue.append((url, 0, source.name))
+            queued += 1
+        logger.info(
+            "Quick scan %s: source query complete for %s (%d URLs queued)",
+            session_id, source.name, queued,
+        )
 
     try:
         while queue:
+            if _cancel_requested():
+                break
             if time.monotonic() > deadline:
                 timed_out = True
                 break
@@ -366,6 +411,21 @@ async def run_quick_scan(session_id: int, storage, tor_client) -> None:
             urls_visited=counters["urls_visited"],
             findings_count=counters["findings"],
             error_message=f"Scan failed: {type(exc).__name__}",
+        )
+        return
+
+    if _cancel_requested():
+        # The cancel endpoint owns status and completed_at; only sync the counters.
+        storage.update_quick_scan_session(
+            session_id,
+            urls_visited=counters["urls_visited"],
+            findings_count=counters["findings"],
+        )
+        logger.info(
+            "Quick scan %s cancelled after %d URLs, %d findings",
+            session_id,
+            counters["urls_visited"],
+            counters["findings"],
         )
         return
 

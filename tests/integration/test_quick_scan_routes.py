@@ -51,8 +51,7 @@ def storage():
     return Storage("sqlite:///:memory:")
 
 
-@pytest.fixture
-def app(storage):
+def _make_app():
     flask_app = Flask(__name__)
     flask_app.config["TESTING"] = True
     flask_app.secret_key = "test-quick-scan-secret"
@@ -68,6 +67,11 @@ def app(storage):
     flask_app.register_blueprint(auth_bp)
     flask_app.register_blueprint(dashboard_bp)
     return flask_app
+
+
+@pytest.fixture
+def app(storage):
+    return _make_app()
 
 
 def _login(client, user_id=1, username="tester"):
@@ -168,6 +172,83 @@ def test_start_poll_and_list_findings(app, storage, monkeypatch):
         sessions = client.get("/api/quick-scan/sessions")
         assert sessions.status_code == 200
         assert any(s["id"] == session_id for s in sessions.get_json())
+
+
+# ── Cancel ─────────────────────────────────────────────────────────────────────
+
+
+def test_cancel_stops_running_scan(tmp_path, monkeypatch):
+    """Cancelling mid-scan flips status to cancelled and halts the crawl early.
+
+    Uses a real background worker thread over a file-backed SQLite DB (in-memory
+    SQLite is not shared across threads). The fetch stub blocks on an event so the
+    cancel deterministically lands while the scan is running.
+    """
+    import asyncio
+    import threading
+
+    monkeypatch.setenv("QUICK_SCAN_DELAY_MIN", "0")
+    monkeypatch.setenv("QUICK_SCAN_DELAY_MAX", "0")
+
+    storage = Storage(f"sqlite:///{tmp_path / 'quick_scan_cancel.db'}")
+    app = _make_app()
+
+    fetch_started = threading.Event()
+    release_fetch = threading.Event()
+
+    async def _blocking_fetch(url, tor_client):
+        fetch_started.set()
+        while not release_fetch.is_set():
+            await asyncio.sleep(0.01)
+        return _page_for(url)
+
+    with patch(
+        "darkweb_scanner.dashboard.dashboard_routes.get_storage", return_value=storage
+    ), patch.object(qs, "_fetch", _blocking_fetch), app.test_client() as client:
+        _login(client, user_id=1)
+
+        start = client.post(
+            "/api/quick-scan/start",
+            json={"target": "acme.com", "target_type": "domain", "sources": ["ahmia"]},
+        )
+        assert start.status_code == 201
+        session_id = start.get_json()["session_id"]
+
+        # Wait until the worker is inside its first fetch, then cancel.
+        assert fetch_started.wait(timeout=10), "worker never reached a fetch"
+        cancel = client.post(f"/api/quick-scan/cancel/{session_id}")
+        assert cancel.status_code == 200
+        assert cancel.get_json()["status"] == "cancelled"
+
+        # A second cancel is rejected — the scan is no longer pending/running.
+        assert client.post(f"/api/quick-scan/cancel/{session_id}").status_code == 400
+
+        # Unblock the fetch and let the worker notice the cancellation and exit.
+        release_fetch.set()
+        worker = next(
+            (t for t in threading.enumerate() if t.name == "quick_scan_thread"), None
+        )
+        assert worker is not None
+        worker.join(timeout=10)
+        assert not worker.is_alive(), "worker did not stop after cancellation"
+
+        status = client.get(f"/api/quick-scan/status/{session_id}")
+        assert status.status_code == 200
+        body = status.get_json()
+        assert body["status"] == "cancelled"
+        assert body["urls_visited"] < qs.MAX_URLS_PER_SCAN
+
+
+def test_cancel_missing_session_is_404_and_cross_user_403(app, storage):
+    other_sid = storage.create_quick_scan_session(
+        2, "acme.com", "domain", ["acme.com"], ["ahmia"]
+    )
+    with patch(
+        "darkweb_scanner.dashboard.dashboard_routes.get_storage", return_value=storage
+    ), app.test_client() as client:
+        _login(client, user_id=1)
+        assert client.post("/api/quick-scan/cancel/999999").status_code == 404
+        assert client.post(f"/api/quick-scan/cancel/{other_sid}").status_code == 403
 
 
 def test_start_requires_target(app, storage):

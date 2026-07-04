@@ -3736,6 +3736,26 @@ def api_quick_scan_status(session_id):
     })
 
 
+@dashboard_bp.route("/api/quick-scan/cancel/<int:session_id>", methods=["POST"])
+@require_login
+def api_quick_scan_cancel(session_id):
+    storage = get_storage()
+    sess = storage.get_quick_scan_session(session_id)
+    if sess is None:
+        return jsonify({"error": "not found"}), 404
+    if sess.user_id != session["user_id"]:
+        return jsonify({"error": "forbidden"}), 403
+    if sess.status not in ("pending", "running"):
+        return jsonify({"error": f"cannot cancel a scan in status {sess.status!r}"}), 400
+    storage.update_quick_scan_session(
+        session_id,
+        status="cancelled",
+        completed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+    )
+    logger.info("Quick scan %s cancelled by user %s", session_id, session["user_id"])
+    return jsonify(_quick_scan_session_dict(storage.get_quick_scan_session(session_id)))
+
+
 @dashboard_bp.route("/api/quick-scan/sessions")
 @require_login
 def api_quick_scan_sessions():

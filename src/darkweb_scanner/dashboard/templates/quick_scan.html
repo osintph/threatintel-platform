@@ -58,6 +58,9 @@
     .btn-primary { background: var(--green); color: #0d1117; }
     .btn-primary:hover { opacity: .85; }
     .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-danger { background: var(--red); color: white; }
+    .btn-danger:hover { opacity: .85; }
+    .btn-danger:disabled { opacity: .5; cursor: not-allowed; }
 
     .activity { display: flex; gap: 26px; align-items: center; flex-wrap: wrap; }
     .stat { display: flex; flex-direction: column; }
@@ -67,6 +70,7 @@
     .dot.running { background: var(--green); animation: pulse 1.2s infinite; }
     .dot.completed { background: var(--accent); }
     .dot.failed { background: var(--red); }
+    .dot.cancelled { background: var(--yellow); }
     @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.4;transform:scale(1.3)} }
     .warn { color: var(--yellow); font-size: 0.8rem; margin-top: 8px; }
 
@@ -149,6 +153,7 @@
         <div class="stat"><span class="n" id="qs-urls">0</span><span class="l">URLs visited</span></div>
         <div class="stat"><span class="n" id="qs-findings">0</span><span class="l">Findings</span></div>
         <div class="stat"><span class="n" id="qs-target-label" style="font-size:.95rem">—</span><span class="l">Target</span></div>
+        <button class="btn btn-danger" id="qs-cancel" style="display:none" onclick="cancelScan()">✖ Cancel</button>
       </div>
       <div class="warn" id="qs-warn" style="display:none"></div>
     </div>
@@ -265,6 +270,8 @@
       document.getElementById('qs-dot').className = 'dot ' + s.status;
       document.getElementById('qs-urls').textContent = s.urls_visited;
       document.getElementById('qs-findings').textContent = s.findings_count;
+      document.getElementById('qs-cancel').style.display =
+        (s.status === 'running' || s.status === 'pending') ? '' : 'none';
       if (s.error_message) {
         const w = document.getElementById('qs-warn');
         w.style.display = ''; w.textContent = '⚠ ' + s.error_message;
@@ -278,6 +285,24 @@
         reloadFindings();
       }
     } catch (e) { /* transient; keep polling */ }
+  }
+
+  async function cancelScan() {
+    if (!currentSession) return;
+    const btn = document.getElementById('qs-cancel');
+    btn.disabled = true;
+    try {
+      const resp = await fetch('/api/quick-scan/cancel/' + currentSession, { method: 'POST' });
+      const data = await resp.json();
+      if (!resp.ok) { toast(data.error || 'Failed to cancel', 'error'); return; }
+      toast('Scan cancelled');
+      pollStatus();
+      loadSessions();
+    } catch (e) {
+      toast('Network error', 'error');
+    } finally {
+      btn.disabled = false;
+    }
   }
 
   function reloadFindings() {
