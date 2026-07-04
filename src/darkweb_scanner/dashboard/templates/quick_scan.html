@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23161b22'/%3E%3Ccircle cx='10' cy='16' r='3.5' fill='%23FF5C5C'/%3E%3Ccircle cx='19' cy='16' r='3.5' fill='%238b949e'/%3E%3Ccircle cx='28' cy='16' r='3.5' fill='%23d29922'/%3E%3C/svg%3E"/>
+  <title>Quick Scan — Threat Intelligence Platform</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0d1117; --surface: #161b22; --surface2: #21262d;
+      --border: #30363d; --text: #e6edf3; --muted: #8b949e;
+      --accent: #58a6ff; --red: #f85149; --green: #3fb950;
+      --yellow: #d29922; --purple: #bc8cff; --orange: #f0883e;
+      --font: 'Segoe UI', system-ui, sans-serif;
+      --mono: 'Cascadia Code', 'Fira Code', monospace;
+    }
+    body { background: var(--bg); color: var(--text); font-family: var(--font); min-height: 100vh; }
+
+    header {
+      background: var(--surface); border-bottom: 1px solid var(--border);
+      padding: 0 28px; display: flex; align-items: center; flex-wrap: wrap; position: sticky; top: 0; z-index: 100;
+    }
+    .logo { display: flex; align-items: center; gap: 10px; padding: 14px 0; margin-right: 20px; flex-shrink: 0; }
+    .logo h1 { font-size: 1rem; font-weight: 700; white-space: nowrap; }
+    .logo .badge { background: var(--red); color: white; font-size: 0.65rem; padding: 2px 7px; border-radius: 20px; font-weight: 700; }
+    .back-link { color: var(--muted); font-size: 0.82rem; text-decoration: none; padding: 14px 11px; }
+    .back-link:hover { color: var(--accent); }
+    .header-right { display: flex; align-items: center; gap: 10px; padding: 8px 0 8px 16px; margin-left: auto; flex-shrink: 0; }
+    .user-pill { color: var(--muted); font-size: 0.82rem; }
+    .sign-out { color: var(--muted); font-size: 0.8rem; text-decoration: none; }
+    .sign-out:hover { color: var(--red); }
+
+    main { padding: 28px; max-width: 1400px; margin: 0 auto; }
+    @media (max-width: 900px) { main { padding: 16px; } header { padding: 0 16px; } }
+
+    h2.section { font-size: 1.05rem; margin-bottom: 14px; }
+    .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 20px; }
+    .panel-head { padding: 12px 18px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 0.9rem; }
+    .panel-body { padding: 18px; }
+
+    label.fld { display: block; font-size: 0.78rem; color: var(--muted); margin-bottom: 5px; }
+    input[type="text"], select {
+      background: var(--bg); color: var(--text); border: 1px solid var(--border);
+      border-radius: 6px; padding: 8px 11px; font-size: 0.85rem; font-family: var(--font); width: 100%;
+    }
+    input[type="text"]:focus, select:focus { outline: none; border-color: var(--accent); }
+    .form-row { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+    .form-row > div { flex: 1; min-width: 220px; }
+
+    .source-grid { display: flex; flex-wrap: wrap; gap: 10px 22px; }
+    .source-item { display: flex; align-items: center; gap: 7px; font-size: 0.82rem; }
+    .source-item.disabled { color: var(--muted); opacity: .6; }
+    .source-item input { accent-color: var(--accent); }
+    .src-transport { font-size: 0.68rem; color: var(--muted); border: 1px solid var(--border); border-radius: 10px; padding: 1px 7px; }
+
+    .btn { border: none; border-radius: 6px; padding: 8px 18px; font-size: 0.85rem; font-weight: 700; cursor: pointer; font-family: var(--font); }
+    .btn-primary { background: var(--green); color: #0d1117; }
+    .btn-primary:hover { opacity: .85; }
+    .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-danger { background: var(--red); color: white; }
+    .btn-danger:hover { opacity: .85; }
+    .btn-danger:disabled { opacity: .5; cursor: not-allowed; }
+
+    .activity { display: flex; gap: 26px; align-items: center; flex-wrap: wrap; }
+    .stat { display: flex; flex-direction: column; }
+    .stat .n { font-size: 1.5rem; font-weight: 700; font-family: var(--mono); }
+    .stat .l { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; margin-right: 6px; }
+    .dot.running { background: var(--green); animation: pulse 1.2s infinite; }
+    .dot.completed { background: var(--accent); }
+    .dot.failed { background: var(--red); }
+    .dot.cancelled { background: var(--yellow); }
+    @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.4;transform:scale(1.3)} }
+    .warn { color: var(--yellow); font-size: 0.8rem; margin-top: 8px; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    thead th { text-align: left; padding: 9px 12px; color: var(--muted); border-bottom: 1px solid var(--border); font-weight: 600; font-size: 0.72rem; text-transform: uppercase; letter-spacing: .4px; }
+    tbody td { padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    tbody tr:hover { background: var(--surface2); }
+    td.ctx { max-width: 320px; color: var(--muted); cursor: help; }
+    td.url a { color: var(--accent); text-decoration: none; word-break: break-all; }
+    td.url a:hover { text-decoration: underline; }
+    td.url .onion { color: var(--muted); font-family: var(--mono); font-size: 0.76rem; word-break: break-all; }
+    .badge { border-radius: 10px; padding: 2px 9px; font-size: 0.7rem; font-weight: 700; }
+    .badge-hi { background: rgba(248,81,73,.15); color: var(--red); border: 1px solid rgba(248,81,73,.3); }
+    .badge-lo { background: var(--surface2); color: var(--muted); border: 1px solid var(--border); }
+    .filter-row { display: flex; align-items: center; gap: 8px; font-size: 0.8rem; color: var(--muted); }
+    .empty { color: var(--muted); font-size: 0.85rem; padding: 16px; text-align: center; }
+    .sess-row { cursor: pointer; }
+    .toast { position: fixed; bottom: 22px; right: 22px; background: var(--surface2); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 6px; padding: 11px 16px; font-size: 0.82rem; opacity: 0; transform: translateY(8px); transition: all .2s; z-index: 200; }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .toast.error { border-left-color: var(--red); }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <h1>🔍 Quick Scan</h1>
+    <span class="badge">AD-HOC</span>
+  </div>
+  <a class="back-link" href="/dashboard">← Dashboard</a>
+  <div class="header-right">
+    <span class="user-pill">{{ username }}</span>
+    <a href="/logout" class="sign-out">Sign out</a>
+  </div>
+</header>
+
+<main>
+  <!-- ── Scan form ── -->
+  <div class="panel">
+    <div class="panel-head">New Quick Scan</div>
+    <div class="panel-body">
+      <div class="form-row">
+        <div>
+          <label class="fld" for="qs-target">Target</label>
+          <input type="text" id="qs-target" placeholder="email, domain, URL, or company name" autocomplete="off"/>
+        </div>
+        <div style="max-width:220px">
+          <label class="fld" for="qs-type">Target type</label>
+          <select id="qs-type">
+            <option value="auto">Auto-detect</option>
+            <option value="email">Email</option>
+            <option value="domain">Domain</option>
+            <option value="url">URL</option>
+            <option value="company_name">Company</option>
+          </select>
+        </div>
+      </div>
+      <label class="fld">Sources</label>
+      <div class="source-grid" id="qs-sources">
+        {% for s in sources %}
+        <label class="source-item {% if not s.enabled %}disabled{% endif %}">
+          <input type="checkbox" value="{{ s.name }}" {% if s.enabled %}checked{% else %}disabled{% endif %}/>
+          {{ s.label }}
+          <span class="src-transport">{{ s.transport }}</span>
+        </label>
+        {% endfor %}
+      </div>
+      <div style="margin-top:18px">
+        <button class="btn btn-primary" id="qs-start" onclick="startScan()">▶ Start Scan</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Live activity ── -->
+  <div class="panel" id="qs-activity-panel" style="display:none">
+    <div class="panel-head">Activity</div>
+    <div class="panel-body">
+      <div class="activity">
+        <div><span class="dot" id="qs-dot"></span><span id="qs-status">idle</span></div>
+        <div class="stat"><span class="n" id="qs-urls">0</span><span class="l">URLs visited</span></div>
+        <div class="stat"><span class="n" id="qs-findings">0</span><span class="l">Findings</span></div>
+        <div class="stat"><span class="n" id="qs-target-label" style="font-size:.95rem">—</span><span class="l">Target</span></div>
+        <button class="btn btn-danger" id="qs-cancel" style="display:none" onclick="cancelScan()">✖ Cancel</button>
+      </div>
+      <div class="warn" id="qs-warn" style="display:none"></div>
+    </div>
+  </div>
+
+  <!-- ── Findings ── -->
+  <div class="panel" id="qs-findings-panel" style="display:none">
+    <div class="panel-head" style="display:flex;justify-content:space-between;align-items:center">
+      <span>Findings</span>
+      <label class="filter-row"><input type="checkbox" id="qs-hi-only" onchange="reloadFindings()"/> Show high-signal only</label>
+    </div>
+    <div class="panel-body" style="padding:0">
+      <table>
+        <thead><tr>
+          <th>Source</th><th>URL</th><th>Matched Variant</th><th>Context</th><th>High Signal</th><th>Found At</th>
+        </tr></thead>
+        <tbody id="qs-findings-body"></tbody>
+      </table>
+      <div class="empty" id="qs-findings-empty">No findings yet.</div>
+    </div>
+  </div>
+
+  <!-- ── Previous sessions ── -->
+  <div class="panel">
+    <div class="panel-head" style="display:flex;justify-content:space-between;align-items:center">
+      <span>Previous Sessions</span>
+      <button class="btn" style="background:var(--surface2);color:var(--text)" onclick="loadSessions()">↻ Refresh</button>
+    </div>
+    <div class="panel-body" style="padding:0">
+      <table>
+        <thead><tr>
+          <th>Target</th><th>Type</th><th>Status</th><th>URLs</th><th>Findings</th><th>Started</th>
+        </tr></thead>
+        <tbody id="qs-sessions-body"></tbody>
+      </table>
+      <div class="empty" id="qs-sessions-empty">No previous sessions.</div>
+    </div>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  let currentSession = null;
+  let pollTimer = null;
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+      ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  function toast(msg, kind) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast show' + (kind === 'error' ? ' error' : '');
+    setTimeout(() => { t.className = 'toast'; }, 3200);
+  }
+  function isOnion(url) { return /\.onion(\/|$|:)/i.test(url || ''); }
+  function fmtTime(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso + 'Z');
+    return isNaN(d) ? iso : d.toLocaleString();
+  }
+
+  async function startScan() {
+    const target = document.getElementById('qs-target').value.trim();
+    if (!target) { toast('Enter a target first', 'error'); return; }
+    const typeSel = document.getElementById('qs-type').value;
+    const sources = Array.from(
+      document.querySelectorAll('#qs-sources input[type=checkbox]:checked')
+    ).map(cb => cb.value);
+    if (!sources.length) { toast('Select at least one source', 'error'); return; }
+
+    const btn = document.getElementById('qs-start');
+    btn.disabled = true;
+    try {
+      const resp = await fetch('/api/quick-scan/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          target: target,
+          target_type: typeSel === 'auto' ? null : typeSel,
+          sources: sources,
+        }),
+      });
+      const data = await resp.json();
+      if (resp.status === 409) { toast('A quick scan is already running', 'error'); btn.disabled = false; return; }
+      if (!resp.ok) { toast(data.error || 'Failed to start', 'error'); btn.disabled = false; return; }
+      currentSession = data.session_id;
+      document.getElementById('qs-activity-panel').style.display = '';
+      document.getElementById('qs-findings-panel').style.display = '';
+      document.getElementById('qs-target-label').textContent = target;
+      document.getElementById('qs-warn').style.display = 'none';
+      toast('Scan started (#' + currentSession + ')');
+      startPolling();
+    } catch (e) {
+      toast('Network error', 'error');
+      btn.disabled = false;
+    }
+  }
+
+  function startPolling() {
+    if (pollTimer) clearInterval(pollTimer);
+    pollStatus();
+    pollTimer = setInterval(pollStatus, 2000);
+  }
+
+  async function pollStatus() {
+    if (!currentSession) return;
+    try {
+      const resp = await fetch('/api/quick-scan/status/' + currentSession);
+      if (!resp.ok) return;
+      const s = await resp.json();
+      document.getElementById('qs-status').textContent = s.status;
+      document.getElementById('qs-dot').className = 'dot ' + s.status;
+      document.getElementById('qs-urls').textContent = s.urls_visited;
+      document.getElementById('qs-findings').textContent = s.findings_count;
+      document.getElementById('qs-cancel').style.display =
+        (s.status === 'running' || s.status === 'pending') ? '' : 'none';
+      if (s.error_message) {
+        const w = document.getElementById('qs-warn');
+        w.style.display = ''; w.textContent = '⚠ ' + s.error_message;
+      }
+      if (s.status === 'completed' || s.status === 'failed' || s.status === 'cancelled') {
+        clearInterval(pollTimer); pollTimer = null;
+        document.getElementById('qs-start').disabled = false;
+        reloadFindings();
+        loadSessions();
+      } else {
+        reloadFindings();
+      }
+    } catch (e) { /* transient; keep polling */ }
+  }
+
+  async function cancelScan() {
+    if (!currentSession) return;
+    const btn = document.getElementById('qs-cancel');
+    btn.disabled = true;
+    try {
+      const resp = await fetch('/api/quick-scan/cancel/' + currentSession, { method: 'POST' });
+      const data = await resp.json();
+      if (!resp.ok) { toast(data.error || 'Failed to cancel', 'error'); return; }
+      toast('Scan cancelled');
+      pollStatus();
+      loadSessions();
+    } catch (e) {
+      toast('Network error', 'error');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function reloadFindings() {
+    if (!currentSession) return;
+    const hiOnly = document.getElementById('qs-hi-only').checked ? '?high_signal_only=1' : '';
+    fetch('/api/quick-scan/findings/' + currentSession + hiOnly)
+      .then(r => r.ok ? r.json() : [])
+      .then(renderFindings);
+  }
+
+  function renderFindings(rows) {
+    const body = document.getElementById('qs-findings-body');
+    const empty = document.getElementById('qs-findings-empty');
+    body.innerHTML = '';
+    if (!rows.length) { empty.style.display = 'block'; return; }
+    empty.style.display = 'none';
+    for (const f of rows) {
+      const ctx = f.context || '';
+      const short = ctx.length > 100 ? ctx.slice(0, 100) + '…' : ctx;
+      const urlCell = isOnion(f.url)
+        ? '<span class="onion">' + esc(f.url) + '</span>'
+        : '<a href="' + esc(f.url) + '" target="_blank" rel="noopener noreferrer">' + esc(f.url) + '</a>';
+      const badge = f.high_signal
+        ? '<span class="badge badge-hi">HIGH</span>'
+        : '<span class="badge badge-lo">—</span>';
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td>' + esc(f.source_name) + '</td>' +
+        '<td class="url">' + urlCell + '</td>' +
+        '<td>' + esc(f.matched_variant) + '</td>' +
+        '<td class="ctx" title="' + esc(ctx) + '">' + esc(short) + '</td>' +
+        '<td>' + badge + '</td>' +
+        '<td>' + esc(fmtTime(f.found_at)) + '</td>';
+      body.appendChild(tr);
+    }
+  }
+
+  async function loadSessions() {
+    try {
+      const resp = await fetch('/api/quick-scan/sessions');
+      if (!resp.ok) return;
+      const rows = await resp.json();
+      const body = document.getElementById('qs-sessions-body');
+      const empty = document.getElementById('qs-sessions-empty');
+      body.innerHTML = '';
+      if (!rows.length) { empty.style.display = 'block'; return; }
+      empty.style.display = 'none';
+      for (const s of rows) {
+        const tr = document.createElement('tr');
+        tr.className = 'sess-row';
+        tr.onclick = () => openSession(s.id, s.target_value);
+        tr.innerHTML =
+          '<td>' + esc(s.target_value) + '</td>' +
+          '<td>' + esc(s.target_type) + '</td>' +
+          '<td><span class="dot ' + esc(s.status) + '"></span>' + esc(s.status) + '</td>' +
+          '<td>' + esc(s.urls_visited) + '</td>' +
+          '<td>' + esc(s.findings_count) + '</td>' +
+          '<td>' + esc(fmtTime(s.started_at)) + '</td>';
+        body.appendChild(tr);
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  function openSession(id, target) {
+    currentSession = id;
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    document.getElementById('qs-activity-panel').style.display = '';
+    document.getElementById('qs-findings-panel').style.display = '';
+    document.getElementById('qs-target-label').textContent = target;
+    pollStatus();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  loadSessions();
+</script>
+</body>
+</html>
