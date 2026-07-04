@@ -5,7 +5,7 @@
 The fastest way to get running on any fresh Linux server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/osintph/darkweb-scanner/main/deploy.sh -o /tmp/deploy.sh && sudo bash /tmp/deploy.sh
+curl -fsSL https://raw.githubusercontent.com/osintph/threatintel-platform/main/deploy.sh -o /tmp/deploy.sh && sudo bash /tmp/deploy.sh
 ```
 
 This installs Docker, clones the repo, configures Tor, generates secrets, and starts all services automatically.
@@ -31,7 +31,7 @@ DOMAIN=scanner.yourdomain.com SSL_EMAIL=you@example.com sudo bash /tmp/deploy.sh
 
 **Option B — Set domain after deployment:**
 ```bash
-sudo bash ~/darkweb-scanner/scripts/configure-ssl.sh
+sudo bash ~/threatintel-platform/scripts/configure-ssl.sh
 ```
 
 ### DNS Setup
@@ -64,14 +64,14 @@ ufw enable
 
 ```bash
 su - scanner
-curl -fsSL https://raw.githubusercontent.com/osintph/darkweb-scanner/main/deploy.sh -o /tmp/deploy.sh && \
+curl -fsSL https://raw.githubusercontent.com/osintph/threatintel-platform/main/deploy.sh -o /tmp/deploy.sh && \
   DOMAIN=scanner.yourdomain.com SSL_EMAIL=you@example.com sudo bash /tmp/deploy.sh
 ```
 
 ### 3. Configure API keys
 
 ```bash
-nano ~/darkweb-scanner/.env
+nano ~/threatintel-platform/.env
 ```
 
 ---
@@ -152,7 +152,7 @@ The digest sends curated threat intelligence every morning at 08:00 PHT.
 
 **4. Schedule with cron:**
 ```bash
-0 0 * * * cd ~/darkweb-scanner && docker compose exec -T dashboard \
+0 0 * * * cd ~/threatintel-platform && docker compose exec -T dashboard \
   python -c "from darkweb_scanner.digest import send_digest; from darkweb_scanner.storage import Storage; send_digest(Storage())"
 ```
 
@@ -167,7 +167,7 @@ No additional setup required. Uses free public sources (crt.sh, HackerTarget, ip
 ## Updating
 
 ```bash
-cd ~/darkweb-scanner
+cd ~/threatintel-platform
 git pull
 docker compose build --no-cache
 docker compose up -d
@@ -216,7 +216,7 @@ Add an A record for `webcheck.YOURDOMAIN` pointing to your server IP. Set to DNS
 
 **4. Start the container**
 ```bash
-cd /root/darkweb-scanner
+cd /root/threatintel-platform
 docker compose up -d webcheck
 ```
 
