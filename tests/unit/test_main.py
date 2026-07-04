@@ -11,13 +11,13 @@ from darkweb_scanner.scanner import KeywordConfig
 async def _empty_crawl(seeds):
     """Async generator that yields nothing (successful empty crawl)."""
     return
-    yield  # noqa: unreachable — makes this an async generator
+    yield  # unreachable — makes this an async generator
 
 
 async def _raising_crawl(seeds):
     """Async generator that raises on first iteration."""
     raise RuntimeError("network error")
-    yield  # noqa: unreachable
+    yield  # unreachable — makes this an async generator
 
 
 def _make_mocks():

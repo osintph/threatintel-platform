@@ -98,7 +98,7 @@ def test_dns_certs_calls_safe_fetch(app):
         "darkweb_scanner.dashboard.dashboard_routes.safe_fetch",
         return_value=_ok("https://crt.sh/?q=%.example.com&output=json", body=cert_body),
     ) as mock_fetch:
-        resp = _authed_client(app).get("/api/dns/certs/example.com")
+        _authed_client(app).get("/api/dns/certs/example.com")
 
     # Route may return 200 or 500 depending on cert-parsing, but safe_fetch must be called
     mock_fetch.assert_called_once()

@@ -1145,7 +1145,7 @@ def api_report_pdf():
             headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
 
-    except Exception as e:
+    except Exception:
         import traceback
         import uuid
         error_id = uuid.uuid4().hex

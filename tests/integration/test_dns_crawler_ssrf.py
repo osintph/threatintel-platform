@@ -9,10 +9,7 @@ resources.
 import socket
 from unittest.mock import patch
 
-import pytest
-
 from darkweb_scanner.dns_crawler import (
-    COMMON_PORTS,
     enumerate_directories,
     probe_service,
     scan_ports_multi,
