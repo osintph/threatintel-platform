@@ -217,3 +217,70 @@ def test_blocks_nat64():
                return_value=_NAT64):
         with pytest.raises(SafeFetchError, match="private"):
             safe_fetch("https://api.github.com/test")
+
+
+# ── SEC-FABLE-4: check_host_ssrf and allow_redirects=False coverage ───────────
+
+def test_check_host_ssrf_rejects_disallowed_scheme():
+    """check_host_ssrf resolves and validates the host — private IPs are rejected."""
+    with patch("darkweb_scanner.dashboard.http_client.socket.getaddrinfo",
+               return_value=_RFC1918):
+        with pytest.raises(SafeFetchError):
+            check_host_ssrf("internal-corp-host.example.com")
+
+
+def test_check_host_ssrf_rejects_private_ip():
+    """check_host_ssrf raises SafeFetchError when getaddrinfo returns 10.0.0.5."""
+    _PRIVATE_10 = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.5", 0))]
+    with patch("darkweb_scanner.dashboard.http_client.socket.getaddrinfo",
+               return_value=_PRIVATE_10):
+        with pytest.raises(SafeFetchError, match="private"):
+            check_host_ssrf("internal.corp")
+
+
+def test_check_host_ssrf_rejects_mapped_ipv6_loopback():
+    """check_host_ssrf must reject ::ffff:127.0.0.1 (Finding 1 fix in check_host_ssrf)."""
+    with patch("darkweb_scanner.dashboard.http_client.socket.getaddrinfo",
+               return_value=_IPV4_MAPPED_LOOPBACK):
+        with pytest.raises(SafeFetchError, match="private"):
+            check_host_ssrf("loopback-via-ipv6.example.com")
+
+
+def test_check_host_ssrf_allows_public_ip():
+    """check_host_ssrf does not raise for a globally routable IP."""
+    with patch("darkweb_scanner.dashboard.http_client.socket.getaddrinfo",
+               return_value=_PUBLIC):
+        check_host_ssrf("public-host.example.com")  # must not raise
+
+
+def test_safe_fetch_default_no_redirect_follow():
+    """_requests.request is always called with allow_redirects=False (mirror test_tls_verify_true)."""
+    with (
+        patch("darkweb_scanner.dashboard.http_client.socket.getaddrinfo", return_value=_PUBLIC),
+        patch(
+            "darkweb_scanner.dashboard.http_client._requests.request",
+            return_value=_resp_200(),
+        ) as mock_req,
+    ):
+        safe_fetch("https://api.github.com/test")
+
+    call_kwargs = mock_req.call_args[1]
+    assert call_kwargs.get("allow_redirects") is False, (
+        f"allow_redirects={call_kwargs.get('allow_redirects')!r} — must be False to prevent "
+        "requests from following redirects internally and bypassing per-hop re-validation"
+    )
+
+
+def test_safe_fetch_redirect_follow_requires_explicit_optin():
+    """A 302 is returned as-is unless allow_redirects=True is explicitly passed."""
+    with (
+        patch("darkweb_scanner.dashboard.http_client.socket.getaddrinfo", return_value=_PUBLIC),
+        patch(
+            "darkweb_scanner.dashboard.http_client._requests.request",
+            return_value=_resp_302("https://api.github.com/redirected"),
+        ) as mock_req,
+    ):
+        result = safe_fetch("https://api.github.com/original")
+
+    assert result["status"] == 302, "302 must be returned without following when allow_redirects not set"
+    assert mock_req.call_count == 1, "request must be called exactly once (no follow)"
