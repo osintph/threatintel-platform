@@ -98,6 +98,8 @@ def attempt_zone_transfer(domain: str) -> dict:
     except ImportError:
         return {"error": "dnspython not installed"}
 
+    from darkweb_scanner.dashboard.http_client import _is_private_ip
+
     results = {}
     try:
         ns_answers = dns.resolver.resolve(domain, "NS", lifetime=DNS_TIMEOUT)
@@ -108,6 +110,10 @@ def attempt_zone_transfer(domain: str) -> dict:
     for ns in nameservers:
         try:
             ns_ip = socket.gethostbyname(ns)
+            if _is_private_ip(ns_ip):
+                results[ns] = {"success": False, "error": "Blocked: nameserver resolves to a private/reserved IP"}
+                logger.warning("Zone transfer blocked: %r resolves to private IP %r", ns, ns_ip)
+                continue
             zone = dns.zone.from_xfr(dns.query.xfr(ns_ip, domain, timeout=DNS_TIMEOUT))
             records = []
             for name, node in zone.nodes.items():
@@ -333,13 +339,18 @@ def analyze_email_security(domain: str, dns_records: dict) -> dict:
 def resolve_subdomains(subdomains: list[str], max_workers: int = 20) -> list[dict]:
     """
     Resolve a list of subdomains to IPs in parallel, then geolocate.
+    Private IPs are filtered from results before returning.
     """
+    from darkweb_scanner.dashboard.http_client import _is_private_ip
+
     resolved = []
 
     def resolve_one(sub: str) -> Optional[dict]:
         ips = resolve_ip(sub)
         if ips:
-            return {"subdomain": sub, "ips": ips}
+            public_ips = [ip for ip in ips if not _is_private_ip(ip)]
+            if public_ips:
+                return {"subdomain": sub, "ips": public_ips}
         return None
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -560,14 +571,24 @@ def scan_ports_multi(hosts: list[str], max_workers: int = 30) -> dict[str, list[
     """
     Scan all COMMON_PORTS against multiple hosts in parallel.
     Returns dict of host -> list of port results.
+    Private/reserved IPs are skipped and logged.
     """
+    from darkweb_scanner.dashboard.http_client import _is_private_ip
+
     results = {}
+
+    safe_hosts = []
+    for h in hosts[:10]:  # cap at 10 hosts
+        if _is_private_ip(h):
+            logger.warning("scan_ports_multi: skipping private/reserved IP %r", h)
+        else:
+            safe_hosts.append(h)
 
     def scan_host(host):
         return host, scan_ports(host, COMMON_PORTS, max_workers=50)
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(scan_host, h): h for h in hosts[:10]}  # cap at 10 hosts
+        futures = {ex.submit(scan_host, h): h for h in safe_hosts}
         for future in as_completed(futures):
             try:
                 host, port_results = future.result()
@@ -623,8 +644,10 @@ SUBDOMAIN_WORDLIST = [
 def brute_force_subdomains(domain: str, wordlist: list[str] = None, max_workers: int = 50) -> list[dict]:
     """
     Actively brute-force subdomains by DNS resolution against a wordlist.
-    Returns list of {subdomain, ips} for each that resolves.
+    Returns list of {subdomain, ips} for each that resolves to a public IP.
     """
+    from darkweb_scanner.dashboard.http_client import _is_private_ip
+
     if wordlist is None:
         wordlist = SUBDOMAIN_WORDLIST
 
@@ -634,7 +657,9 @@ def brute_force_subdomains(domain: str, wordlist: list[str] = None, max_workers:
     def try_resolve(fqdn: str) -> Optional[dict]:
         ips = resolve_ip(fqdn)
         if ips:
-            return {"subdomain": fqdn, "ips": ips, "source": "bruteforce"}
+            public_ips = [ip for ip in ips if not _is_private_ip(ip)]
+            if public_ips:
+                return {"subdomain": fqdn, "ips": public_ips, "source": "bruteforce"}
         return None
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -700,6 +725,13 @@ def enumerate_directories(
     Returns list of {path, url, status_code, content_length, redirect_to}
     for any path that returns a non-404 response.
     """
+    from darkweb_scanner.dashboard.http_client import resolve_and_check_target, SafeFetchError
+    try:
+        resolve_and_check_target(target)
+    except SafeFetchError as e:
+        logger.warning("enumerate_directories: %r blocked by SSRF guard — %s", target, e)
+        return []
+
     if paths is None:
         paths = DIR_WORDLIST
 
@@ -810,6 +842,13 @@ def probe_service(fqdn: str) -> Optional[dict]:
     Probe a single hostname over HTTPS then HTTP.
     Returns {host, url, status_code, server, title, tech, redirect_to} or None.
     """
+    from darkweb_scanner.dashboard.http_client import resolve_and_check_target, SafeFetchError
+    try:
+        resolve_and_check_target(fqdn)
+    except SafeFetchError as e:
+        logger.warning("probe_service: %r blocked by SSRF guard — %s", fqdn, e)
+        return None
+
     for proto in ("https", "http"):
         url = f"{proto}://{fqdn}"
         try:
