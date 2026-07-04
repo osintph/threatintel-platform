@@ -4,19 +4,16 @@ Dashboard blueprint — all protected routes.
 
 import json
 import os
-import ssl
-import urllib.error
-import urllib.request
-import urllib3
 from datetime import datetime, timezone
 from pathlib import Path
+
+import requests
 
 from flask import Blueprint, Response, jsonify, render_template, request, session
 
 from ..auth import hash_password, require_login, validate_password_strength
+from .http_client import SafeFetchError, check_host_ssrf, safe_fetch
 from .storage_helper import get_storage
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 dashboard_bp = Blueprint("dashboard", __name__)
 
@@ -1723,15 +1720,19 @@ def api_dns_enrich(inv_id: int):
     domain = inv["domain"]
 
     # ── Call DNSDumpster API ──────────────────────────────────────────────────
-    status, body = _fetch_url(
-        f"https://api.dnsdumpster.com/domain/{domain}",
-        headers={
-            "X-API-Key": api_key,
-            "Accept": "application/json",
-            "User-Agent": "OSINTPH-DNSCrawler/1.0",
-        },
-        timeout=20,
-    )
+    try:
+        _dn = safe_fetch(
+            f"https://api.dnsdumpster.com/domain/{domain}",
+            headers={
+                "X-API-Key": api_key,
+                "Accept": "application/json",
+                "User-Agent": "OSINTPH-DNSCrawler/1.0",
+            },
+            timeout=20,
+        )
+    except SafeFetchError as e:
+        return jsonify({"error": str(e)}), 502
+    status, body = _dn["status"], _dn["body"]
 
     if status != 200:
         return jsonify({"error": f"DNSDumpster API returned {status}", "body": body[:200].decode("utf-8", errors="replace")}), 502
@@ -1832,30 +1833,26 @@ def api_dns_certs(domain: str):
     Returns rich cert data: issuer, validity, SANs, grouped by cert.
     """
     import json as _json
-    import requests as _requests
 
     domain = domain.strip().lower().split("/")[0]
 
     # Query crt.sh — use the deduplicated JSON endpoint
     try:
-        resp = _requests.get(
+        _result = safe_fetch(
             f"https://crt.sh/?q=%.{domain}&output=json",
             headers={"User-Agent": "OSINTPH-DNSCrawler/1.0", "Accept": "application/json"},
             timeout=30,
-            verify=False,
         )
-    except _requests.exceptions.Timeout:
-        return jsonify({"error": "crt.sh timed out — try again in a moment"}), 502
-    except Exception as e:
-        return jsonify({"error": f"crt.sh connection failed: {str(e)}"}), 502
+    except SafeFetchError as e:
+        return jsonify({"error": f"crt.sh request failed: {e}"}), 502
 
-    if resp.status_code != 200:
-        return jsonify({"error": f"crt.sh returned HTTP {resp.status_code}"}), 502
+    if _result["status"] != 200:
+        return jsonify({"error": f"crt.sh returned HTTP {_result['status']}"}), 502
 
     try:
-        raw = resp.json()
+        raw = _json.loads(_result["body"])
     except Exception:
-        preview = resp.text[:120]
+        preview = _result["body"][:120].decode("utf-8", errors="replace")
         return jsonify({"error": f"crt.sh returned non-JSON: {preview}"}), 502
 
     from datetime import datetime as dt
@@ -2724,16 +2721,15 @@ window._ready = true;
         # Try to fetch rich cert data from crt.sh for the PDF
         rich_cert_data = None
         try:
-            import requests as _req
-            _cr = _req.get(
+            _cr_result = safe_fetch(
                 f"https://crt.sh/?q=%.{domain}&output=json",
                 headers={"User-Agent": "OSINTPH-PDFGen/1.0", "Accept": "application/json"},
-                timeout=20, verify=False,
+                timeout=20,
             )
-            if _cr.status_code == 200:
+            if _cr_result["status"] == 200:
                 from datetime import datetime as _dt
                 _now = _dt.now(timezone.utc).replace(tzinfo=None)
-                _raw = _cr.json()
+                _raw = json.loads(_cr_result["body"])
                 _certs = []
                 _seen = set()
                 _issuer_cnt = Counter()
@@ -3283,21 +3279,8 @@ def api_paste_scan():
 
 # ── OSINT Toolkit Proxy Routes ────────────────────────────────────────────────
 # Server-side proxy so browser CORS restrictions don't block external APIs
-
-def _fetch_url(url, headers=None, timeout=10):
-    """Simple HTTP GET helper, returns (status, body_bytes)."""
-    req = urllib.request.Request(url, headers=headers or {
-        "User-Agent": "Mozilla/5.0 (compatible; OsintBot/1.0)",
-        "Accept": "application/json, text/html, */*",
-    })
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            return resp.status, resp.read()
-    except urllib.error.HTTPError as e:
-        return e.code, e.read()
+# All routes use safe_fetch() which enforces HTTPS, host allowlist, and IP
+# blocklist. See dashboard/http_client.py for the full policy.
 
 
 @dashboard_bp.route("/api/osint/github/<username>")
@@ -3305,15 +3288,18 @@ def _fetch_url(url, headers=None, timeout=10):
 def osint_github(username):
     """Proxy GitHub public API."""
     import json as _json
-    status, body = _fetch_url(f"https://api.github.com/users/{username}", headers={
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "OsintTool/1.0",
-    })
-    # Also fetch events for email extraction
-    _, ev_body = _fetch_url(f"https://api.github.com/users/{username}/events/public?per_page=10", headers={
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "OsintTool/1.0",
-    })
+    try:
+        _r1 = safe_fetch(
+            f"https://api.github.com/users/{username}",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "OsintTool/1.0"},
+        )
+        _r2 = safe_fetch(
+            f"https://api.github.com/users/{username}/events/public?per_page=10",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "OsintTool/1.0"},
+        )
+    except SafeFetchError as e:
+        return jsonify({"error": str(e)}), 502
+    status, body, ev_body = _r1["status"], _r1["body"], _r2["body"]
     try:
         profile = _json.loads(body)
         events = _json.loads(ev_body) if ev_body else []
@@ -3333,12 +3319,15 @@ def osint_github(username):
 @require_login
 def osint_reddit(username):
     import json as _json
-    status, body = _fetch_url(f"https://www.reddit.com/user/{username}/about.json", headers={
-        "User-Agent": "OsintTool/1.0 (research)",
-        "Accept": "application/json",
-    })
     try:
-        return jsonify(_json.loads(body)), status
+        _r = safe_fetch(
+            f"https://www.reddit.com/user/{username}/about.json",
+            headers={"User-Agent": "OsintTool/1.0 (research)", "Accept": "application/json"},
+        )
+    except SafeFetchError as e:
+        return jsonify({"error": str(e)}), 502
+    try:
+        return jsonify(_json.loads(_r["body"])), _r["status"]
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3347,9 +3336,12 @@ def osint_reddit(username):
 @require_login
 def osint_discord(user_id):
     import json as _json
-    status, body = _fetch_url(f"https://discordlookup.mesalytic.moe/v1/user/{user_id}")
     try:
-        return jsonify(_json.loads(body)), status
+        _r = safe_fetch(f"https://discordlookup.mesalytic.moe/v1/user/{user_id}")
+    except SafeFetchError as e:
+        return jsonify({"error": str(e)}), 502
+    try:
+        return jsonify(_json.loads(_r["body"])), _r["status"]
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3360,8 +3352,14 @@ def osint_domain(domain):
     import json as _json
     domain = domain.strip().lower().split("/")[0]
     results = {}
-    # RDAP
-    rdap_status, rdap_body = _fetch_url(f"https://rdap.org/domain/{domain}")
+    # RDAP — rdap.org is allowlisted; registry-specific redirect targets are not.
+    # If rdap.org redirects to a non-allowlisted registry RDAP server, SafeFetchError
+    # is raised and we return an empty rdap result gracefully.
+    try:
+        _rdap = safe_fetch(f"https://rdap.org/domain/{domain}", allow_redirects=True)
+        rdap_status, rdap_body = _rdap["status"], _rdap["body"]
+    except SafeFetchError:
+        rdap_status, rdap_body = 0, b""
     try:
         results["rdap"] = _json.loads(rdap_body)
         results["rdap_status"] = rdap_status
@@ -3369,10 +3367,14 @@ def osint_domain(domain):
         results["rdap"] = None
         results["rdap_status"] = rdap_status
     # crt.sh
-    crt_status, crt_body = _fetch_url(f"https://crt.sh/?q={domain}&output=json", headers={
-        "User-Agent": "OsintTool/1.0",
-        "Accept": "application/json",
-    })
+    try:
+        _crt = safe_fetch(
+            f"https://crt.sh/?q={domain}&output=json",
+            headers={"User-Agent": "OsintTool/1.0", "Accept": "application/json"},
+        )
+        crt_status, crt_body = _crt["status"], _crt["body"]
+    except SafeFetchError:
+        crt_status, crt_body = 0, b"[]"
     try:
         certs = _json.loads(crt_body) if crt_status == 200 else []
         names = sorted(set(
@@ -3391,20 +3393,22 @@ def osint_domain(domain):
 @require_login
 def osint_tiktok(username):
     import json as _json
-    # TikTok timestamp trick: user ID is encoded in the video ID
-    status, body = _fetch_url(
-        f"https://www.tiktok.com/api/user/detail/?uniqueId={username}&aid=1988",
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://www.tiktok.com/",
-            "Accept": "application/json",
-        }
-    )
     try:
-        data = _json.loads(body)
-        return jsonify(data), status
+        _r = safe_fetch(
+            f"https://www.tiktok.com/api/user/detail/?uniqueId={username}&aid=1988",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://www.tiktok.com/",
+                "Accept": "application/json",
+            },
+        )
+    except SafeFetchError as e:
+        return jsonify({"error": str(e)}), 502
+    try:
+        data = _json.loads(_r["body"])
+        return jsonify(data), _r["status"]
     except Exception as e:
-        return jsonify({"error": str(e), "raw": body[:200].decode("utf-8", errors="replace")}), 500
+        return jsonify({"error": str(e), "raw": _r["body"][:200].decode("utf-8", errors="replace")}), 500
 
 
 @dashboard_bp.route("/api/osint/username/<username>")
@@ -3413,12 +3417,14 @@ def osint_username_check(username):
     """Check a username against WhatsMyName dataset."""
     import json as _json
     import concurrent.futures
-    _, wmn_body = _fetch_url(
-        "https://raw.githubusercontent.com/WebBreacher/WhatsMyName/main/wmn-data.json"
-    )
+    from urllib.parse import urlparse as _urlparse
     try:
-        wmn = _json.loads(wmn_body)
-    except Exception as e:
+        _wmn = safe_fetch(
+            "https://raw.githubusercontent.com/WebBreacher/WhatsMyName/main/wmn-data.json",
+            timeout=15,
+        )
+        wmn = _json.loads(_wmn["body"])
+    except (SafeFetchError, Exception) as e:
         return jsonify({"error": f"Could not fetch WMN data: {e}"}), 500
 
     sites = [s for s in wmn.get("sites", []) if s.get("uri_check") and s.get("e_code") == 200][:200]
@@ -3426,15 +3432,22 @@ def osint_username_check(username):
 
     def check(site):
         url = site["uri_check"].replace("{account}", username)
+        # WhatsMyName spans 200+ public sites — host allowlist not applied.
+        # HTTPS enforced; private-IP blocklist applied to block SSRF.
+        if not url.startswith("https://"):
+            return None
         try:
-            st, body_b = _fetch_url(url, timeout=6)
-            text = body_b.decode("utf-8", errors="replace")
-            e_string = site.get("e_string", "")
-            m_string = site.get("m_string", "")
-            if st == site["e_code"] and (not e_string or e_string in text) and (not m_string or m_string not in text):
-                return {"name": site["name"], "url": url, "pretty": site.get("uri_pretty", "").replace("{account}", username)}
-        except Exception:
-            pass
+            _host = _urlparse(url).hostname or ""
+            check_host_ssrf(_host)
+            r = requests.get(url, timeout=6, verify=True, allow_redirects=False)
+            st, body_b = r.status_code, r.content
+        except (SafeFetchError, Exception):
+            return None
+        text = body_b.decode("utf-8", errors="replace")
+        e_string = site.get("e_string", "")
+        m_string = site.get("m_string", "")
+        if st == site["e_code"] and (not e_string or e_string in text) and (not m_string or m_string not in text):
+            return {"name": site["name"], "url": url, "pretty": site.get("uri_pretty", "").replace("{account}", username)}
         return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=30) as pool:
@@ -3451,59 +3464,50 @@ def osint_username_check(username):
 @require_login
 def proxy_threatfox():
     """Proxy ThreatFox API — avoids CORS from browser."""
-    import json as _json
+    body = request.get_data()
+    api_key = os.getenv("THREATFOX_API_KEY", "")
+    _hdrs = {"Content-Type": "application/json", "User-Agent": "OSINTPH/1.0"}
+    if api_key:
+        _hdrs["Auth-Key"] = api_key
     try:
-        body = request.get_data()
-        api_key = os.getenv("THREATFOX_API_KEY", "")
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "OSINTPH/1.0",
-        }
-        if api_key:
-            headers["Auth-Key"] = api_key
-        req = urllib.request.Request(
+        _r = safe_fetch(
             "https://threatfox-api.abuse.ch/api/v1/",
-            data=body,
-            headers=headers,
             method="POST",
+            headers=_hdrs,
+            data=body,
+            timeout=15,
         )
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-            return Response(resp.read(), mimetype="application/json")
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return Response(_r["body"], mimetype="application/json")
+    except SafeFetchError as e:
+        return jsonify({"error": str(e)}), 502
 
 
 @dashboard_bp.route("/api/proxy/urlhaus", methods=["POST"])
 @require_login
 def proxy_urlhaus():
     """Proxy URLhaus recent URLs."""
-    import json as _json
     try:
-        body = b"limit=200"
-        req = urllib.request.Request(
+        _r = safe_fetch(
             "https://urlhaus-api.abuse.ch/v1/urls/recent/",
-            data=body,
-            headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "OSINTPH/1.0"},
             method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "OSINTPH/1.0"},
+            data=b"limit=200",
+            timeout=15,
         )
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-            return Response(resp.read(), mimetype="application/json")
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return Response(_r["body"], mimetype="application/json")
+    except SafeFetchError as e:
+        return jsonify({"error": str(e)}), 502
 
 
 @dashboard_bp.route("/api/proxy/feodo")
 @require_login
 def proxy_feodo():
     """Proxy Feodo Tracker C2 blocklist."""
-    status, body = _fetch_url("https://feodotracker.abuse.ch/downloads/ipblocklist.json")
-    return Response(body, mimetype="application/json")
+    try:
+        _r = safe_fetch("https://feodotracker.abuse.ch/downloads/ipblocklist.json")
+        return Response(_r["body"], mimetype="application/json")
+    except SafeFetchError as e:
+        return jsonify({"error": str(e)}), 502
 
 
 # ── WhiteIntel proxy ───────────────────────────────────────────────────────────
@@ -3529,14 +3533,18 @@ def whiteintel_alerts():
     if severity:
         params += f"&severity={severity}"
 
-    status, body = _fetch_url(
-        f"https://whiteintel.io/api/v1/alerts{params}",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Accept": "application/json",
-            "User-Agent": "OSINTPH/1.0",
-        },
-    )
+    try:
+        _r = safe_fetch(
+            f"https://whiteintel.io/api/v1/alerts{params}",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+                "User-Agent": "OSINTPH/1.0",
+            },
+        )
+        status, body = _r["status"], _r["body"]
+    except SafeFetchError as e:
+        return jsonify({"ok": False, "error": str(e), "data": []}), 200
     try:
         data = _json.loads(body)
         return jsonify({"ok": True, "data": data})
@@ -3556,14 +3564,18 @@ def whiteintel_search():
     if not api_key:
         return jsonify({"ok": False, "error": "WHITEINTEL_API_KEY not set", "data": []}), 200
 
-    status, body = _fetch_url(
-        f"https://whiteintel.io/api/v1/search?domain={domain}",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Accept": "application/json",
-            "User-Agent": "OSINTPH/1.0",
-        },
-    )
+    try:
+        _r = safe_fetch(
+            f"https://whiteintel.io/api/v1/search?domain={domain}",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+                "User-Agent": "OSINTPH/1.0",
+            },
+        )
+        status, body = _r["status"], _r["body"]
+    except SafeFetchError as e:
+        return jsonify({"ok": False, "error": str(e)}), 200
     try:
         data = _json.loads(body)
         return jsonify({"ok": True, "data": data})
