@@ -3,9 +3,12 @@ Dashboard blueprint — all protected routes.
 """
 
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 import requests
 
@@ -1144,7 +1147,10 @@ def api_report_pdf():
 
     except Exception as e:
         import traceback
-        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+        import uuid
+        error_id = uuid.uuid4().hex
+        logger.error("api_report_pdf error [%s]: %s", error_id, traceback.format_exc())
+        return jsonify({"error": "PDF generation failed. Please try again later.", "error_id": error_id}), 500
 
 
 # ── Investigations API ─────────────────────────────────────────────────────────
@@ -1731,7 +1737,8 @@ def api_dns_enrich(inv_id: int):
             timeout=20,
         )
     except SafeFetchError as e:
-        return jsonify({"error": str(e)}), 502
+        logger.warning("DNSDumpster safe_fetch blocked: %s", e)
+        return jsonify({"error": "External request blocked by security policy."}), 502
     status, body = _dn["status"], _dn["body"]
 
     if status != 200:
@@ -1844,7 +1851,8 @@ def api_dns_certs(domain: str):
             timeout=30,
         )
     except SafeFetchError as e:
-        return jsonify({"error": f"crt.sh request failed: {e}"}), 502
+        logger.warning("crt.sh safe_fetch blocked: %s", e)
+        return jsonify({"error": "Certificate transparency lookup failed."}), 502
 
     if _result["status"] != 200:
         return jsonify({"error": f"crt.sh returned HTTP {_result['status']}"}), 502
@@ -3298,7 +3306,8 @@ def osint_github(username):
             headers={"Accept": "application/vnd.github+json", "User-Agent": "OsintTool/1.0"},
         )
     except SafeFetchError as e:
-        return jsonify({"error": str(e)}), 502
+        logger.warning("GitHub OSINT safe_fetch blocked: %s", e)
+        return jsonify({"error": "External request blocked by security policy."}), 502
     status, body, ev_body = _r1["status"], _r1["body"], _r2["body"]
     try:
         profile = _json.loads(body)
@@ -3325,7 +3334,8 @@ def osint_reddit(username):
             headers={"User-Agent": "OsintTool/1.0 (research)", "Accept": "application/json"},
         )
     except SafeFetchError as e:
-        return jsonify({"error": str(e)}), 502
+        logger.warning("Reddit OSINT safe_fetch blocked: %s", e)
+        return jsonify({"error": "External request blocked by security policy."}), 502
     try:
         return jsonify(_json.loads(_r["body"])), _r["status"]
     except Exception as e:
@@ -3339,7 +3349,8 @@ def osint_discord(user_id):
     try:
         _r = safe_fetch(f"https://discordlookup.mesalytic.moe/v1/user/{user_id}")
     except SafeFetchError as e:
-        return jsonify({"error": str(e)}), 502
+        logger.warning("Discord OSINT safe_fetch blocked: %s", e)
+        return jsonify({"error": "External request blocked by security policy."}), 502
     try:
         return jsonify(_json.loads(_r["body"])), _r["status"]
     except Exception as e:
@@ -3403,7 +3414,8 @@ def osint_tiktok(username):
             },
         )
     except SafeFetchError as e:
-        return jsonify({"error": str(e)}), 502
+        logger.warning("TikTok OSINT safe_fetch blocked: %s", e)
+        return jsonify({"error": "External request blocked by security policy."}), 502
     try:
         data = _json.loads(_r["body"])
         return jsonify(data), _r["status"]
@@ -3479,7 +3491,8 @@ def proxy_threatfox():
         )
         return Response(_r["body"], mimetype="application/json")
     except SafeFetchError as e:
-        return jsonify({"error": str(e)}), 502
+        logger.warning("ThreatFox proxy safe_fetch blocked: %s", e)
+        return jsonify({"error": "External request blocked by security policy."}), 502
 
 
 @dashboard_bp.route("/api/proxy/urlhaus", methods=["POST"])
@@ -3496,7 +3509,8 @@ def proxy_urlhaus():
         )
         return Response(_r["body"], mimetype="application/json")
     except SafeFetchError as e:
-        return jsonify({"error": str(e)}), 502
+        logger.warning("URLhaus proxy safe_fetch blocked: %s", e)
+        return jsonify({"error": "External request blocked by security policy."}), 502
 
 
 @dashboard_bp.route("/api/proxy/feodo")
@@ -3507,7 +3521,8 @@ def proxy_feodo():
         _r = safe_fetch("https://feodotracker.abuse.ch/downloads/ipblocklist.json")
         return Response(_r["body"], mimetype="application/json")
     except SafeFetchError as e:
-        return jsonify({"error": str(e)}), 502
+        logger.warning("Feodo proxy safe_fetch blocked: %s", e)
+        return jsonify({"error": "External request blocked by security policy."}), 502
 
 
 # ── WhiteIntel proxy ───────────────────────────────────────────────────────────
@@ -3544,7 +3559,8 @@ def whiteintel_alerts():
         )
         status, body = _r["status"], _r["body"]
     except SafeFetchError as e:
-        return jsonify({"ok": False, "error": str(e), "data": []}), 200
+        logger.warning("WhiteIntel alerts safe_fetch blocked: %s", e)
+        return jsonify({"ok": False, "error": "External request blocked by security policy.", "data": []}), 200
     try:
         data = _json.loads(body)
         return jsonify({"ok": True, "data": data})
@@ -3575,7 +3591,8 @@ def whiteintel_search():
         )
         status, body = _r["status"], _r["body"]
     except SafeFetchError as e:
-        return jsonify({"ok": False, "error": str(e)}), 200
+        logger.warning("WhiteIntel search safe_fetch blocked: %s", e)
+        return jsonify({"ok": False, "error": "External request blocked by security policy."}), 200
     try:
         data = _json.loads(body)
         return jsonify({"ok": True, "data": data})
