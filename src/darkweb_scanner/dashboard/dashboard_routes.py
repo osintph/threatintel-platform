@@ -8,8 +8,6 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
-
 import requests
 
 from flask import Blueprint, Response, jsonify, render_template, request, session
@@ -17,6 +15,8 @@ from flask import Blueprint, Response, jsonify, render_template, request, sessio
 from ..auth import hash_password, require_login, validate_password_strength
 from .http_client import SafeFetchError, check_host_ssrf, safe_fetch
 from .storage_helper import get_storage
+
+logger = logging.getLogger(__name__)
 
 dashboard_bp = Blueprint("dashboard", __name__)
 
