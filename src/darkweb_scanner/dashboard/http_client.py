@@ -77,7 +77,9 @@ ALLOWED_EXTERNAL_HOSTS: frozenset = frozenset({
     "api.mailgun.net",
 })
 
-# Networks that must never be the destination of a proxied request
+# Supplementary networks not fully covered by ipaddress stdlib classifiers on all
+# Python versions. The stdlib is_private/is_reserved/is_loopback/is_link_local
+# checks run first; these catch anything that slips through.
 _BLOCKED_NETS = [
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
@@ -88,6 +90,11 @@ _BLOCKED_NETS = [
     ipaddress.ip_network("::1/128"),
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("fe80::/10"),
+    # Ranges the stdlib is_private misses on older Python versions:
+    ipaddress.ip_network("100.64.0.0/10"),   # CGNAT (RFC 6598)
+    ipaddress.ip_network("192.0.0.0/24"),    # IETF protocol assignments (RFC 6890)
+    ipaddress.ip_network("198.18.0.0/15"),   # benchmarking (RFC 2544)
+    ipaddress.ip_network("64:ff9b::/96"),    # NAT64 (RFC 6052)
 ]
 
 
@@ -98,9 +105,16 @@ class SafeFetchError(Exception):
 def _is_private_ip(addr: str) -> bool:
     try:
         ip = ipaddress.ip_address(addr)
-        return any(ip in net for net in _BLOCKED_NETS)
     except ValueError:
-        return True  # unparseable address — treat as blocked
+        return True  # unparseable address — fail closed
+    # Unwrap IPv4-mapped IPv6 (::ffff:a.b.c.d) before classifying so that
+    # ::ffff:127.0.0.1 and ::ffff:169.254.169.254 are correctly blocked.
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    if (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+        return True
+    return any(ip in net for net in _BLOCKED_NETS)
 
 
 def _resolve_and_check(hostname: str) -> None:
@@ -117,6 +131,33 @@ def _resolve_and_check(hostname: str) -> None:
             raise SafeFetchError(
                 f"Blocked: {hostname!r} resolves to a private/loopback address {addr!r}"
             )
+
+
+def resolve_and_check_target(host: str) -> list:
+    """Resolve host to IPs, validate each with the private-IP check, return public IPs.
+
+    Raises SafeFetchError if any resolved IP is private, loopback, or otherwise blocked.
+    Used by dns_crawler to apply the same SSRF guard to its recon paths.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise SafeFetchError(
+            f"DNS resolution failed for {host!r}: {exc}"
+        ) from exc
+    seen: set = set()
+    public_ips: list = []
+    for info in infos:
+        addr = info[4][0]
+        if addr in seen:
+            continue
+        seen.add(addr)
+        if _is_private_ip(addr):
+            raise SafeFetchError(
+                f"Blocked: {host!r} resolves to a private/loopback address {addr!r}"
+            )
+        public_ips.append(addr)
+    return public_ips
 
 
 def check_host_ssrf(hostname: str) -> None:

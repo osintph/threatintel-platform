@@ -18,11 +18,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from darkweb_scanner.dashboard.http_client import SafeFetchError, safe_fetch
+from darkweb_scanner.dashboard.http_client import (
+    SafeFetchError,
+    check_host_ssrf,
+    safe_fetch,
+)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-_PUBLIC = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("203.0.113.1", 443))]
+_PUBLIC = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 443))]
 _RFC1918 = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.1", 443))]
 _LOOPBACK = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 443))]
 _LINK_LOCAL = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.1.1", 443))]
@@ -164,3 +168,52 @@ def test_tls_verify_true():
     assert call_kwargs.get("verify") is True, (
         f"verify={call_kwargs.get('verify')!r} — must be True"
     )
+
+
+# ── SEC-FABLE-1: IPv4-mapped IPv6 and new reserved ranges ─────────────────────
+
+_IPV4_MAPPED_LOOPBACK = [(socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("::ffff:127.0.0.1", 443, 0, 0))]
+_IPV4_MAPPED_METADATA = [(socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("::ffff:169.254.169.254", 443, 0, 0))]
+_CGNAT            = [(socket.AF_INET,  socket.SOCK_STREAM, 0, "", ("100.64.1.1", 443))]
+_IPV6_UNSPECIFIED = [(socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("::", 443, 0, 0))]
+_NAT64            = [(socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("64:ff9b::a9fe:a9fe", 443, 0, 0))]
+
+
+def test_blocks_ipv4_mapped_ipv6_loopback():
+    """::ffff:127.0.0.1 must be blocked (IPv4-mapped loopback bypass)."""
+    with patch("darkweb_scanner.dashboard.http_client.socket.getaddrinfo",
+               return_value=_IPV4_MAPPED_LOOPBACK):
+        with pytest.raises(SafeFetchError, match="private"):
+            safe_fetch("https://api.github.com/test")
+
+
+def test_blocks_ipv4_mapped_ipv6_metadata():
+    """::ffff:169.254.169.254 must be blocked (IPv4-mapped link-local bypass)."""
+    with patch("darkweb_scanner.dashboard.http_client.socket.getaddrinfo",
+               return_value=_IPV4_MAPPED_METADATA):
+        with pytest.raises(SafeFetchError, match="private"):
+            safe_fetch("https://api.github.com/test")
+
+
+def test_blocks_cgnat():
+    """100.64.1.1 (CGNAT) must be blocked."""
+    with patch("darkweb_scanner.dashboard.http_client.socket.getaddrinfo",
+               return_value=_CGNAT):
+        with pytest.raises(SafeFetchError, match="private"):
+            safe_fetch("https://api.github.com/test")
+
+
+def test_blocks_ipv6_unspecified():
+    """:: (IPv6 unspecified) must be blocked."""
+    with patch("darkweb_scanner.dashboard.http_client.socket.getaddrinfo",
+               return_value=_IPV6_UNSPECIFIED):
+        with pytest.raises(SafeFetchError, match="private"):
+            safe_fetch("https://api.github.com/test")
+
+
+def test_blocks_nat64():
+    """64:ff9b::a9fe:a9fe (NAT64) must be blocked."""
+    with patch("darkweb_scanner.dashboard.http_client.socket.getaddrinfo",
+               return_value=_NAT64):
+        with pytest.raises(SafeFetchError, match="private"):
+            safe_fetch("https://api.github.com/test")
