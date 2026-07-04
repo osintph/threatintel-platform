@@ -351,7 +351,7 @@ class Storage:
         self._create_tables()
 
     def _create_tables(self):
-        Base.metadata.create_all(self.engine)
+        Base.metadata.create_all(self.engine, checkfirst=True)
         logger.info("Database tables ready")
 
     @contextmanager

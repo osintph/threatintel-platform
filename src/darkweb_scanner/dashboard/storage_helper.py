@@ -2,15 +2,23 @@
 Shared storage accessor — avoids circular imports between app.py and route modules.
 """
 
+import threading
+
 from ..storage import Storage, _FLASK_SESSION_KEY
 
 _storage = None
+# Guards first-time construction: Storage.__init__ runs create_all, and two
+# concurrent requests racing it can collide in Postgres (pg_type_typname_nsp_index
+# UniqueViolation) despite checkfirst.
+_storage_lock = threading.Lock()
 
 
 def get_storage() -> Storage:
     global _storage
     if _storage is None:
-        _storage = Storage()
+        with _storage_lock:
+            if _storage is None:
+                _storage = Storage()
     return _storage
 
 
