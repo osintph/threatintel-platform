@@ -154,15 +154,21 @@ def fetch_crtsh(domain: str) -> list[dict]:
     Query crt.sh for all certificates issued for domain.
     Returns list of subdomains with cert metadata.
     """
-    resp = _safe_http(
-        f"https://crt.sh/?q=%.{domain}&output=json",
-        headers={"User-Agent": "OSINTPH-DNSCrawler/1.0"},
-    )
-    if not resp or resp.status_code != 200:
+    # Use safe_fetch: crt.sh is allowlisted, TLS verified, IP pre-checked.
+    from darkweb_scanner.dashboard.http_client import safe_fetch, SafeFetchError
+    try:
+        result = safe_fetch(
+            f"https://crt.sh/?q=%.{domain}&output=json",
+            headers={"User-Agent": "OSINTPH-DNSCrawler/1.0"},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except SafeFetchError:
+        return []
+    if result["status"] != 200:
         return []
 
     try:
-        data = resp.json()
+        data = json.loads(result["body"])
     except Exception:
         return []
 
@@ -700,7 +706,9 @@ def enumerate_directories(
     results = []
     protocols = ["https", "http"]
 
-    # First figure out which protocol is reachable
+    # First figure out which protocol is reachable.
+    # TLS verification is enforced (verify=True). Targets with self-signed
+    # certs will fail the HTTPS probe and fall through to HTTP.
     base_url = None
     for proto in protocols:
         try:
@@ -709,7 +717,7 @@ def enumerate_directories(
                 timeout=HTTP_TIMEOUT,
                 allow_redirects=True,
                 headers={"User-Agent": "Mozilla/5.0 (compatible; OSINTPH-DirScan/1.0)"},
-                verify=False,
+                verify=True,
             )
             base_url = f"{proto}://{target}"
             break
@@ -728,7 +736,7 @@ def enumerate_directories(
                 timeout=HTTP_TIMEOUT,
                 allow_redirects=follow_redirects,
                 headers={"User-Agent": "Mozilla/5.0 (compatible; OSINTPH-DirScan/1.0)"},
-                verify=False,
+                verify=True,
                 stream=True,
             )
             # Skip boring 404s and common irrelevant codes
@@ -809,7 +817,7 @@ def probe_service(fqdn: str) -> Optional[dict]:
                 url,
                 timeout=HTTP_BANNER_TIMEOUT,
                 headers=HTTP_BANNER_HEADERS,
-                verify=False,
+                verify=True,  # TLS enforced; targets with invalid certs fall through to HTTP
                 allow_redirects=True,
                 stream=True,
             )

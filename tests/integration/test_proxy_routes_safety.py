@@ -105,3 +105,22 @@ def test_dns_certs_calls_safe_fetch(app):
     call_url = mock_fetch.call_args[0][0]
     assert "crt.sh" in call_url
     assert "example.com" in call_url
+
+
+# ── dns_crawler.fetch_crtsh uses safe_fetch ───────────────────────────────────
+
+def test_dns_crawler_fetch_crtsh_calls_safe_fetch():
+    """fetch_crtsh must route through safe_fetch, not _safe_http directly."""
+    crtsh_body = b'[{"name_value": "www.example.com\\napi.example.com"}]'
+    with patch(
+        "darkweb_scanner.dashboard.http_client.safe_fetch",
+        return_value=_ok("https://crt.sh/?q=%.example.com&output=json", body=crtsh_body),
+    ) as mock_fetch:
+        from darkweb_scanner.dns_crawler import fetch_crtsh
+        result = fetch_crtsh("example.com")
+
+    mock_fetch.assert_called_once()
+    call_url = mock_fetch.call_args[0][0]
+    assert "crt.sh" in call_url
+    assert "%.example.com" in call_url
+    assert isinstance(result, list)
