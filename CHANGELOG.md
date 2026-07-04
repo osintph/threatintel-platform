@@ -3,6 +3,49 @@
 All notable changes to this project will be documented in this file.
 The format follows **Keep a Changelog**. This project adheres to **Semantic Versioning**.
 
+## [1.1.0] - 2026-07-04
+
+Quick Scan tab, safe_fetch SSRF/TLS hardening, session lifecycle refactor, N+1 collapse, and audit remediation.
+
+### Security
+
+- **SEC-FABLE-1 / SEC-05 / SEC-06:** Introduced `dashboard/http_client.py` with `safe_fetch` — hardened outbound HTTP client enforcing HTTPS, TLS verification (`verify=True`), per-host allowlist, and IP blocklist; all proxy routes and the crt.sh fetch in `dns_crawler.py` migrated to `safe_fetch`
+- **SEC-FABLE-1:** Closed IPv4-mapped IPv6 bypass (`::ffff:a.b.c.d`) and missing reserved ranges (CGNAT `100.64.0.0/10`, `192.0.0.0/24`, `198.18.0.0/15`, `0.0.0.0/8`) in the private-IP blocklist
+- **SEC-FABLE-3:** Applied SSRF guard to `dns_crawler` recon path (port scan, directory enumeration, zone transfer); private-IP targets rejected before connect
+- **SEC-FABLE-4:** Added missing negative tests for `check_host_ssrf` and default redirect behaviour
+- **SEC-FABLE-6:** Stopped leaking stack traces and resolved IPs in error responses; generic messages returned to client, full detail logged server-side
+- **SEC-05 / SEC-06:** Allowlisted RDAP registry servers so domain lookups resolve past the rdap.org redirect
+- **SEC-01:** Flask refuses to start if `DASHBOARD_SECRET_KEY` is absent or set to the placeholder value
+- **SEC-04:** `next=` redirect parameter validated against open-redirect; only paths starting with `/` accepted
+- **SEC-08:** `html.escape()` applied to all hit context fields before interpolation in alert email body
+- **SEC-13:** Warning emitted when Tor control port accepts unauthenticated connections
+
+### Performance
+
+- **PERF-01 / COR-06:** Collapsed N+1 on ransomware groups endpoint — all keyword hit counts fetched in a single query
+- **COR-07:** Collapsed N+1 on threat actors endpoint — same pattern
+
+### Features
+
+- **Quick Scan tab** — on-demand OSINT sweep of any domain, IP, URL, or company name; live progress streaming, per-source results, cancel endpoint with orchestrator interrupt, source config module and target-type normalisation
+- Quick Scan storage models and `Storage` methods (`quick_scan_sessions`, `quick_scan_findings`)
+- Quick Scan routes: `POST /api/quick-scan/start`, `GET /api/quick-scan/<id>/status`, `POST /api/quick-scan/<id>/cancel`
+- Unit and integration tests for Quick Scan target detection, variant normalisation, and storage
+
+### Chore
+
+- **PERF-05 / COR-05:** Refactored `Storage` methods to use request-scoped SQLAlchemy session via Flask `g` when in Flask context, reducing per-request connection overhead
+- **COR-05:** Added request-scoped session lifecycle (`get_session`, teardown) via `storage_helper.py`
+- **OPS-02:** App container now runs as non-root user (`appuser`, uid 1000)
+- **OPS-01:** Added healthcheck to `dashboard` service (`GET /` via curl, 15 s interval)
+- **COR-14:** Synced `__version__` and `__license__` in `__init__.py` with `pyproject.toml`
+- **COR-03:** Replaced `exit(1)` with `RuntimeError` in `check_disk_space()`
+- **COR-02:** Replaced SQLite `datetime('now')` with portable Python timestamp
+- **COR-01:** Fixed crawl session status double-update on failure — failed scans no longer appear as completed
+- Replaced deprecated `datetime.utcnow()` with timezone-aware equivalent throughout
+- Fixed ruff lint errors (E402, E701, noqa syntax, unused variables, ambiguous names)
+- Thread-safe `Storage` singleton to eliminate `create_tables` race on startup
+
 ## [1.0.1] - 2026-03-15
 
 ### Added
