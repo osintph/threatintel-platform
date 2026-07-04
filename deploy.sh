@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  darkweb-scanner — Zero-prerequisite deployment script
-#  Repo: https://github.com/osintph/darkweb-scanner
+#  threatintel-platform — Zero-prerequisite deployment script
+#  Repo: https://github.com/osintph/threatintel-platform
 #
 #  Usage (recommended):
-#    curl -fsSL https://raw.githubusercontent.com/osintph/darkweb-scanner/main/deploy.sh -o /tmp/deploy.sh && sudo bash /tmp/deploy.sh
+#    curl -fsSL https://raw.githubusercontent.com/osintph/threatintel-platform/main/deploy.sh -o /tmp/deploy.sh && sudo bash /tmp/deploy.sh
 #
 #  Or if already downloaded:
 #    sudo bash deploy.sh
 #
 #  Optional env overrides:
-#    INSTALL_DIR=/opt/darkweb-scanner sudo bash deploy.sh
+#    INSTALL_DIR=/opt/threatintel-platform sudo bash deploy.sh
 #    DOMAIN=scanner.example.com SSL_EMAIL=you@email.com sudo bash deploy.sh
 #    INSTALL_TIMER=1 sudo bash deploy.sh
 # =============================================================================
 set -euo pipefail
 
-REPO_URL="https://github.com/osintph/darkweb-scanner"
+REPO_URL="https://github.com/osintph/threatintel-platform"
 RUN_USER="${SUDO_USER:-$(whoami)}"
 RUN_USER_HOME=$(getent passwd "$RUN_USER" | cut -d: -f6)
-INSTALL_DIR="${INSTALL_DIR:-${RUN_USER_HOME}/darkweb-scanner}"
+INSTALL_DIR="${INSTALL_DIR:-${RUN_USER_HOME}/threatintel-platform}"
 DOMAIN="${DOMAIN:-}"
 SSL_EMAIL="${SSL_EMAIL:-}"
 
@@ -33,7 +33,7 @@ error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 echo ""
 echo -e "${CYAN}╔══════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║     darkweb-scanner  —  Deployment       ║${NC}"
+echo -e "${CYAN}║   threatintel-platform  —  Deployment    ║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -116,6 +116,7 @@ info "Copying example config files..."
 cp -n .env.example .env                                  2>/dev/null || true
 cp -n config/keywords.example.yaml config/keywords.yaml  2>/dev/null || true
 cp -n config/seeds.example.txt config/seeds.txt          2>/dev/null || true
+chmod 600 .env
 success "Config files ready."
 
 # ── Patch .env ────────────────────────────────────────────────────────────────
@@ -135,6 +136,14 @@ if [[ -n "$SSL_EMAIL" ]]; then
 fi
 
 success "Configuration patched."
+
+# ── Validate secret key ────────────────────────────────────────────────────────
+# The app will also check on startup, but fail fast here before building images.
+_SECRET_VAL=$(grep '^DASHBOARD_SECRET_KEY=' .env | cut -d= -f2- | tr -d '[:space:]')
+if [[ -z "$_SECRET_VAL" || "$_SECRET_VAL" == "changeme" || "$_SECRET_VAL" == "change-me-in-production" || "$_SECRET_VAL" == "change-me-to-a-long-random-string" ]]; then
+  error "DASHBOARD_SECRET_KEY is empty or set to a placeholder. Edit .env and set a real secret before deploying."
+fi
+success "Secret key validated."
 
 # ── Generate Tor control password ─────────────────────────────────────────────
 info "Building Tor image to generate control password hash..."
@@ -158,6 +167,14 @@ info "Building all Docker images (this may take a few minutes)..."
 docker compose build --no-cache
 success "Images built."
 
+# ── Fix /app/data ownership for non-root container ────────────────────────────
+# The app container runs as appuser (uid 1000). On a first deploy or after a
+# volume was populated by a root-owned container, /app/data may be owned by root.
+info "Ensuring /app/data is owned by appuser (uid 1000)..."
+docker compose run --rm --user root dashboard chown -R 1000:1000 /app/data 2>/dev/null || \
+  warn "Could not chown /app/data — if the container fails to write data, run this manually."
+success "/app/data ownership set."
+
 # ── Start all services ────────────────────────────────────────────────────────
 info "Starting all containers..."
 # Start postgres first and wait for it to be healthy
@@ -179,8 +196,20 @@ success "PostgreSQL is ready."
 docker compose up -d
 success "Containers started."
 
+# ── Wait for dashboard container to be healthy ────────────────────────────────
+info "Waiting for dashboard container to become healthy (up to 60 s)..."
+ELAPSED=0
+until [[ "$(docker compose ps dashboard --format json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Health',''))" 2>/dev/null)" == "healthy" ]]; do
+  if [[ $ELAPSED -ge 60 ]]; then
+    warn "Dashboard health check timed out after 60 s — check: docker compose logs dashboard"
+    break
+  fi
+  sleep 3; ELAPSED=$((ELAPSED + 3))
+done
+[[ $ELAPSED -lt 60 ]] && success "Dashboard container is healthy."
+
 # ── Wait for dashboard ────────────────────────────────────────────────────────
-info "Waiting for services to be ready..."
+info "Waiting for HTTPS to respond..."
 TIMEOUT=90; ELAPSED=0
 until curl -sfk "https://localhost" -o /dev/null 2>/dev/null; do
   [[ $ELAPSED -ge $TIMEOUT ]] && { warn "HTTPS not responding after ${TIMEOUT}s. Check: docker compose logs nginx"; break; }
@@ -200,12 +229,21 @@ until docker compose logs tor 2>/dev/null | grep -q "Bootstrapped 100%"; do
 done
 docker compose logs tor 2>/dev/null | grep -q "Bootstrapped 100%" && success "Tor bootstrapped and ready."
 
+# ── Post-deploy smoke check ───────────────────────────────────────────────────
+info "Running post-deploy smoke check..."
+_HTTP_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "https://localhost" 2>/dev/null || true)
+if [[ "$_HTTP_STATUS" == "200" || "$_HTTP_STATUS" == "302" ]]; then
+  success "Smoke check passed (HTTP ${_HTTP_STATUS})."
+else
+  warn "Smoke check returned HTTP ${_HTTP_STATUS} — the dashboard may not be fully up yet."
+fi
+
 # ── Optional: systemd scan timer ─────────────────────────────────────────────
 if [[ "${INSTALL_TIMER:-}" == "1" ]]; then
   info "Installing systemd scan timer (every 6 hours)..."
-  tee /etc/systemd/system/darkweb-scan.service > /dev/null <<EOF
+  tee /etc/systemd/system/threatintel-scan.service > /dev/null <<EOF
 [Unit]
-Description=Dark Web Scanner — scheduled crawl
+Description=threatintel-platform — scheduled crawl
 Requires=docker.service
 After=docker.service
 
@@ -216,9 +254,9 @@ WorkingDirectory=${INSTALL_DIR}
 ExecStart=/usr/bin/docker compose --profile scan run --rm scanner
 EOF
 
-  tee /etc/systemd/system/darkweb-scan.timer > /dev/null <<EOF
+  tee /etc/systemd/system/threatintel-scan.timer > /dev/null <<EOF
 [Unit]
-Description=Run Dark Web Scanner every 6 hours
+Description=Run threatintel-platform crawler every 6 hours
 
 [Timer]
 OnBootSec=5min
@@ -229,9 +267,14 @@ WantedBy=timers.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now darkweb-scan.timer
+  systemctl enable --now threatintel-scan.timer
   success "Systemd scan timer enabled (every 6h)."
 fi
+
+# ── Version display ───────────────────────────────────────────────────────────
+_VERSION=$(docker compose exec -T dashboard python3 -c \
+  "from darkweb_scanner import __version__; print(f'Deployed version: {__version__}')" 2>/dev/null || true)
+[[ -n "$_VERSION" ]] && info "$_VERSION"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
@@ -239,20 +282,20 @@ echo -e "${GREEN}╔════════════════════
 echo -e "${GREEN}║              ✅  Deployment Complete                      ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "  📁 Install dir:  ${CYAN}${INSTALL_DIR}${NC}"
+echo -e "  Install dir:  ${CYAN}${INSTALL_DIR}${NC}"
 if [[ -n "$DOMAIN" ]]; then
-  echo -e "  🌐 Dashboard:    ${CYAN}https://${DOMAIN}${NC}"
+  echo -e "  Dashboard:    ${CYAN}https://${DOMAIN}${NC}"
 else
-  echo -e "  🌐 Dashboard:    ${CYAN}https://YOUR_SERVER_IP${NC}  (self-signed cert — accept browser warning)"
-  echo -e "  💡 For a real SSL cert, redeploy with:"
+  echo -e "  Dashboard:    ${CYAN}https://YOUR_SERVER_IP${NC}  (self-signed cert — accept browser warning)"
+  echo -e "  For a real SSL cert, redeploy with:"
   echo -e "     ${YELLOW}DOMAIN=yourdomain.com SSL_EMAIL=you@email.com sudo bash deploy.sh${NC}"
 fi
 echo ""
 echo -e "${YELLOW}First-time setup — create your admin account:${NC}"
 if [[ -n "$DOMAIN" ]]; then
-  echo -e "  👉 Visit ${CYAN}https://${DOMAIN}/register${NC} to create your admin account"
+  echo -e "  Visit ${CYAN}https://${DOMAIN}/register${NC} to create your admin account"
 else
-  echo -e "  👉 Visit ${CYAN}https://YOUR_SERVER_IP/register${NC} to create your admin account"
+  echo -e "  Visit ${CYAN}https://YOUR_SERVER_IP/register${NC} to create your admin account"
 fi
 echo -e "  (Registration is only open when no users exist — it closes after the first account is created)"
 echo ""
@@ -270,7 +313,7 @@ echo -e "  make logs          # tail all container logs"
 echo -e "  make stop          # stop all containers"
 echo ""
 if [[ "$RUN_USER" != "root" ]]; then
-  echo -e "${YELLOW}⚠️  Log out and back in${NC} (or run 'newgrp docker') so"
+  echo -e "${YELLOW}Log out and back in${NC} (or run 'newgrp docker') so"
   echo -e "   '${RUN_USER}' can use docker without sudo."
   echo ""
 fi
