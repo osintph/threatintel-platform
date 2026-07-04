@@ -10,9 +10,18 @@ Detection and normalization are deliberately pure and side-effect free so they c
 be unit-tested exhaustively without any network or database.
 """
 
+import asyncio
+import json
 import logging
+import os
+import random
 import re
-from urllib.parse import urlparse
+import time
+from datetime import datetime, timezone
+from urllib.parse import urljoin, urlparse
+
+import aiohttp
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +40,13 @@ HIGH_SIGNAL_KEYWORDS = (
 
 # Context window: characters kept on each side of a match.
 CONTEXT_SIDE = 100
+
+# Crawl behavior caps (module-level so tests can monkeypatch them).
+MAX_DEPTH = 2                 # hops followed from a source's initial fetch
+MAX_URLS_PER_SCAN = 100       # hard cap on URLs attempted per scan
+PER_SOURCE_TIMEOUT = 30       # seconds per individual fetch
+TOTAL_TIMEOUT = 600           # 10-minute hard cap on the whole scan
+MAX_CONCURRENT = int(os.getenv("QUICK_SCAN_MAX_CONCURRENT", "4"))
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # label.tld, one or more labels, ascii TLD >= 2 chars. No scheme, no path.
@@ -162,3 +178,215 @@ def find_matches(text: str, variants: list) -> list:
             }
         )
     return results
+
+
+# ── Orchestration ────────────────────────────────────────────────────────────────
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _is_onion(url: str) -> bool:
+    return (urlparse(url).hostname or "").endswith(".onion")
+
+
+def _normalize_url(url: str) -> str:
+    return urlparse(url)._replace(fragment="").geturl().rstrip("/")
+
+
+def _rate_limit_delay() -> float:
+    """Reuse the crawler's random-delay rate-limit approach.
+
+    Reads the crawler's CRAWL_DELAY_* knobs so behavior matches the main crawler,
+    with QUICK_SCAN_DELAY_* overrides (tests set these to 0 for speed).
+    """
+    lo = float(os.getenv("QUICK_SCAN_DELAY_MIN", os.getenv("CRAWL_DELAY_MIN", "2")))
+    hi = float(os.getenv("QUICK_SCAN_DELAY_MAX", os.getenv("CRAWL_DELAY_MAX", "8")))
+    if hi < lo:
+        hi = lo
+    return random.uniform(lo, hi)
+
+
+def _extract_page_text(html: str) -> str:
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    return soup.get_text(separator=" ", strip=True)
+
+
+def _extract_links(html: str, base_url: str) -> list:
+    soup = BeautifulSoup(html, "lxml")
+    links = []
+    for tag in soup.find_all("a", href=True):
+        href = tag["href"].strip()
+        if not href or href.startswith(("#", "mailto:", "javascript:")):
+            continue
+        absolute = urljoin(base_url, href)
+        parsed = urlparse(absolute)
+        if parsed.scheme in ("http", "https"):
+            links.append(_normalize_url(absolute))
+    return links
+
+
+async def _fetch_onion(url: str, tor_client) -> tuple:
+    session = await tor_client.get_session()
+    timeout = aiohttp.ClientTimeout(total=PER_SOURCE_TIMEOUT)
+    async with session.get(url, ssl=False, allow_redirects=True, timeout=timeout) as resp:
+        html = await resp.text(errors="replace")
+        return resp.status, html
+
+
+async def _fetch_clearnet(url: str) -> tuple:
+    """Fetch a clearnet URL through safe_fetch (HTTPS-only, allowlisted, IP-blocked).
+
+    Imported lazily and run in a thread since safe_fetch is synchronous.
+    """
+    from .dashboard.http_client import safe_fetch
+
+    def _do():
+        result = safe_fetch(url, timeout=PER_SOURCE_TIMEOUT, allow_redirects=True)
+        body = result.get("body") or b""
+        if isinstance(body, bytes):
+            body = body.decode("utf-8", "replace")
+        return result.get("status", 0), body
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _do)
+
+
+async def _fetch(url: str, tor_client) -> tuple:
+    """Return (status_code, html). Onion via Tor, clearnet via safe_fetch."""
+    if _is_onion(url):
+        return await _fetch_onion(url, tor_client)
+    return await _fetch_clearnet(url)
+
+
+async def run_quick_scan(session_id: int, storage, tor_client) -> None:
+    """Run a quick scan end to end for a persisted session.
+
+    Loads the session, marks it running, queries each configured source with the
+    target value, fetches result pages (and links up to MAX_DEPTH), records findings
+    whenever a normalized variant appears in page text, and finalizes the session.
+
+    Per-URL errors are logged and skipped. A total-time overrun finalizes the session
+    as ``completed`` with a warning in error_message. Only failures that prevent the
+    scan from running at all mark it ``failed``.
+    """
+    from .quick_scan_sources import resolve_sources
+
+    session = storage.get_quick_scan_session(session_id)
+    if session is None:
+        logger.warning("Quick scan session %s not found; aborting", session_id)
+        return
+
+    target_value = session.target_value
+    variants = json.loads(session.normalized_variants or "[]")
+    source_names = json.loads(session.sources_used or "[]")
+    sources = resolve_sources(source_names)
+
+    storage.update_quick_scan_session(session_id, status="running", started_at=_now())
+
+    deadline = time.monotonic() + TOTAL_TIMEOUT
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    visited: set = set()
+    counters = {"urls_visited": 0, "findings": 0}
+    timed_out = False
+
+    async def _process(url: str, depth: int, source_name: str) -> list:
+        """Fetch one URL, record findings, return discovered links."""
+        async with semaphore:
+            if time.monotonic() > deadline:
+                return []
+            await asyncio.sleep(_rate_limit_delay())
+            try:
+                status, html = await asyncio.wait_for(
+                    _fetch(url, tor_client), timeout=PER_SOURCE_TIMEOUT
+                )
+            except Exception as exc:  # noqa: BLE001 — per-URL errors must not abort the scan
+                logger.info("Quick scan fetch failed for %s: %s", url, exc)
+                return []
+            counters["urls_visited"] += 1
+            text = _extract_page_text(html)
+            for match in find_matches(text, variants):
+                storage.add_quick_scan_finding(
+                    session_id=session_id,
+                    source_name=source_name,
+                    url=url,
+                    matched_variant=match["variant"],
+                    context=match["context"],
+                    high_signal=match["high_signal"],
+                )
+                counters["findings"] += 1
+            return _extract_links(html, url)
+
+    # Seed the frontier with each enabled source's query URLs (depth 0).
+    queue: list = []
+    for source in sources:
+        for url in source.build_urls(target_value):
+            norm = _normalize_url(url)
+            if norm in visited:
+                continue
+            if len(visited) >= MAX_URLS_PER_SCAN:
+                break
+            visited.add(norm)
+            queue.append((url, 0, source.name))
+
+    try:
+        while queue:
+            if time.monotonic() > deadline:
+                timed_out = True
+                break
+            batch = queue[:MAX_CONCURRENT]
+            queue = queue[MAX_CONCURRENT:]
+            results = await asyncio.gather(
+                *[_process(url, depth, name) for url, depth, name in batch],
+                return_exceptions=True,
+            )
+            for (url, depth, name), result in zip(batch, results):
+                if isinstance(result, Exception):
+                    logger.warning("Quick scan task error for %s: %s", url, result)
+                    continue
+                if depth >= MAX_DEPTH:
+                    continue
+                for link in result:
+                    norm = _normalize_url(link)
+                    if norm in visited:
+                        continue
+                    if len(visited) >= MAX_URLS_PER_SCAN:
+                        break
+                    visited.add(norm)
+                    queue.append((link, depth + 1, name))
+    except Exception as exc:  # noqa: BLE001 — finalize as failed on unexpected error
+        logger.exception("Quick scan %s failed", session_id)
+        storage.update_quick_scan_session(
+            session_id,
+            status="failed",
+            completed_at=_now(),
+            urls_visited=counters["urls_visited"],
+            findings_count=counters["findings"],
+            error_message=f"Scan failed: {type(exc).__name__}",
+        )
+        return
+
+    warning = None
+    if timed_out:
+        warning = (
+            f"Scan reached the {TOTAL_TIMEOUT}s total time cap before all sources "
+            "were exhausted; results may be partial."
+        )
+    storage.update_quick_scan_session(
+        session_id,
+        status="completed",
+        completed_at=_now(),
+        urls_visited=counters["urls_visited"],
+        findings_count=counters["findings"],
+        error_message=warning,
+    )
+    logger.info(
+        "Quick scan %s complete: %d URLs, %d findings%s",
+        session_id,
+        counters["urls_visited"],
+        counters["findings"],
+        " (timed out)" if timed_out else "",
+    )
