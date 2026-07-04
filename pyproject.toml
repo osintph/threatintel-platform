@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "darkweb-scanner"
-version = "1.0.0"
+version = "1.1.0"
 description = "Keyword monitoring tool for .onion sites — for legitimate security research and threat intelligence"
 readme = "README.md"
 # Updated license field
