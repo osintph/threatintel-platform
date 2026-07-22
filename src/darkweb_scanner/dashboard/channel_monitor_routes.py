@@ -4,7 +4,6 @@ Integrates channel_monitor.py into the threat intelligence dashboard.
 """
 
 import asyncio
-import io
 import json
 import os
 import shutil
@@ -15,7 +14,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Blueprint, Response, jsonify, request, session, stream_with_context
+from flask import Blueprint, after_this_request, jsonify, request, send_file, session
 
 from ..auth import require_login
 from .storage_helper import get_storage
@@ -24,6 +23,11 @@ channel_monitor_bp = Blueprint("channel_monitor", __name__)
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 CHANNEL_MONITOR_DIR = DATA_DIR / "channel_monitor"
+
+# Cap on total source bytes zipped for a single download. Building to a temp
+# file (rather than streaming) is bounded by disk, not memory, but we still
+# want a clear failure instead of silently filling the data volume.
+MAX_DOWNLOAD_SOURCE_BYTES = int(os.getenv("CHANNEL_MONITOR_MAX_DOWNLOAD_GB", "5")) * (1024 ** 3)
 
 # In-memory job store  { job_id: { status, log, output_dir, started_at, config } }
 _jobs: dict[str, dict] = {}
@@ -123,7 +127,17 @@ def api_cm_job_log(job_id: str):
 @channel_monitor_bp.route("/api/channel-monitor/jobs/<job_id>/download", methods=["GET"])
 @require_login
 def api_cm_job_download(job_id: str):
-    """Stream a ZIP of the job output directory without buffering in memory."""
+    """Build a ZIP of the job output directory to a temp file, then serve
+    that file with a real Content-Length.
+
+    Streaming the ZIP live from a generator (the old approach) meant no
+    Content-Length and no way to answer a Range resume with anything but a
+    fresh full 200 body — a client splicing that onto bytes it already had
+    is exactly what produces a truncated archive with orphaned tail data
+    and no End Of Central Directory record. Serving a file that's already
+    complete on disk lets Flask's normal conditional/Range handling work
+    correctly instead.
+    """
     with _jobs_lock:
         j = _jobs.get(job_id)
     if not j:
@@ -141,31 +155,56 @@ def api_cm_job_download(job_id: str):
 
     files = sorted([f for f in output_dir.rglob("*") if f.is_file()])
 
-    def generate():
-        """Yield ZIP data using ZIP_STORED (no compression).
-        Photos/videos are already compressed — deflating wastes CPU and
-        delays the first byte sent to the browser."""
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
-            for fpath in files:
-                arcname = str(fpath.relative_to(output_dir.parent))
-                zf.write(fpath, arcname)
-                buf.seek(0)
-                chunk = buf.read()
-                buf.seek(0)
-                buf.truncate(0)
-                if chunk:
-                    yield chunk
-        # Flush ZIP central directory / end record
-        buf.seek(0)
-        remaining = buf.read()
-        if remaining:
-            yield remaining
+    total_source_bytes = sum(f.stat().st_size for f in files)
+    if total_source_bytes > MAX_DOWNLOAD_SOURCE_BYTES:
+        return jsonify({
+            "error": (
+                f"Output directory is {total_source_bytes / (1024 ** 3):.2f} GB, "
+                f"over the {MAX_DOWNLOAD_SOURCE_BYTES / (1024 ** 3):.0f} GB download "
+                "cap. Retrieve the files directly from the server instead."
+            )
+        }), 413
 
-    return Response(
-        stream_with_context(generate()),
+    _ensure_dirs()
+    fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="cm_download_", dir=CHANNEL_MONITOR_DIR)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            with zipfile.ZipFile(fh, "w", zipfile.ZIP_STORED) as zf:
+                for fpath in files:
+                    arcname = str(fpath.relative_to(output_dir.parent))
+                    zf.write(fpath, arcname)
+            fh.flush()
+            os.fsync(fh.fileno())
+            bytes_written = fh.tell()
+
+        # Integrity guard: what's on disk must match what we actually wrote,
+        # and must parse as a well-formed archive (catches a truncated write
+        # even when the byte count happens to line up).
+        on_disk_size = os.path.getsize(tmp_path)
+        if on_disk_size == 0 or on_disk_size != bytes_written:
+            raise IOError(
+                f"ZIP write mismatch for job {job_id}: wrote {bytes_written} "
+                f"bytes but {on_disk_size} are on disk"
+            )
+        if not zipfile.is_zipfile(tmp_path):
+            raise IOError(f"ZIP integrity check failed for job {job_id}: no valid EOCD record")
+    except Exception as exc:
+        os.unlink(tmp_path)
+        return jsonify({"error": f"Failed to build ZIP: {exc}"}), 500
+
+    @after_this_request
+    def _cleanup_tmp_zip(response):
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return response
+
+    return send_file(
+        tmp_path,
         mimetype="application/zip",
-        headers={"Content-Disposition": f"attachment; filename={zip_filename}"},
+        as_attachment=True,
+        download_name=zip_filename,
     )
 
 

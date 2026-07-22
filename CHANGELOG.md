@@ -3,6 +3,12 @@
 All notable changes to this project will be documented in this file.
 The format follows **Keep a Changelog**. This project adheres to **Semantic Versioning**.
 
+## [Unreleased]
+
+### Fixed
+
+- **Channel Monitor download corruption:** `GET /api/channel-monitor/jobs/<id>/download` no longer streams the ZIP live from an in-request generator with no `Content-Length`. The old approach also ignored `Range` headers, so a resumed/reconnected download got a fresh full `200` body that clients would splice onto bytes they already had — producing archives with a valid small entry followed by orphaned tail data and no End Of Central Directory record. The ZIP is now built to a temp file server-side, verified (on-disk byte count checked against bytes written, plus an `is_zipfile` EOCD check) before anything is sent, then served via `send_file` with a real `Content-Length` and correct `Range`/206 support; the temp file is removed after the response completes. Oversized output directories (>5 GB, configurable via `CHANNEL_MONITOR_MAX_DOWNLOAD_GB`) are rejected up front with a 413 instead of being zipped.
+
 ## [1.1.0] - 2026-07-04
 
 Quick Scan tab, safe_fetch SSRF/TLS hardening, session lifecycle refactor, N+1 collapse, and audit remediation.
