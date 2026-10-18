@@ -84,7 +84,11 @@ server {
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
     root /var/www/osintph-www;
     index index.html;
-    location / { try_files \$uri \$uri/ /index.html; }
+    location / { try_files \$uri \$uri/ =404; }
+    error_page 404 /404.html;
+    location = /index-de.html { return 301 /index.html; }
+    location = /index-th.html { return 301 /index.html; }
+    location = /contact-th.html { return 301 /contact.html; }
     location ~* \.(svg|png|jpg|jpeg|gif|ico|webp|woff2?)$ {
         expires 30d;
         add_header Cache-Control "public, immutable";

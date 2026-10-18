@@ -52,6 +52,8 @@ docker-compose
   webcheck                 ← lissy93/web-check (optional OSINT service)
 ```
 
+The nginx entrypoint also generates the static website vhost when `WWW_DOMAIN` is set. That vhost serves the site's own `404.html` with status 404 for missing paths (no fallback to the home page) and permanently redirects the withdrawn Thai and German page URLs to their English pages. The config is generated when the container starts, so a change to `docker/nginx/entrypoint.sh` takes effect only after the nginx image is rebuilt.
+
 All external API calls (ransomware.live, ThreatFox, AbuseIPDB, VirusTotal, etc.) go over the clearnet. Only `.onion` crawling is Tor-routed.
 
 SQLAlchemy sessions are request-scoped via Flask `g` and torn down at request end, reducing connection pool pressure.
