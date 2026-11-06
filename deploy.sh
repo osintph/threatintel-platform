@@ -13,6 +13,7 @@
 #    INSTALL_DIR=/opt/threatintel-platform sudo bash deploy.sh
 #    DOMAIN=scanner.example.com SSL_EMAIL=you@email.com sudo bash deploy.sh
 #    INSTALL_TIMER=1 sudo bash deploy.sh
+#    ORIGIN_LOCK=1 sudo bash deploy.sh      # only if every public name is proxied through Cloudflare
 # =============================================================================
 set -euo pipefail
 
@@ -269,6 +270,17 @@ EOF
   systemctl daemon-reload
   systemctl enable --now threatintel-scan.timer
   success "Systemd scan timer enabled (every 6h)."
+fi
+
+# ── Optional: Cloudflare origin lock ─────────────────────────────────────────
+# Limits the published web ports to Cloudflare's ranges. See docs/runbook.md.
+if [[ "${ORIGIN_LOCK:-}" == "1" ]]; then
+  info "Installing the Cloudflare origin lock (DOCKER-USER rules, weekly refresh)..."
+  if bash ops/cf-origin-lock/install.sh; then
+    success "Origin lock installed. Check it with: cf-origin-lock selftest"
+  else
+    warn "Origin lock install failed — see: journalctl -u cf-origin-lock.service"
+  fi
 fi
 
 # ── Version display ───────────────────────────────────────────────────────────

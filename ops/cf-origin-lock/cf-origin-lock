@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# cf-origin-lock: let only Cloudflare reach the web ports that Docker publishes.
+#
+# Docker publishes ports through its own NAT rules, which bypass ufw. This
+# script drops new inbound connections to those ports in the DOCKER-USER chain
+# unless they come from one of Cloudflare's published ranges.
+#
+#   apply     fetch the ranges, load the ipsets, add the rules, self-test
+#   refresh   fetch the ranges and reload the ipsets; re-check the rules if the
+#             lock is on (it never turns the lock on by itself)
+#   selftest  check rules, ipsets and container egress; non-zero on any failure
+#   remove    delete the rules and the ipsets (rollback)
+#   status    print the rules with counters and the size of each ipset
+#
+# Scope: the DOCKER-USER chain and the cf4/cf6 ipsets only. It never touches
+# SSH, ufw, INPUT or any other chain.
+#
+# The rules match on --ctdir ORIGINAL. Without it, --ctorigdstport also matches
+# the replies to connections that containers open to ports 80/443 elsewhere,
+# and every container loses outbound HTTP(S).
+set -euo pipefail
+
+STATE_DIR=/etc/cf-origin-lock
+# shellcheck disable=SC1091
+[ -r /etc/default/cf-origin-lock ] && . /etc/default/cf-origin-lock
+
+IFACE="${IFACE:-}"
+PORTS="${PORTS:-80 443}"
+MIN_V4="${MIN_V4:-10}"
+MIN_V6="${MIN_V6:-5}"
+LIST_BASE="${LIST_BASE:-https://www.cloudflare.com}"
+# Addresses outside Cloudflare's published ranges that answer HTTPS on their
+# IP. The egress test passes if a container reaches any one of them.
+EGRESS_URLS="${EGRESS_URLS:-https://9.9.9.9/ https://1.1.1.1/cdn-cgi/trace https://8.8.8.8/}"
+EGRESS_WAIT="${EGRESS_WAIT:-30}"
+CHAIN=DOCKER-USER
+IPT_WAIT=5
+
+log() { echo "cf-origin-lock: $*"; }
+err() { echo "cf-origin-lock: ERROR: $*" >&2; }
+die() { err "$*"; exit 1; }
+
+[ "$(id -u)" -eq 0 ] || die "must run as root"
+
+detect_iface() {
+  [ -n "$IFACE" ] && return 0
+  IFACE="$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')"
+  [ -n "$IFACE" ] || die "cannot find the public interface; set IFACE in /etc/default/cf-origin-lock"
+}
+
+# ── Lists ─────────────────────────────────────────────────────────────────────
+
+# valid_list FILE 4|6: every line is a CIDR of that family, no range wider than
+# /8 (v4) or /16 (v6), and the list is not suspiciously short.
+valid_list() {
+  local file=$1 fam=$2 min n=0 net
+  [ -s "$file" ] || return 1
+  if [ "$fam" = 4 ]; then min=$MIN_V4; else min=$MIN_V6; fi
+  while read -r net || [ -n "$net" ]; do
+    [ -n "$net" ] || continue
+    if [ "$fam" = 4 ]; then
+      [[ "$net" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]] || return 1
+      local o
+      for o in "${BASH_REMATCH[@]:1:4}"; do [ "$o" -le 255 ] || return 1; done
+      [ "${BASH_REMATCH[5]}" -ge 8 ] && [ "${BASH_REMATCH[5]}" -le 32 ] || return 1
+    else
+      [[ "$net" =~ ^[0-9A-Fa-f:]*:[0-9A-Fa-f:]*/([0-9]{1,3})$ ]] || return 1
+      [ "${BASH_REMATCH[1]}" -ge 16 ] && [ "${BASH_REMATCH[1]}" -le 128 ] || return 1
+    fi
+    n=$((n + 1))
+  done < "$file"
+  [ "$n" -ge "$min" ]
+}
+
+# fetch_list 4|6: replace the cached copy only with a complete, valid download.
+fetch_list() {
+  local fam=$1 tmp
+  mkdir -p "$STATE_DIR"
+  tmp="$(mktemp "$STATE_DIR/.ips-v$fam.XXXXXX")"
+  if curl -fsS --proto '=https' --max-time 20 --retry 2 --retry-delay 3 "$LIST_BASE/ips-v$fam" 2>/dev/null \
+      | tr -d '\r' | sed -e 's/[[:space:]]*$//' -e '/^$/d' > "$tmp" && valid_list "$tmp" "$fam"; then
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$STATE_DIR/ips-v$fam"
+  else
+    rm -f "$tmp"
+    log "could not fetch a valid IPv$fam list; keeping the previous copy"
+  fi
+  valid_list "$STATE_DIR/ips-v$fam" "$fam" || die "no usable Cloudflare IPv$fam list in $STATE_DIR"
+}
+
+list_count() { grep -c . "$1"; }
+set_count() { ipset list "$1" 2>/dev/null | awk '/^Number of entries:/ {print $4}'; }
+
+# ── ipsets ────────────────────────────────────────────────────────────────────
+
+# load_set NAME inet|inet6 FILE: build a new set and swap it in, so the live
+# set is never empty. The "|| [ -n ]" keeps a last line with no newline.
+load_set() {
+  local name=$1 fam=$2 file=$3 tmp="$1-new" net
+  ipset create "$name" hash:net family "$fam" -exist
+  ipset create "$tmp" hash:net family "$fam" -exist
+  ipset flush "$tmp"
+  while read -r net || [ -n "$net" ]; do
+    [ -n "$net" ] && ipset add "$tmp" "$net" -exist
+  done < "$file"
+  ipset swap "$tmp" "$name"
+  ipset destroy "$tmp"
+}
+
+load_sets() {
+  load_set cf4 inet "$STATE_DIR/ips-v4"
+  load_set cf6 inet6 "$STATE_DIR/ips-v6"
+}
+
+# ── Rules ─────────────────────────────────────────────────────────────────────
+
+FAMILIES=("iptables cf4" "ip6tables cf6")
+
+new_rule() { echo "-i $IFACE -p tcp -m conntrack --ctorigdstport $2 --ctdir ORIGINAL -m set ! --match-set $1 src -j DROP"; }
+# The form older versions of this script wrote. It breaks container egress.
+old_rule() { echo "-i $IFACE -p tcp -m conntrack --ctorigdstport $2 -m set ! --match-set $1 src -j DROP"; }
+
+has_rule() { # cmd spec...
+  local cmd=$1; shift
+  # shellcheck disable=SC2068
+  "$cmd" -w "$IPT_WAIT" -C "$CHAIN" $@ 2>/dev/null
+}
+
+ensure_rules() {
+  local fam cmd set port
+  for fam in "${FAMILIES[@]}"; do
+    read -r cmd set <<< "$fam"
+    if ! "$cmd" -w "$IPT_WAIT" -n -L "$CHAIN" >/dev/null 2>&1; then
+      log "$cmd: chain $CHAIN does not exist yet; creating it"
+      "$cmd" -w "$IPT_WAIT" -N "$CHAIN"
+    fi
+    for port in $PORTS; do
+      # Add the new rule first, then remove the old form, so the port is never open in between.
+      # shellcheck disable=SC2046
+      has_rule "$cmd" $(new_rule "$set" "$port") || "$cmd" -w "$IPT_WAIT" -A "$CHAIN" $(new_rule "$set" "$port")
+      # shellcheck disable=SC2046
+      while has_rule "$cmd" $(old_rule "$set" "$port"); do
+        "$cmd" -w "$IPT_WAIT" -D "$CHAIN" $(old_rule "$set" "$port")
+        log "$cmd: removed an old-form rule for port $port (no --ctdir ORIGINAL)"
+      done
+    done
+  done
+}
+
+lock_is_on() {
+  local fam cmd set port
+  for fam in "${FAMILIES[@]}"; do
+    read -r cmd set <<< "$fam"
+    for port in $PORTS; do
+      # shellcheck disable=SC2046
+      has_rule "$cmd" $(new_rule "$set" "$port") && return 0
+      # shellcheck disable=SC2046
+      has_rule "$cmd" $(old_rule "$set" "$port") && return 0
+    done
+  done
+  return 1
+}
+
+remove_rules() {
+  local fam cmd set port
+  for fam in "${FAMILIES[@]}"; do
+    read -r cmd set <<< "$fam"
+    for port in $PORTS; do
+      # shellcheck disable=SC2046
+      while has_rule "$cmd" $(new_rule "$set" "$port"); do "$cmd" -w "$IPT_WAIT" -D "$CHAIN" $(new_rule "$set" "$port"); done
+      # shellcheck disable=SC2046
+      while has_rule "$cmd" $(old_rule "$set" "$port"); do "$cmd" -w "$IPT_WAIT" -D "$CHAIN" $(old_rule "$set" "$port"); done
+    done
+    ipset destroy "$set" 2>/dev/null || true
+  done
+}
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+
+# One HTTPS request from inside a running container's network namespace, using
+# the host's curl, so it works whatever the image contains.
+egress_test() {
+  command -v docker >/dev/null 2>&1 || { log "docker not found; egress test skipped"; return 0; }
+  command -v nsenter >/dev/null 2>&1 || { log "nsenter not found; egress test skipped"; return 0; }
+  local waited=0 cid="" c mode pid url try
+  while :; do
+    for c in $(docker ps -q --filter status=running 2>/dev/null); do
+      mode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$c" 2>/dev/null || true)"
+      case "$mode" in host | none | container:* | "") continue ;; esac
+      cid=$c
+      break
+    done
+    [ -n "$cid" ] && break
+    [ "$waited" -ge "$EGRESS_WAIT" ] && { log "no running bridge-network container after ${EGRESS_WAIT}s; egress test skipped"; return 0; }
+    sleep 2
+    waited=$((waited + 2))
+  done
+  pid="$(docker inspect -f '{{.State.Pid}}' "$cid")"
+  for try in 1 2 3; do
+    for url in $EGRESS_URLS; do
+      if nsenter -t "$pid" -n curl -sS --max-time 10 -o /dev/null "$url" 2>/dev/null; then
+        log "egress ok: container $(docker inspect -f '{{.Name}}' "$cid" | tr -d /) reached $url"
+        return 0
+      fi
+    done
+    [ "$try" -lt 3 ] && sleep 5
+  done
+  err "container egress failed: no answer from any of: $EGRESS_URLS"
+  return 1
+}
+
+selftest() {
+  local bad=0 fam cmd set port want have
+  for fam in "${FAMILIES[@]}"; do
+    read -r cmd set <<< "$fam"
+    for port in $PORTS; do
+      # shellcheck disable=SC2046
+      has_rule "$cmd" $(new_rule "$set" "$port") || { err "$cmd: no rule with --ctdir ORIGINAL for port $port"; bad=1; }
+      # shellcheck disable=SC2046
+      if has_rule "$cmd" $(old_rule "$set" "$port"); then err "$cmd: an old-form rule for port $port is still present"; bad=1; fi
+    done
+  done
+  for fam in "4 cf4" "6 cf6"; do
+    read -r port set <<< "$fam"
+    want="$(list_count "$STATE_DIR/ips-v$port")"
+    have="$(set_count "$set")"
+    if [ "${have:-0}" -eq "$want" ]; then
+      log "$set: $have entries, as many as the list"
+    else
+      err "$set has ${have:-0} entries, the list has $want"
+      bad=1
+    fi
+  done
+  egress_test || bad=1
+  if [ "$bad" -eq 0 ]; then log "self-test passed"; else err "self-test FAILED"; fi
+  return "$bad"
+}
+
+status() {
+  local fam cmd set
+  for fam in "${FAMILIES[@]}"; do
+    read -r cmd set <<< "$fam"
+    echo "== $cmd $CHAIN"
+    "$cmd" -w "$IPT_WAIT" -nvx -L "$CHAIN" --line-numbers 2>&1 || true
+    echo "== $set: $(set_count "$set") entries (list: $(list_count "$STATE_DIR/ips-v${set#cf}" 2>/dev/null || echo none))"
+  done
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+case "${1:-apply}" in
+  apply)
+    detect_iface
+    fetch_list 4
+    fetch_list 6
+    load_sets
+    ensure_rules
+    selftest
+    ;;
+  refresh)
+    detect_iface
+    fetch_list 4
+    fetch_list 6
+    if lock_is_on; then
+      load_sets
+      ensure_rules
+      selftest
+    else
+      log "the lock is off; lists refreshed, nothing else changed"
+    fi
+    ;;
+  selftest)
+    detect_iface
+    selftest
+    ;;
+  remove)
+    detect_iface
+    remove_rules
+    log "rules and ipsets removed; ports $PORTS on $IFACE are no longer limited to Cloudflare"
+    ;;
+  status)
+    detect_iface
+    status
+    ;;
+  *)
+    echo "usage: cf-origin-lock {apply|refresh|selftest|remove|status}" >&2
+    exit 2
+    ;;
+esac

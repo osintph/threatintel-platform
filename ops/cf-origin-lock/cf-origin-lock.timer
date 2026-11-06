@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly refresh of Cloudflare ranges for the origin lock
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1h
+Unit=cf-origin-lock-refresh.service
+
+[Install]
+WantedBy=timers.target

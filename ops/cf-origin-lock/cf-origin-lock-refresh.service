@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh Cloudflare ranges for the origin lock and re-check its rules
+Documentation=https://github.com/osintph/threatintel-platform/blob/main/docs/runbook.md
+After=docker.service cf-origin-lock.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cf-origin-lock refresh

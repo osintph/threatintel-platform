@@ -1,0 +1,16 @@
+[Unit]
+Description=Restrict Docker-published web ports to Cloudflare (origin lock)
+Documentation=https://github.com/osintph/threatintel-platform/blob/main/docs/runbook.md
+# After the CrowdSec bouncer: it inserts its jump at the top of DOCKER-USER,
+# and starting after it keeps the order of the chain the same on every boot.
+After=docker.service crowdsec-firewall-bouncer.service network-online.target
+Wants=network-online.target docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/cf-origin-lock apply
+ExecStop=/usr/local/sbin/cf-origin-lock remove
+
+[Install]
+WantedBy=multi-user.target
