@@ -5,11 +5,26 @@ The format follows **Keep a Changelog**. This project adheres to **Semantic Vers
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-06
+
+Build, deployment and nginx fixes from the November 2026 audit: locked dependencies, an upgrade script, certificates that survive restarts, and a Cloudflare origin lock.
+
+### Upgrade notes
+
+- Upgrade with `sudo ./upgrade.sh v1.1.1` (from 1.1.0 or older: check out `main` once to get the script, see `docs/runbook.md`).
+- **Certificates:** after the upgrade, look for `were overwritten` in `docker compose logs nginx`. For each name reported, run `docker compose exec nginx certbot renew --cert-name <name> --force-renewal`, then `docker compose exec nginx nginx -s reload`. Behind Cloudflare, switch the SSL mode to Full (strict) afterwards.
+- **Web Check:** a full `upgrade.sh` run removes the container. Then delete its certificate (`docker compose exec nginx certbot delete --cert-name webcheck.<your domain>`), its image (`docker image rm lissy93/web-check`) and its DNS record.
+- **`.env`:** `DATABASE_URL` must start with `postgresql+psycopg2://`; `upgrade.sh` changes it for you and sets the file to mode 600.
+
 ### Fixed
 
+- **nginx replaced its Let's Encrypt chain and private key with a self-signed pair at every container start.** `/etc/nginx/certs/*.pem` are links into `/etc/letsencrypt/live/`, and the entrypoint ran `openssl req` against those names on every start, so it wrote through the links: the real private key was destroyed and the origin served a self-signed certificate while certbot still saw a valid `cert.pem`. The entrypoint (`docker/nginx/entrypoint.sh`, rewritten) now only links to existing Let's Encrypt files, generates a self-signed pair only for a name that has no certificate, and removes whatever is at the target path before writing. A lineage that was damaged this way is reported in the log at start, with the command that repairs it. **After upgrading, run the forced renewal once** (see Upgrade notes below). New regression test `tests/nginx/test_entrypoint.sh`, run in CI.
+- **A rebuilt dashboard answered 502 until nginx was restarted, and nginx could not start while the dashboard was down.** nginx resolved `dashboard` once at start. It now uses Docker's DNS (`resolver 127.0.0.11 valid=10s`) with a variable in `proxy_pass`, so the name is looked up at request time. The relay upstreams on the threat-watch site are resolved the same way.
+- **`scripts/configure-ssl.sh` did not apply the domain it had just written.** It ran `docker compose restart nginx`, which does not re-read `.env`; it now runs `docker compose up -d nginx`.
 - **A fresh build could not reach PostgreSQL.** Nothing pinned SQLAlchemy, and from 2.1 a bare `postgresql://` URL selects the psycopg 3 driver, which the image does not ship; the first query failed with `No module named 'psycopg'` while the container still reported healthy. `.env.example` and `deploy.sh` now write `postgresql+psycopg2://`, `upgrade.sh` corrects existing `.env` files, and `Storage` normalises a bare URL itself.
 - **The healthcheck could not see a broken database connection.** It requested `/`, which never touches the database. New `GET /healthz` runs `SELECT 1` and answers 200 or 503; the compose healthcheck uses it and the dashboard now waits for a healthy PostgreSQL. Healthcheck requests are kept out of the access log.
 - **Chromium could not be launched by the runtime user.** Playwright's browser was installed into root's home and the app runs as `appuser`, so the world map in the DNS PDF export could not render. The browser now installs to `/opt/playwright` (`PLAYWRIGHT_BROWSERS_PATH`).
+- **Channel Monitor download corruption:** `GET /api/channel-monitor/jobs/<id>/download` no longer streams the ZIP live from an in-request generator with no `Content-Length`. The old approach also ignored `Range` headers, so a resumed/reconnected download got a fresh full `200` body that clients would splice onto bytes they already had — producing archives with a valid small entry followed by orphaned tail data and no End Of Central Directory record. The ZIP is now built to a temp file server-side, verified (on-disk byte count checked against bytes written, plus an `is_zipfile` EOCD check) before anything is sent, then served via `send_file` with a real `Content-Length` and correct `Range`/206 support; the temp file is removed after the response completes. Oversized output directories (>5 GB, configurable via `CHANNEL_MONITOR_MAX_DOWNLOAD_GB`) are rejected up front with a 413 instead of being zipped.
 
 ### Changed
 
@@ -19,20 +34,22 @@ The format follows **Keep a Changelog**. This project adheres to **Semantic Vers
 - **New `.dockerignore`** keeps `.env`, the real `config/keywords.yaml` and `config/seeds.txt`, `*.bak` files, backups and the website directories out of the build context.
 - **`www` submodule** now records `bba43f7`, the commit that is deployed.
 - **CI** runs the integration tests as well as the unit tests, shellchecks the deploy, upgrade and ops scripts, builds all three images, and checks that the app image starts as its runtime user and can launch Chromium.
+- **Website vhost returns real 404s.** In the website server block generated by `docker/nginx/entrypoint.sh`, missing paths no longer fall back to `/index.html` with status 200: `try_files` ends in `=404` and `error_page 404 /404.html` serves the site's own 404 page. The withdrawn Thai and German URLs redirect permanently: `/index-de.html` and `/index-th.html` to `/index.html`, `/contact-th.html` to `/contact.html`. The threat-watch vhost is unchanged. **Deployment state:** this is live as a hot patch of the generated nginx config (tested and reloaded, no rebuild or restart) until the next approved nginx image rebuild. Until that rebuild, a container restart regenerates the old fallback from the image's copy of this script.
+- **nginx refuses unknown host names.** New catch-all servers: port 80 closes the connection (444) and port 443 rejects the TLS handshake, so a request with any other `Host` no longer lands on the dashboard. The stock `conf.d/default.conf` is removed from the image. Without `DOMAIN` (access by IP address) the dashboard stays the default.
+- **nginx sees the visitor's address.** `CF-Connecting-IP` is used as the client address for connections that come from Cloudflare's published ranges (`docker/nginx/cloudflare-realip.conf`, regenerated by the new `scripts/update-cloudflare-ips.sh`) and ignored from anyone else. `X-Forwarded-For` and `X-Forwarded-Host` are now set by nginx and no longer passed through from the client.
+- **Rate limits are applied.** The two `limit_req_zone` lines in `nginx.conf` were never used. `/login`, `/register`, `/totp/setup`, `/totp/verify`, `/api/digest/subscribe` and `/api/send-brief` now share 10 requests a minute per visitor (burst 10); over the limit nginx answers 429.
+- **Threat-watch relays are narrowed.** `/api/nvd/`, `/api/threatfox` and `/api/urlhaus` each accept one method and one fixed upstream path, bodies up to 4 kB, 30 requests a minute per visitor, and no longer send `Access-Control-Allow-Origin: *`, so other websites cannot use them.
+- **`/healthz` answers 404 through nginx**; it is for the container healthcheck only.
 
 ### Added
 
 - **`upgrade.sh`** — upgrades an existing install to a release: pre-flight checks, verified database dump, checkout, `.env` fixes, origin lock update, image rebuild, containers recreated one by one, health and public URL checks. Documented in `docs/runbook.md`.
-
 - **Cloudflare origin lock (`ops/cf-origin-lock/`).** A systemd oneshot (`cf-origin-lock.service`, ordered after Docker and the CrowdSec firewall bouncer) with a weekly refresh timer. It builds the `cf4` and `cf6` ipsets from Cloudflare's published lists and adds `DOCKER-USER` rules for `iptables` and `ip6tables` that drop new inbound connections to ports 80 and 443 from any other source. The rules carry `--ctdir ORIGINAL`, so replies to connections that containers open to ports 80/443 are no longer matched; each run removes rules of the older form that broke container egress. Lists are validated before use, the last good copy is kept when a download fails, an unterminated last line is no longer dropped, and every run ends with a self-test (rules, ipset sizes, one HTTPS request from a container). `deploy.sh` installs it with `ORIGIN_LOCK=1`. No SSH or ufw changes. Documented in `docs/runbook.md`.
 
-### Changed
+### Removed
 
-- **Website vhost returns real 404s.** In the website server block generated by `docker/nginx/entrypoint.sh`, missing paths no longer fall back to `/index.html` with status 200: `try_files` ends in `=404` and `error_page 404 /404.html` serves the site's own 404 page. The withdrawn Thai and German URLs redirect permanently: `/index-de.html` and `/index-th.html` to `/index.html`, `/contact-th.html` to `/contact.html`. The threat-watch vhost is unchanged. **Deployment state:** this is live as a hot patch of the generated nginx config (tested and reloaded, no rebuild or restart) until the next approved nginx image rebuild. Until that rebuild, a container restart regenerates the old fallback from the image's copy of this script.
-
-### Fixed
-
-- **Channel Monitor download corruption:** `GET /api/channel-monitor/jobs/<id>/download` no longer streams the ZIP live from an in-request generator with no `Content-Length`. The old approach also ignored `Range` headers, so a resumed/reconnected download got a fresh full `200` body that clients would splice onto bytes they already had — producing archives with a valid small entry followed by orphaned tail data and no End Of Central Directory record. The ZIP is now built to a temp file server-side, verified (on-disk byte count checked against bytes written, plus an `is_zipfile` EOCD check) before anything is sent, then served via `send_file` with a real `Content-Length` and correct `Range`/206 support; the temp file is removed after the response completes. Oversized output directories (>5 GB, configurable via `CHANNEL_MONITOR_MAX_DOWNLOAD_GB`) are rejected up front with a 413 instead of being zipped.
+- **Web Check.** The `webcheck` service (`lissy93/web-check:latest`, public and unauthenticated on the stack's network), its virtual host, the dashboard's Web Check button and the documentation section are gone. See Upgrade notes.
+- **`/api/send-brief` proxy locations** on the website and threat-watch virtual hosts. No page on either site calls the endpoint.
 
 ## [1.1.0] - 2026-07-04
 

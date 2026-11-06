@@ -95,7 +95,8 @@ fi
 # Restart nginx container to pick up new config and get cert
 info "Restarting nginx to apply SSL configuration..."
 cd "$REPO_DIR"
-docker compose restart nginx
+# "up -d" recreates the container, so the new DOMAIN and SSL_EMAIL from .env are read.
+docker compose up -d nginx
 
 # Wait for nginx to come up
 sleep 5

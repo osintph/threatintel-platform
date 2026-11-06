@@ -39,6 +39,24 @@ sudo bash ~/threatintel-platform/scripts/configure-ssl.sh
 1. Add an **A record** at your DNS provider pointing to your server's public IP
 2. **Cloudflare users:** Set proxy status to **DNS only** (grey cloud) during cert issuance
 
+### How certificates are handled
+
+- Let's Encrypt files live in the `letsencrypt` volume. A container start only links to them; it never writes to them. A self-signed pair is generated only for a name that has no certificate yet, and is kept until it has less than 30 days left.
+- Renewal runs daily inside the nginx container (`certbot renew`, then `nginx -s reload`).
+- Behind Cloudflare, set the zone's SSL mode to **Full (strict)** once the origin serves a Let's Encrypt chain. Check from the server:
+
+```bash
+echo | openssl s_client -connect 127.0.0.1:443 -servername scanner.yourdomain.com 2>/dev/null \
+  | openssl x509 -noout -issuer -enddate
+```
+
+- Versions before 1.1.1 replaced the certificate chain and private key with a self-signed pair at every container start. If the nginx log says `the certificate files for <name> were overwritten`, repair that name once (see the [runbook](runbook.md#certificates)):
+
+```bash
+docker compose exec nginx certbot renew --cert-name scanner.yourdomain.com --force-renewal
+docker compose exec nginx nginx -s reload
+```
+
 ---
 
 ## Production Setup on Ubuntu 22.04 VPS
@@ -172,7 +190,7 @@ sudo ./upgrade.sh            # tip of main
 sudo ./upgrade.sh v1.1.1     # or a release tag
 ```
 
-The script takes a verified database dump, checks out the release, rebuilds and recreates the containers, and checks the public URLs at the end. See the [runbook](runbook.md#upgrading) for what each step does and how to roll back.
+The script takes a verified database dump, checks out the release, rebuilds and recreates the containers, and checks at the end that nginx answers 200 for each site. See the [runbook](runbook.md#upgrading) for what each step does and how to roll back.
 
 To apply a change you made in `.env`, recreate the service; `docker compose restart` does not re-read `.env`:
 
@@ -192,68 +210,9 @@ docker compose up -d dashboard
 
 **Full restart:** `docker compose down && docker compose up -d`
 
----
+**502 from nginx right after a rebuild:** the dashboard is still starting; nginx finds it again by itself within about 10 seconds. No nginx restart is needed.
 
-## Web Check Integration
-
-Web Check provides OSINT analysis for any domain — DNS, SSL, headers, ports, tech stack, and more. It runs as a separate service at `webcheck.osintph.info` and is accessible via the **🔍 Web Check** button in the dashboard nav bar.
-
-### Fresh Deploy Steps
-
-Web Check lives outside the main repo at `/root/web-check` and must be set up manually after deploying the main platform:
-
-**1. Install Node.js 20+ and yarn**
-```bash
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-apt install nodejs -y
-npm install -g yarn
-```
-
-**2. Clone and build web-check**
-```bash
-cd /root
-git clone https://github.com/lissy93/web-check.git
-cd web-check
-BASE_URL=/ yarn install && yarn build
-```
-
-**3. Add DNS record**
-
-Add an A record for `webcheck.YOURDOMAIN` pointing to your server IP. Set to DNS only (grey cloud) in Cloudflare during cert issuance.
-
-**4. Start the container**
-```bash
-cd /root/threatintel-platform
-docker compose up -d webcheck
-```
-
-**5. Issue SSL certificate**
-```bash
-docker compose exec nginx certbot certonly --webroot --webroot-path /var/www/certbot \
-  --email YOUR_SSL_EMAIL --agree-tos --no-eff-email \
-  -d webcheck.YOURDOMAIN
-```
-
-**6. Link cert and reload nginx**
-```bash
-docker compose exec nginx sh -c "
-  ln -sf /etc/letsencrypt/live/webcheck.YOURDOMAIN/fullchain.pem /etc/nginx/certs/webcheck-cert.pem &&
-  ln -sf /etc/letsencrypt/live/webcheck.YOURDOMAIN/privkey.pem /etc/nginx/certs/webcheck-key.pem
-"
-docker compose up -d --build nginx
-```
-
-### SSL Renewal
-
-The webcheck.osintph.info cert renews automatically via the certbot cron job inside the nginx container as long as the container stays running.
-
-### Troubleshooting
-
-**Web Check not loading:** `docker compose logs webcheck`
-
-> **Note:** After deploying your own instance, update the Web Check button URL in `src/darkweb_scanner/dashboard/templates/index.html` — search for `webcheck.osintph.info` and replace with your own domain e.g. `webcheck.yourdomain.com`.
-
-**502 Bad Gateway on webcheck subdomain:** Container may still be starting — wait 30 seconds and retry.
+**429 on the sign-in page:** more than 10 sign-in requests a minute from one address; wait a minute.
 
 ---
 

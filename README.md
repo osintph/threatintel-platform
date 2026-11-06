@@ -2,7 +2,7 @@
 
 A self-hosted, open-source threat intelligence platform built for the Philippine and Southeast Asian security landscape. Crawls .onion networks, monitors Telegram channels, tracks ransomware groups, profiles threat actors, and delivers a daily intelligence digest — all from a single Docker Compose deployment.
 
-**Version: 1.1.0 · License: AGPL-3.0**
+**Version: 1.1.1 · License: AGPL-3.0**
 
 ---
 
@@ -50,8 +50,9 @@ docker-compose
   tor                      ← SOCKS5 proxy + control port; runs as debian-tor
   dashboard                ← Flask app; runs as appuser (uid 1000)
   nginx                    ← SSL reverse proxy; Let's Encrypt or self-signed
-  webcheck                 ← lissy93/web-check (optional OSINT service)
 ```
+
+nginx answers only for the names it is configured with: a request for any other host name is closed without a response. It takes the visitor's address from `CF-Connecting-IP` when the connection comes from Cloudflare, limits sign-in requests to 10 a minute per visitor, and looks the dashboard up at request time, so the dashboard can be rebuilt without touching nginx. Certificates and keys in the `letsencrypt` volume are never rewritten by a container start.
 
 The nginx entrypoint also generates the static website vhost when `WWW_DOMAIN` is set. That vhost serves the site's own `404.html` with status 404 for missing paths (no fallback to the home page) and permanently redirects the withdrawn Thai and German page URLs to their English pages. The config is generated when the container starts, so a change to `docker/nginx/entrypoint.sh` takes effect only after the nginx image is rebuilt.
 
@@ -110,11 +111,7 @@ sudo ./upgrade.sh            # tip of main
 sudo ./upgrade.sh v1.1.1     # or a release tag
 ```
 
-`upgrade.sh` dumps the database first, checks out the release, fixes known `.env` issues, rebuilds the images from the lock file, recreates the containers one by one and ends by checking that the public URLs answer 200. Details and rollback: [docs/runbook.md](docs/runbook.md#upgrading).
-
-### Web Check (manual step)
-
-Web Check runs as a separate service and is not started by default. See [docs/deployment.md](docs/deployment.md#web-check-integration) for setup steps.
+`upgrade.sh` dumps the database first, checks out the release, fixes known `.env` issues, rebuilds the images from the lock file, recreates the containers one by one and ends by checking that nginx answers 200 for each site. Details and rollback: [docs/runbook.md](docs/runbook.md#upgrading).
 
 ---
 

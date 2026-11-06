@@ -123,19 +123,6 @@ services:
     networks:
       - scanner_net
 
-  # ── Web Check ───────────────────────────────────────────────────────────────
-  webcheck:
-    logging: *default-logging
-    image: lissy93/web-check:latest
-    restart: unless-stopped
-    environment:
-      - PORT=3000
-      - DISABLE_GUI=false
-    expose:
-      - "3000"
-    networks:
-      - scanner_net
-
 volumes:
   tor_data:
   app_data:

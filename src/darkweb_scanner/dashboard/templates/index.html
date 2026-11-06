@@ -479,7 +479,6 @@
     <button class="nav-tab" onclick="switchTab('projects', this)">📁 Projects</button>
     <button class="nav-tab" onclick="switchTab('paste', this)">📋 Paste Monitor</button>
     <button class="nav-tab" onclick="switchTab('dns', this)">🌐 DNS</button>
-    <button class="nav-tab" onclick="window.open('https://webcheck.osintph.info', '_blank')">🔍 Web Check</button>
     <button class="nav-tab" onclick="switchTab('channelmonitor', this)">📡 Channel Monitor</button>
     <button class="nav-tab" onclick="switchTab('reports', this)">📄 Reports</button>
     <button class="nav-tab" onclick="switchTab('osint', this)">🧰 OSINT Toolkit</button>
@@ -1660,7 +1659,6 @@
     if (tab === 'projects') loadProjects();
     if (tab === 'paste') loadPasteHits();
     if (tab === 'dns') loadDNSInvestigations();
-    if (tab === 'webcheck') document.querySelector('#panel-webcheck iframe').src = '/webcheck/';
     if (tab === 'reports') { loadReportPreview(); if (isAdmin) loadSubscribers(); }
     if (tab === 'settings') loadSettings();
     if (tab === 'channelmonitor') cmInit();

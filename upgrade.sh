@@ -12,14 +12,15 @@
 #    SKIP_BACKUP=1              skip the pre-upgrade database dump
 #    SKIP_FETCH=1               use the refs already in the local clone
 #    SITE_URLS="https://a/ https://b/"
-#                               public URLs that must answer 200 at the end
-#                               (default: built from DOMAIN and WWW_DOMAIN in .env)
+#                               URLs that this server's nginx must answer with 200
+#                               at the end (default: built from DOMAIN and WWW_DOMAIN
+#                               in .env); they are also tried the public way
 #    ORIGIN_LOCK=1              install the Cloudflare origin lock if it is not there yet
 #    UPDATE_WWW=1               also move the www submodule to the recorded commit
 #
 #  What it does, in order: pre-flight checks, database dump, git checkout,
 #  .env fixes, origin lock update, image build, containers recreated one by one
-#  (postgres, tor, dashboard, nginx), health checks, public URL checks.
+#  (postgres, tor, dashboard, nginx), health checks, URL checks.
 #  It never touches SSH, ufw or volumes. See docs/runbook.md for rollback.
 # =============================================================================
 set -euo pipefail
@@ -96,7 +97,8 @@ checkout_ref() { # ref
   info "Current commit: $(git rev-parse --short HEAD) ($(git describe --tags --always 2>/dev/null))"
   if [[ "${SKIP_FETCH:-}" != "1" ]]; then
     info "Fetching from origin..."
-    git fetch --tags --prune origin || error "git fetch failed; nothing was changed."
+    # The www submodule is handled below, so the fetch does not descend into it.
+    git fetch --tags --prune --no-recurse-submodules origin || error "git fetch failed; nothing was changed."
   fi
   if git show-ref --verify --quiet "refs/remotes/origin/$ref"; then
     # A branch: stay on it, fast-forward only.
@@ -208,7 +210,7 @@ build_and_start() {
 }
 
 final_checks() {
-  local domain www urls url code bad=0 version
+  local domain www urls url host code hdrs bad=0 version
   version="$(docker compose exec -T dashboard python3 -c 'from darkweb_scanner import __version__; print(__version__)' 2>/dev/null || true)"
   [[ -n "$version" ]] && info "Running version: $version"
   docker compose ps --format 'table {{.Service}}\t{{.Status}}'
@@ -220,17 +222,37 @@ final_checks() {
     [[ -n "$domain" ]] && urls="https://$domain/login"
     [[ -n "$www" ]] && urls="$urls https://$www/"
   fi
-  if [[ -z "$urls" ]]; then
-    code="$(curl -sk -o /dev/null -m 20 -w '%{http_code}' https://localhost/login || true)"
-    if [[ "$code" == "200" ]]; then success "https://localhost/login -> 200"; else warn "https://localhost/login -> $code"; bad=1; fi
-  else
-    info "Checking the public URLs..."
-    sleep 3
-    for url in $urls; do
-      code="$(curl -s -o /dev/null -m 30 -w '%{http_code}' "$url" || true)"
-      if [[ "$code" == "200" ]]; then success "$url -> 200"; else warn "$url -> $code"; bad=1; fi
-    done
-  fi
+  [[ -n "$urls" ]] || urls="https://localhost/login"
+
+  # 1. This server's own nginx, asked on loopback under each host name. This is
+  #    the stack that was just upgraded, so it decides pass or fail.
+  info "Checking this server's nginx..."
+  sleep 3
+  for url in $urls; do
+    host="${url#https://}"; host="${host%%/*}"
+    code="$(curl -sk -o /dev/null -m 20 -w '%{http_code}' --resolve "$host:443:127.0.0.1" "$url" || true)"
+    if [[ "$code" == "200" ]]; then success "origin  $url -> 200"; else warn "origin  $url -> $code"; bad=1; fi
+  done
+
+  # 2. The same URLs the public way. A CDN may challenge requests that come from
+  #    the server's own address, which says nothing about the site, so only a
+  #    server error fails here; anything else is reported for you to check.
+  [[ "$urls" == "https://localhost/login" ]] && return "$bad"
+  info "Checking the public URLs..."
+  for url in $urls; do
+    hdrs="$(curl -s -o /dev/null -m 30 -D - "$url" 2>/dev/null | tr -d '\r' || true)"
+    code="$(awk 'NR == 1 {print $2}' <<<"$hdrs")"
+    code="${code:-000}"
+    if [[ "$code" == "200" ]]; then
+      success "public  $url -> 200"
+    elif grep -qi '^cf-mitigated:' <<<"$hdrs"; then
+      warn "public  $url -> $code: Cloudflare challenged this server's own request. Check the URL from another machine."
+    elif [[ "$code" == 5* ]]; then
+      warn "public  $url -> $code"; bad=1
+    else
+      warn "public  $url -> $code (not checked further; open the URL from another machine)"
+    fi
+  done
   return "$bad"
 }
 
