@@ -1,4 +1,5 @@
-FROM python:3.11-slim
+# Base image pinned by digest; .github/dependabot.yml proposes updates monthly.
+FROM python:3.11-slim@sha256:65bd3d9f1d7fa268dd1909973ba7eb4bdf41f6dcf2cfbe76ba9528b170f3fd79
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
@@ -26,19 +27,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy everything first, then install
-COPY pyproject.toml ./
+# Chromium goes to a shared path so the runtime user (appuser) can launch it.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Dependencies come only from the lock file, every one checked against its hash.
+# Regenerate it with `make lock`. The app itself runs from /app/src (PYTHONPATH).
+COPY requirements.lock ./
+RUN pip install --require-hashes -r requirements.lock && \
+    playwright install chromium && \
+    chmod -R a+rX /opt/playwright
+
 COPY src/ ./src/
 COPY config/ ./config/
 
-# Install the package + playwright chromium
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir ".[all]" && \
-    playwright install chromium
-
-RUN mkdir -p /app/data
-
-RUN useradd -m -u 1000 appuser \
+RUN mkdir -p /app/data \
+    && useradd -m -u 1000 appuser \
     && chown -R appuser:appuser /app
 
 USER appuser

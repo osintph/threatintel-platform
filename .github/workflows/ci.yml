@@ -19,10 +19,12 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install dev dependencies
+      - name: Install locked dependencies and dev tools
         run: |
           pip install --upgrade pip
-          pip install -e ".[dev,all]"
+          pip install --require-hashes -r requirements.lock
+          pip install --no-deps -e .
+          pip install ruff
 
       - name: Ruff (lint)
         run: ruff check src/ tests/ --fix-only --exit-zero && ruff check src/ tests/
@@ -31,7 +33,7 @@ jobs:
         run: ruff format src/ tests/
 
   test:
-    name: Unit Tests
+    name: Tests
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -45,13 +47,16 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install dependencies
+      # The same pinned, hash-checked versions the image is built from.
+      - name: Install locked dependencies and test tools
         run: |
           pip install --upgrade pip
-          pip install -e ".[dev,all]"
+          pip install --require-hashes -r requirements.lock
+          pip install --no-deps -e .
+          pip install pytest pytest-asyncio pytest-cov
 
-      - name: Run unit tests
-        run: pytest tests/unit/ -v --cov=darkweb_scanner --cov-report=xml
+      - name: Run unit and integration tests
+        run: pytest tests/ -v --cov=darkweb_scanner --cov-report=xml
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4
@@ -59,6 +64,18 @@ jobs:
         with:
           files: coverage.xml
           fail_ci_if_error: false
+
+  scripts:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck (deploy, upgrade and ops scripts)
+        run: shellcheck -x upgrade.sh ops/cf-origin-lock/cf-origin-lock ops/cf-origin-lock/install.sh
+
+      - name: shellcheck (older scripts, errors only)
+        run: shellcheck -S error deploy.sh docker/nginx/entrypoint.sh scripts/configure-ssl.sh
 
   docker:
     name: Docker Build Check
@@ -69,5 +86,16 @@ jobs:
       - name: Build app image
         run: docker build -f docker/app/Dockerfile -t darkweb-scanner:test .
 
+      - name: App image starts as its runtime user and can launch Chromium
+        run: |
+          docker run --rm darkweb-scanner:test python -c "import darkweb_scanner, sqlalchemy, psycopg2; print(darkweb_scanner.__version__, sqlalchemy.__version__)"
+          docker run --rm darkweb-scanner:test python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(); print('chromium', b.version); b.close(); p.stop()"
+
       - name: Build tor image
         run: docker build -f docker/tor/Dockerfile -t darkweb-scanner-tor:test docker/tor/
+
+      - name: Build nginx image
+        run: docker build -f docker/nginx/Dockerfile -t darkweb-scanner-nginx:test docker/nginx/
+
+      - name: Compose file is valid
+        run: cp .env.example .env && docker compose config -q

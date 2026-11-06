@@ -2,11 +2,22 @@
 Flask application factory — wires up auth + dashboard blueprints.
 """
 
+import logging
 import os
 from datetime import timedelta
 
 from flask import Flask, redirect, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
+
+
+logger = logging.getLogger(__name__)
+
+
+class _SkipHealthcheckLog(logging.Filter):
+    """Keep the container healthcheck (one request every 15 s) out of the access log."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "GET /healthz" not in record.getMessage()
 
 
 def create_app() -> Flask:
@@ -41,6 +52,22 @@ def create_app() -> Flask:
     @app.route("/")
     def root():
         return redirect(url_for("dashboard.index"))
+
+    @app.route("/healthz")
+    def healthz():
+        """Container healthcheck: 200 only when a query against the database works."""
+        from sqlalchemy import text
+
+        from .storage_helper import get_db
+
+        try:
+            get_db().execute(text("SELECT 1"))
+        except Exception:
+            logger.exception("healthz: database check failed")
+            return {"status": "error", "database": "unreachable"}, 503
+        return {"status": "ok", "database": "ok"}
+
+    logging.getLogger("werkzeug").addFilter(_SkipHealthcheckLog())
 
     return app
 

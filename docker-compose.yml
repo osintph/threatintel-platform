@@ -1,6 +1,18 @@
+# The project name is part of every volume name (darkweb-scanner_pg_data, ...).
+# Keep it fixed so the data stays attached whatever the install directory is called.
+name: darkweb-scanner
+
+# Every service rotates its own log: at most 5 files of 20 MB.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   # ── Tor daemon ──────────────────────────────────────────────────────────────
   tor:
+    logging: *default-logging
     build:
       context: ./docker/tor
     restart: unless-stopped
@@ -17,7 +29,9 @@ services:
 
   # ── PostgreSQL ─────────────────────────────────────────────────────────────
   postgres:
-    image: postgres:16-alpine
+    logging: *default-logging
+    # Pinned by digest; .github/dependabot.yml proposes updates monthly.
+    image: postgres:16-alpine@sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139
     restart: unless-stopped
     environment:
       - POSTGRES_DB=darkweb_scanner
@@ -35,6 +49,7 @@ services:
 
   # ── Scanner / crawler ───────────────────────────────────────────────────────
   scanner:
+    logging: *default-logging
     build:
       context: .
       dockerfile: docker/app/Dockerfile
@@ -55,13 +70,16 @@ services:
 
   # ── Dashboard ───────────────────────────────────────────────────────────────
   dashboard:
+    logging: *default-logging
     build:
       context: .
       dockerfile: docker/app/Dockerfile
     restart: unless-stopped
     depends_on:
-      - tor
-      - postgres
+      tor:
+        condition: service_started
+      postgres:
+        condition: service_healthy
     env_file:
       - .env
     volumes:
@@ -73,7 +91,8 @@ services:
       - scanner_net
     command: ["python", "-m", "darkweb_scanner.dashboard.app"]
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/"]
+      # /healthz runs SELECT 1, so "healthy" means the app can reach its database.
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/healthz"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -81,6 +100,7 @@ services:
 
   # ── Nginx SSL reverse proxy ─────────────────────────────────────────────────
   nginx:
+    logging: *default-logging
     build:
       context: ./docker/nginx
     restart: unless-stopped
@@ -105,6 +125,7 @@ services:
 
   # ── Web Check ───────────────────────────────────────────────────────────────
   webcheck:
+    logging: *default-logging
     image: lissy93/web-check:latest
     restart: unless-stopped
     environment:

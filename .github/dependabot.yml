@@ -1,0 +1,19 @@
+# Monthly proposals for the pinned base images and the workflow actions.
+# Python packages are pinned in requirements.lock; refresh it with `make lock`.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directories:
+      - /docker/app
+      - /docker/tor
+      - /docker/nginx
+    schedule:
+      interval: monthly
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: monthly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

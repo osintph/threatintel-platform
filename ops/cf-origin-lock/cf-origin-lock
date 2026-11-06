@@ -31,7 +31,7 @@ MIN_V6="${MIN_V6:-5}"
 LIST_BASE="${LIST_BASE:-https://www.cloudflare.com}"
 # Addresses outside Cloudflare's published ranges that answer HTTPS on their
 # IP. The egress test passes if a container reaches any one of them.
-EGRESS_URLS="${EGRESS_URLS:-https://9.9.9.9/ https://1.1.1.1/cdn-cgi/trace https://8.8.8.8/}"
+EGRESS_URLS="${EGRESS_URLS:-https://8.8.8.8/ https://1.1.1.1/cdn-cgi/trace https://9.9.9.9/}"
 EGRESS_WAIT="${EGRESS_WAIT:-30}"
 CHAIN=DOCKER-USER
 IPT_WAIT=5

@@ -125,7 +125,7 @@ SECRET_KEY="$(openssl rand -hex 32)"
 sed -i "s/^DASHBOARD_SECRET_KEY=.*/DASHBOARD_SECRET_KEY=${SECRET_KEY}/" .env
 PG_PASS="$(openssl rand -hex 24)"
 sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=${PG_PASS}/" .env
-sed -i "s|^DATABASE_URL=.*|DATABASE_URL=postgresql://scanner:${PG_PASS}@postgres:5432/darkweb_scanner|" .env
+sed -i "s|^DATABASE_URL=.*|DATABASE_URL=postgresql+psycopg2://scanner:${PG_PASS}@postgres:5432/darkweb_scanner|" .env
 
 # Set domain and SSL email if provided
 if [[ -n "$DOMAIN" ]]; then

@@ -333,10 +333,22 @@ class QuickScanFinding(Base):
     )
 
 
+def normalise_database_url(url: str) -> str:
+    """Name the PostgreSQL driver explicitly.
+
+    SQLAlchemy 2.1 maps a bare ``postgresql://`` URL to psycopg 3. The image
+    ships psycopg2, so a bare URL would fail at the first query.
+    """
+    for prefix in ("postgresql://", "postgres://"):
+        if url.startswith(prefix):
+            return "postgresql+psycopg2://" + url[len(prefix):]
+    return url
+
+
 class Storage:
     def __init__(self, database_url: Optional[str] = None):
-        self.database_url = database_url or os.getenv(
-            "DATABASE_URL", "sqlite:////app/data/results.db"
+        self.database_url = normalise_database_url(
+            database_url or os.getenv("DATABASE_URL", "sqlite:////app/data/results.db")
         )
         connect_args = {}
         if self.database_url.startswith("sqlite"):

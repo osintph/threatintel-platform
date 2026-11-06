@@ -34,7 +34,11 @@ echo "cf-origin-lock: files installed"
 [ "${1:-}" = "--files" ] && exit 0
 
 systemctl enable cf-origin-lock.service cf-origin-lock.timer
-# "restart" runs the remove step and then a full apply, the same path as a boot.
-systemctl restart cf-origin-lock.service
+if systemctl is-active --quiet cf-origin-lock.service; then
+  # Already on: apply in place. A restart would take the lock off for a moment.
+  /usr/local/sbin/cf-origin-lock apply
+else
+  systemctl start cf-origin-lock.service
+fi
 systemctl start cf-origin-lock.timer
 systemctl --no-pager --lines=12 status cf-origin-lock.service || true

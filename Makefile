@@ -1,4 +1,4 @@
-.PHONY: help install dev-install test lint format run stop logs shell stats hits check-tor clean
+.PHONY: help install dev-install lock test lint format run stop logs shell stats hits check-tor clean
 
 help:  ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -16,6 +16,10 @@ setup:  ## First-time setup: copy config examples
 	@cp -n config/keywords.example.yaml config/keywords.yaml || true
 	@cp -n config/seeds.example.txt config/seeds.txt || true
 	@echo "✅ Config files created. Edit .env, config/keywords.yaml, and config/seeds.txt"
+
+lock:  ## Regenerate requirements.lock (exact versions with hashes; needs uv)
+	uv pip compile pyproject.toml --extra all --universal --python-version 3.11 \
+		--generate-hashes --upgrade --custom-compile-command "make lock" -o requirements.lock
 
 # ── Testing ─────────────────────────────────────────────────────────────────
 test:  ## Run unit tests
