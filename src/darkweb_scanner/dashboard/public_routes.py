@@ -2,10 +2,11 @@
 Public routes — no auth required.
 Currently: /api/send-brief  (Mailgun email for threat brief gate)
 """
-import os
 import logging
+import os
+
 import requests
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, jsonify, request
 
 logger = logging.getLogger(__name__)
 public_bp = Blueprint("public", __name__)

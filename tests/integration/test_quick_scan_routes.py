@@ -18,13 +18,14 @@ from darkweb_scanner import quick_scan as qs
 from darkweb_scanner.dashboard.dashboard_routes import dashboard_bp
 from darkweb_scanner.dashboard.storage_helper import close_db
 from darkweb_scanner.storage import Storage
+from tests.helpers import login_as, use_storage
 
 _SEARCH_HTML = (
-    '<html><body>results '
+    "<html><body>results "
     '<a href="http://aaaaaaaaaaaaaaaaaaaaaaaaaa.onion/hit1">r1</a>'
-    '</body></html>'
+    "</body></html>"
 )
-_HIT_HTML = '<html><body>acme.com credentials leaked and for sale here</body></html>'
+_HIT_HTML = "<html><body>acme.com credentials leaked and for sale here</body></html>"
 
 
 def _page_for(url):
@@ -47,8 +48,9 @@ class _InlineThread:
 
 
 @pytest.fixture
-def storage():
-    return Storage("sqlite:///:memory:")
+def storage(monkeypatch):
+    # Also the storage the auth layer loads the signed-in user from.
+    return use_storage(monkeypatch, Storage("sqlite:///:memory:"))
 
 
 def _make_app():
@@ -75,32 +77,32 @@ def app(storage):
 
 
 def _login(client, user_id=1, username="tester"):
-    with client.session_transaction() as sess:
-        sess["logged_in"] = True
-        sess["user_id"] = user_id
-        sess["username"] = username
+    login_as(client, user_id=user_id)
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 
 
 def test_unauthenticated_is_blocked(app, storage):
-    with patch(
-        "darkweb_scanner.dashboard.dashboard_routes.get_storage", return_value=storage
-    ), app.test_client() as client:
+    with (
+        patch("darkweb_scanner.dashboard.dashboard_routes.get_storage", return_value=storage),
+        app.test_client() as client,
+    ):
         resp = client.get("/api/quick-scan/sessions")
-    # require_login redirects unauthenticated requests to the login page.
-    assert resp.status_code == 302
-    assert "/login" in resp.headers.get("Location", "")
+        page = client.get("/quick-scan")
+    # API calls get a 401 they can handle; pages are sent to the sign-in page.
+    assert resp.status_code == 401
+    assert resp.get_json() == {"error": "unauthorized"}
+    assert page.status_code == 302
+    assert "/login" in page.headers.get("Location", "")
 
 
 def test_cross_user_status_is_forbidden(app, storage):
-    other_sid = storage.create_quick_scan_session(
-        2, "acme.com", "domain", ["acme.com"], ["ahmia"]
-    )
-    with patch(
-        "darkweb_scanner.dashboard.dashboard_routes.get_storage", return_value=storage
-    ), app.test_client() as client:
+    other_sid = storage.create_quick_scan_session(2, "acme.com", "domain", ["acme.com"], ["ahmia"])
+    with (
+        patch("darkweb_scanner.dashboard.dashboard_routes.get_storage", return_value=storage),
+        app.test_client() as client,
+    ):
         _login(client, user_id=1)
         resp = client.get(f"/api/quick-scan/status/{other_sid}")
         findings_resp = client.get(f"/api/quick-scan/findings/{other_sid}")
@@ -114,12 +116,14 @@ def test_cross_user_status_is_forbidden(app, storage):
 def test_second_start_while_active_returns_409(app, storage):
     # Seed an already-active (pending) scan for user 1.
     storage.create_quick_scan_session(1, "prior.com", "domain", ["prior.com"], ["ahmia"])
-    with patch(
-        "darkweb_scanner.dashboard.dashboard_routes.get_storage", return_value=storage
-    ), app.test_client() as client:
+    with (
+        patch("darkweb_scanner.dashboard.dashboard_routes.get_storage", return_value=storage),
+        app.test_client() as client,
+    ):
         _login(client, user_id=1)
         resp = client.post(
-            "/api/quick-scan/start", json={"target": "acme.com", "target_type": None, "sources": None}
+            "/api/quick-scan/start",
+            json={"target": "acme.com", "target_type": None, "sources": None},
         )
     assert resp.status_code == 409
 
@@ -134,11 +138,12 @@ def test_start_poll_and_list_findings(app, storage, monkeypatch):
     async def _fake_fetch(url, tor_client):
         return _page_for(url)
 
-    with patch(
-        "darkweb_scanner.dashboard.dashboard_routes.get_storage", return_value=storage
-    ), patch("threading.Thread", _InlineThread), patch.object(
-        qs, "_fetch", _fake_fetch
-    ), app.test_client() as client:
+    with (
+        patch("darkweb_scanner.dashboard.dashboard_routes.get_storage", return_value=storage),
+        patch("threading.Thread", _InlineThread),
+        patch.object(qs, "_fetch", _fake_fetch),
+        app.test_client() as client,
+    ):
         _login(client, user_id=1)
 
         start = client.post(
@@ -190,7 +195,7 @@ def test_cancel_stops_running_scan(tmp_path, monkeypatch):
     monkeypatch.setenv("QUICK_SCAN_DELAY_MIN", "0")
     monkeypatch.setenv("QUICK_SCAN_DELAY_MAX", "0")
 
-    storage = Storage(f"sqlite:///{tmp_path / 'quick_scan_cancel.db'}")
+    storage = use_storage(monkeypatch, Storage(f"sqlite:///{tmp_path / 'quick_scan_cancel.db'}"))
     app = _make_app()
 
     fetch_started = threading.Event()
@@ -202,9 +207,11 @@ def test_cancel_stops_running_scan(tmp_path, monkeypatch):
             await asyncio.sleep(0.01)
         return _page_for(url)
 
-    with patch(
-        "darkweb_scanner.dashboard.dashboard_routes.get_storage", return_value=storage
-    ), patch.object(qs, "_fetch", _blocking_fetch), app.test_client() as client:
+    with (
+        patch("darkweb_scanner.dashboard.dashboard_routes.get_storage", return_value=storage),
+        patch.object(qs, "_fetch", _blocking_fetch),
+        app.test_client() as client,
+    ):
         _login(client, user_id=1)
 
         start = client.post(
@@ -225,9 +232,7 @@ def test_cancel_stops_running_scan(tmp_path, monkeypatch):
 
         # Unblock the fetch and let the worker notice the cancellation and exit.
         release_fetch.set()
-        worker = next(
-            (t for t in threading.enumerate() if t.name == "quick_scan_thread"), None
-        )
+        worker = next((t for t in threading.enumerate() if t.name == "quick_scan_thread"), None)
         assert worker is not None
         worker.join(timeout=10)
         assert not worker.is_alive(), "worker did not stop after cancellation"
@@ -240,21 +245,21 @@ def test_cancel_stops_running_scan(tmp_path, monkeypatch):
 
 
 def test_cancel_missing_session_is_404_and_cross_user_403(app, storage):
-    other_sid = storage.create_quick_scan_session(
-        2, "acme.com", "domain", ["acme.com"], ["ahmia"]
-    )
-    with patch(
-        "darkweb_scanner.dashboard.dashboard_routes.get_storage", return_value=storage
-    ), app.test_client() as client:
+    other_sid = storage.create_quick_scan_session(2, "acme.com", "domain", ["acme.com"], ["ahmia"])
+    with (
+        patch("darkweb_scanner.dashboard.dashboard_routes.get_storage", return_value=storage),
+        app.test_client() as client,
+    ):
         _login(client, user_id=1)
         assert client.post("/api/quick-scan/cancel/999999").status_code == 404
         assert client.post(f"/api/quick-scan/cancel/{other_sid}").status_code == 403
 
 
 def test_start_requires_target(app, storage):
-    with patch(
-        "darkweb_scanner.dashboard.dashboard_routes.get_storage", return_value=storage
-    ), app.test_client() as client:
+    with (
+        patch("darkweb_scanner.dashboard.dashboard_routes.get_storage", return_value=storage),
+        app.test_client() as client,
+    ):
         _login(client, user_id=1)
         resp = client.post("/api/quick-scan/start", json={"target": "  "})
     assert resp.status_code == 400

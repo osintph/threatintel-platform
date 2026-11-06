@@ -7,7 +7,6 @@ and stores findings as named investigations.
 import asyncio
 import logging
 import os
-import time
 from dataclasses import dataclass, field
 from typing import Optional
 

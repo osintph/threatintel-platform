@@ -5,6 +5,95 @@ The format follows **Keep a Changelog**. This project adheres to **Semantic Vers
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-06
+
+Security release for the application, from the November 2026 audit: sign-in and sessions are checked on the server, every change needs a CSRF token and the right role, the dashboard and its exports show data as text, outbound requests cannot be redirected to internal addresses, and Channel Monitor is limited to administrators and public channels.
+
+### Upgrade notes
+
+- Upgrade with `sudo ./upgrade.sh v1.2.0`.
+- **Everyone signs in again.** All sessions end at the upgrade. Passwords and authenticators are unchanged. An account without a second factor is taken to enrolment right after it signs in; there is no way to skip it.
+- **Channel Monitor archives older than 90 days are deleted when the dashboard first starts.** Download what you want to keep before upgrading, or set `CHANNEL_MONITOR_RETENTION_DAYS` in `.env` first.
+- **`.env`:** `upgrade.sh` removes the settings nothing reads any more (`TOR_CONTROL_PORT`, `TOR_CONTROL_PASSWORD`, `FLASK_DEBUG`, `DASHBOARD_PORT`, the OAuth client ids and secrets) after copying the old file to `backups/env-before-<time>`. It stops before rebuilding anything if `DASHBOARD_SECRET_KEY` is shorter than 32 characters. `SETUP_TOKEN` is needed for new installs only.
+- **OAuth sign-in is gone.** An account that only ever signed in through Google, GitHub, Microsoft or Apple has no password: an administrator deletes it and creates it again.
+- **Non-administrators lose the controls listed under "Changed".** Give the admin role to the people who need them.
+- **Scripts that call the API** with a session cookie must send the `X-CSRF-Token` header on every request that is not a GET, and now get `401` with a JSON body, not a redirect, when the session has ended.
+- **Locked out or lost authenticator:** `docker compose exec dashboard python -m darkweb_scanner.main user-unlock NAME` and `... user-reset-mfa NAME`; see `docs/runbook.md`.
+
+### Security
+
+**Sign-in and sessions**
+
+- **A session is checked against the database on every request.** The cookie used to be trusted as it was: a deleted user kept working for as long as the cookie stayed valid (12 hours, renewed by every request), and the admin flag and the "second factor done" flag were read from the cookie. The cookie now carries a user id and a session version; the user, the role and the second factor come from the database each time. Sessions end 12 hours after sign-in however active they are, and at sign-out, a password change, a second-factor change, an administrator's reset, or when the user is deleted.
+- **Two-factor sign-in is mandatory and enforced on the server.** The enrolment page had a "skip" link and the API did not check enrolment at all. An account without a second factor can now reach only the enrolment page.
+- **A code works once.** A six-digit code that was accepted is refused when it is sent again.
+- **Replacing or removing a second factor needs proof.** Replacing needs a code from the current authenticator; removing needs the password and a current code. The secret being enrolled is kept on the server, not in the cookie.
+- **Changing a password needs the current password**, and ends the user's other sessions.
+- **Sign-in is throttled in the application**, not only by nginx: 10 wrong passwords for one user name, or 20 failures from one address, within 15 minutes lock sign-in for 15 minutes; 5 wrong codes lock the second step and the password has to be entered again. The answer is the same whether or not the user name exists, and takes the same time.
+- **CSRF protection.** Every request that is not a GET, HEAD or OPTIONS must carry the session's token (`X-CSRF-Token` header or `csrf_token` form field), and an `Origin` header must name this host. Sign-out is a POST. The cookie is `__Host-session`: Secure, HttpOnly, SameSite=Lax.
+- **The first administrator needs a setup token.** `/register` was open to whoever reached a fresh install first. It now needs `SETUP_TOKEN` from the server's `.env`, and is closed when no token is set.
+- **Sign-in log.** Sign-ins, failures, lockouts, sign-outs, password and second-factor changes and user administration are written to the new `auth_events` table and to the container log, with time, user name and address, and kept for 365 days. Administrators read it under Users.
+- **The visitor's address is taken from nginx** (`ProxyFix`, one hop), so the log and the per-address limit see the real client.
+- **Start-up checks:** the dashboard does not start with a `DASHBOARD_SECRET_KEY` shorter than 32 characters, or without `DATABASE_URL`. The silent fallback to an empty SQLite file, which reopened first-admin registration, is gone.
+- **Password rule:** at least 12 characters with an uppercase letter, a lowercase letter, a number and a symbol, for passwords set from now on.
+- **Sign-in redirect:** the `next` target must be a path on this site; backslashes and control characters are refused.
+
+**Authorization**
+
+- **Administrator role required**, checked on the server, for: adding, importing and removing keywords, seeds, clearnet seeds, paste sources, Telegram channels and custom ransomware-group and threat-actor entries; starting and stopping a crawl and a paste scan; deleting breach, IP and DNS investigations; digest subscribers and sending the digest; user administration; everything in Channel Monitor. The data stays a workspace shared by all signed-in users.
+- **Project rows can only be removed through their own project.** Deleting a keyword, domain or entity took the row id alone, so a member of one project could delete another project's rows.
+- **The role of a new user is explicit:** `is_admin` must be a JSON boolean. An administrator cannot delete their own account.
+
+**Dashboard pages (cross-site scripting)**
+
+- **API data is shown as text.** Values from feeds, crawl results, investigations, subscribers and HTTP headers were placed into markup, event handlers and attributes with an escaper that skipped quotes. The escaper now covers all five characters, no data is written into an event handler (buttons carry `data-` attributes and one listener dispatches to a fixed list of functions), links accept `http` and `https` only, colours must be hex colours, and path segments are URL-encoded. External links open with `rel="noopener noreferrer"`.
+- **Controls a user may not use are hidden**, by a class set on the server.
+
+**Channel Monitor**
+
+- **The report can no longer run script.** `messages.html` was assembled from message text, entity data and file names as HTML. It is now rendered from a template with auto-escaping, from the raw text and entity offsets; links are `http`, `https` or `tg` only; media files are named `<message id>.<ext>` from a fixed list of types, anything else is saved as `.bin` and linked, not displayed; the page carries a content security policy that blocks scripts and remote content.
+- **Public channels only.** `me`, phone numbers, numeric ids, invite links and titles are refused before Telegram is contacted, and the resolved chat must be a public channel. Previously the tab could read the saved messages and private chats of the Telegram account configured on the server.
+- **Administrators only, with job ownership.** Jobs record who started them; a malformed, unknown or foreign job id answers 404; a running job cannot be deleted (409).
+- **Retention:** archives and job folders are deleted 90 days after their last change (`CHANNEL_MONITOR_RETENTION_DAYS`).
+- **Input is validated:** wrong types are refused, numbers are kept within limits.
+
+**Outbound requests**
+
+- **Connections go to the address that was checked.** A host name is resolved once and the request is sent to an address that passed the internal-address check, with the name still used for TLS. A second DNS answer can no longer move the request to an internal address. This applies to the proxy routes, the DNS recon probes and the user-name check.
+- **Recon probes do not follow redirects.** A host that answers with a redirect is reported as "redirects to …"; the target is not fetched. Names that resolve to any internal address are skipped. Proxy settings and `.netrc` are ignored. Request headers are not carried to another host on a redirect.
+- **PDF exports escape their text.** A `<` or `&` in a hit, a DNS record or a feed title was parsed as ReportLab markup, which could break the export or pull in a remote image. Every value is now escaped, and only `http`/`https` URLs become links.
+- **The ThreatFox relay builds its own request**; it no longer forwards the caller's body.
+- **Input validation** on every route that takes user input: e-mail addresses, domains, IP addresses, URLs, user names, channel names, keywords, limits.
+
+**Tor**
+
+- **No control port.** The control port was open to every container on the stack's network, protected by a password whose hash was committed. Tor now runs as a SOCKS client only. The crawler gets a new circuit by using new SOCKS credentials, so nothing needs the port, and the `stem` dependency is gone.
+- **`torrc` is rendered when the container starts** (`docker/tor/entrypoint.sh`); the repository and the image hold no `torrc` and no hash.
+
+### Changed
+
+- **The dashboard runs under gunicorn** (one worker, eight threads) in place of Flask's development server. There is no debug switch. `python -m darkweb_scanner.dashboard.app` no longer starts a server.
+- **API answers for a signed-out or not-yet-enrolled user** are JSON with status 401 or 403; pages still redirect to sign-in.
+- **`deploy.sh`** generates `SETUP_TOKEN` once and tells you where to find it, checks the length of `DASHBOARD_SECRET_KEY`, and no longer generates a Tor password or edits `torrc`.
+- **`upgrade.sh`** removes obsolete settings from `.env` (with a copy kept) and checks `DASHBOARD_SECRET_KEY` before rebuilding.
+- **`.env.example`:** `SETUP_TOKEN` and `CHANNEL_MONITOR_RETENTION_DAYS` added; Tor control, OAuth, `FLASK_DEBUG` and `DASHBOARD_PORT` removed.
+- **DNS recon results:** the HTTP table shows each probed host's own answer; 303 answers are reported.
+- **Digest PDF:** text is escaped, and links that are not `http`/`https` are shown as text.
+- **CI** runs the integration tests on PostgreSQL 16 as well as SQLite, loads the app with gunicorn, renders the dashboard in headless Chromium with hostile data in every API answer, tests the Tor image, and shellchecks the new scripts.
+
+### Added
+
+- **Help & privacy page** (`/help`, linked from the header): sign-in rules, who can do what, what Channel Monitor does with message text, which services receive which data, and what is stored and logged.
+- **Account commands on the server:** `user-list`, `user-unlock`, `user-reset-mfa` (`python -m darkweb_scanner.main …`, `make users`).
+- **Users panel:** "Reset 2FA" for a user who lost their authenticator, and the sign-in log.
+- **Tests:** sign-in flow, authorization, input validation, the application's URL map, dashboard templates, Channel Monitor report and routes, outbound pinning, PDF exports, the Tor client and container, the account commands (595 tests, up from 135).
+
+### Removed
+
+- **OAuth sign-in** (Google, GitHub, Microsoft, Apple): routes, buttons, helpers and settings. The two unused columns stay in the `users` table until the next release.
+- **Tor control port**, `TOR_CONTROL_PORT`, `TOR_CONTROL_PASSWORD`, the committed `torrc` files and the unused root `Dockerfile.tor`.
+- **`FLASK_DEBUG`** and the development server entry point.
+
 ## [1.1.1] - 2026-11-06
 
 Build, deployment and nginx fixes from the November 2026 audit: locked dependencies, an upgrade script, certificates that survive restarts, and a Cloudflare origin lock.

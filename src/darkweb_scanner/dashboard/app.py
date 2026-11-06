@@ -1,16 +1,27 @@
 """
 Flask application factory — wires up auth + dashboard blueprints.
+
+Served by gunicorn (see docker-compose.yml):
+    gunicorn 'darkweb_scanner.dashboard.app:create_app()'
 """
 
 import logging
 import os
 from datetime import timedelta
 
-from flask import Flask, redirect, url_for
+from flask import Flask, flash, jsonify, redirect, request, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 
+from ..auth import SESSION_MAX_AGE_SECONDS, client_ip, csrf_failure, csrf_token
 
 logger = logging.getLogger(__name__)
+
+MIN_SECRET_KEY_LENGTH = 32
+_PLACEHOLDER_SECRETS = ("change-me-in-production", "change-me-to-a-long-random-string")
+
+# Endpoints that take a POST from another site by design and have no session to protect.
+# /api/digest/subscribe is the public subscribe form; nginx rate-limits it.
+CSRF_EXEMPT_ENDPOINTS = frozenset({"dashboard.api_public_subscribe"})
 
 
 class _SkipHealthcheckLog(logging.Filter):
@@ -20,34 +31,89 @@ class _SkipHealthcheckLog(logging.Filter):
         return "GET /healthz" not in record.getMessage()
 
 
+def _configure_logging() -> None:
+    """Send the app's own log lines (including auth events) to the container log."""
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("darkweb_scanner").setLevel(logging.INFO)
+
+
 def create_app() -> Flask:
+    _configure_logging()
     app = Flask(__name__)
 
     _secret = os.getenv("DASHBOARD_SECRET_KEY", "")
-    _PLACEHOLDER = "change-me-in-production"
-    if not _secret or _secret == _PLACEHOLDER or _secret == "change-me-to-a-long-random-string":
+    if not _secret or _secret in _PLACEHOLDER_SECRETS or len(_secret) < MIN_SECRET_KEY_LENGTH:
         raise RuntimeError(
-            "DASHBOARD_SECRET_KEY is not set or still uses the placeholder value. "
+            "DASHBOARD_SECRET_KEY is not set, still uses the placeholder value, or is shorter than "
+            f"{MIN_SECRET_KEY_LENGTH} characters. "
             "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\" "
             "and set it in .env before starting the dashboard."
         )
     app.secret_key = _secret
-    app.permanent_session_lifetime = timedelta(hours=12)
+    app.permanent_session_lifetime = timedelta(seconds=SESSION_MAX_AGE_SECONDS)
 
-    # Trust X-Forwarded-Proto from nginx so url_for generates https:// URLs
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+    # The dashboard is only ever served over HTTPS by nginx. DASHBOARD_ALLOW_HTTP=1 is
+    # for running it on a developer's machine without TLS, and for nothing else.
+    allow_http = os.getenv("DASHBOARD_ALLOW_HTTP", "").lower() in ("1", "true")
+    app.config.update(
+        SESSION_COOKIE_NAME="session" if allow_http else "__Host-session",
+        SESSION_COOKIE_SECURE=not allow_http,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        # The cookie's lifetime is not pushed forward by every response.
+        SESSION_REFRESH_EACH_REQUEST=False,
+        MAX_CONTENT_LENGTH=16 * 1024 * 1024,
+    )
+    if allow_http:
+        logger.warning("DASHBOARD_ALLOW_HTTP is set: the session cookie is sent over plain HTTP")
+
+    # nginx sets X-Forwarded-For (the visitor's address), -Proto and -Host itself
+    # and never passes the client's values through; trust exactly one hop.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)  # type: ignore[method-assign]
+
+    app.jinja_env.globals["csrf_token"] = csrf_token
 
     from .auth_routes import auth_bp
-    from .dashboard_routes import dashboard_bp
     from .channel_monitor_routes import channel_monitor_bp
+    from .dashboard_routes import dashboard_bp
     from .ransomware_live_routes import rw_live_bp
-    from .storage_helper import close_db
+    from .storage_helper import close_db, get_storage
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(dashboard_bp)
     app.register_blueprint(channel_monitor_bp)
     app.register_blueprint(rw_live_bp)
     app.teardown_appcontext(close_db)
+
+    # Fail at start, not at the first request, when the database is not configured.
+    storage = get_storage()
+    try:
+        storage.prune_auth_state()
+    except Exception:
+        logger.exception("could not prune old auth events")
+    try:
+        from .channel_monitor_routes import purge_expired_archives
+
+        purge_expired_archives()
+    except Exception:
+        logger.exception("could not purge expired Channel Monitor archives")
+
+    @app.before_request
+    def _csrf_protect():
+        if request.endpoint in CSRF_EXEMPT_ENDPOINTS:
+            return None
+        reason = csrf_failure()
+        if reason is None:
+            return None
+        logger.warning(
+            "csrf check failed reason=%s method=%s path=%s ip=%s", reason, request.method, request.path, client_ip()
+        )
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "csrf", "detail": "missing or wrong CSRF token; reload the page"}), 403
+        flash("That page expired. Please try again.", "error")
+        return redirect(url_for("auth.login"))
 
     @app.route("/")
     def root():
@@ -70,11 +136,3 @@ def create_app() -> Flask:
     logging.getLogger("werkzeug").addFilter(_SkipHealthcheckLog())
 
     return app
-
-
-app = create_app()
-
-if __name__ == "__main__":
-    port = int(os.getenv("DASHBOARD_PORT", "8080"))
-    debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
-    app.run(host="0.0.0.0", port=port, debug=debug)

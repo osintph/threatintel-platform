@@ -47,7 +47,8 @@
     </div>
 
     <div class="first-run">
-      ⚠️ First-time setup — create the administrator account. This page is only available once.
+      ⚠️ First-time setup — create the administrator account. This page works only while
+      there are no users, and only with the setup token from the server.
     </div>
 
     {% with messages = get_flashed_messages(with_categories=true) %}
@@ -56,7 +57,20 @@
       {% endfor %}
     {% endwith %}
 
+    {% if setup_disabled %}
+    <div class="flash error">
+      Setup is switched off. On the server, set <code>SETUP_TOKEN</code> in <code>.env</code> to a random value of
+      at least 24 characters (for example the output of <code>openssl rand -hex 24</code>), run
+      <code>docker compose up -d dashboard</code>, and open this page again.
+    </div>
+    {% else %}
     <form method="POST">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+      <div class="form-group">
+        <label for="setup_token">Setup token</label>
+        <input type="password" id="setup_token" name="setup_token" required autocomplete="off"/>
+        <div class="hint">The value of <code>SETUP_TOKEN</code> in the server's <code>.env</code> file.</div>
+      </div>
       <div class="form-group">
         <label for="username">Username</label>
         <input type="text" id="username" name="username" required autocomplete="username"/>
@@ -68,7 +82,7 @@
       <div class="form-group">
         <label for="password">Password</label>
         <input type="password" id="password" name="password" required autocomplete="new-password"/>
-        <div class="hint">Min 10 characters, one uppercase, one number.</div>
+        <div class="hint">{{ password_policy }}</div>
       </div>
       <div class="form-group">
         <label for="confirm_password">Confirm Password</label>
@@ -76,6 +90,7 @@
       </div>
       <button type="submit" class="btn btn-primary">Create Account &amp; Continue</button>
     </form>
+    {% endif %}
   </div>
 </body>
 </html>

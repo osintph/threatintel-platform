@@ -2,7 +2,7 @@
 
 The platform provides two complementary ways to work with Telegram channels:
 
-1. **Channel Monitor tab** — interactive, on-demand scraping of any channel directly from the dashboard. Fetches messages, auto-translates to English, downloads media, and lets you download a ZIP of the full report.
+1. **Channel Monitor tab** (administrators only) — interactive, on-demand scraping of any **public** channel directly from the dashboard. Fetches messages, auto-translates to English with Google Translate, downloads media, and lets you download a ZIP of the full report.
 2. **Background Telegram Scraper** — automated keyword scanning of a fixed list of channels, feeding hits into the main database alongside dark web crawler results.
 
 ---
@@ -47,7 +47,7 @@ Enter the OTP sent to your Telegram app when prompted. The session is saved to `
 ### Using the tab
 
 1. Click **📡 Channel Monitor** in the nav bar
-2. Enter a channel username (e.g. `irna_1931`), `@handle`, or invite link
+2. Enter a public channel username (e.g. `irna_1931`), `@handle`, or a `t.me/name` link. Private chats, saved messages, phone numbers, numeric ids and invite links are refused
 3. Configure your scan settings and click **▶ Start Scan**
 4. Watch the live log — the scan runs in the background so you can navigate away
 5. When the status changes to **✓ Completed**, click **⬇ Download ZIP**
@@ -57,8 +57,16 @@ Enter the OTP sent to your Telegram app when prompted. The session is saved to `
 | File | Contents |
 |------|----------|
 | `messages.html` | Full rendered report — original text, English translation, inline photos/videos |
-| `messages.json` | Raw structured data for all messages |
+| `messages.json` | Structured data for all messages: original text, translation, and the text split into `segments` (plain text, links, formatting) |
 | `media/` | All downloaded photos and video files |
+
+### Privacy, access and retention
+
+- **Administrators only.** Other users do not see the tab, and the API refuses them. Each job records who started it.
+- **Public channels only.** The name is checked before Telegram is contacted, and the resolved chat must be a public channel with a user name.
+- **Google Translate.** The text of every message that is not detected as English is sent from the server to `translate.google.com` in pieces of up to 4,500 characters. No key or account is used; media, sender names, message ids and the channel name are not sent. Forcing the source language to English sends nothing. Language detection itself runs on the server.
+- **Retention.** A job folder and its ZIP are deleted `CHANNEL_MONITOR_RETENTION_DAYS` days (default 90) after their last change. A running job cannot be deleted.
+- **The report** shows channel content as text. It contains no scripts and loads nothing from the internet; media of a type the report does not know is saved as `.bin` and linked, not displayed.
 
 ### Scan options
 

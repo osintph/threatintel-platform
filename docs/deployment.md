@@ -8,7 +8,16 @@ The fastest way to get running on any fresh Linux server:
 curl -fsSL https://raw.githubusercontent.com/osintph/threatintel-platform/main/deploy.sh -o /tmp/deploy.sh && sudo bash /tmp/deploy.sh
 ```
 
-This installs Docker, clones the repo, configures Tor, generates secrets, and starts all services automatically.
+This installs Docker, clones the repo, generates secrets, and starts all services automatically.
+
+### Create the first administrator
+
+1. Open `https://YOUR_DOMAIN/register` (or `https://YOUR_SERVER_IP/register`).
+2. Enter the setup token that `deploy.sh` wrote to `.env`. Read it on the server: `grep '^SETUP_TOKEN=' ~/threatintel-platform/.env`.
+3. Choose a user name and a password (at least 12 characters, with an uppercase letter, a lowercase letter, a number and a symbol).
+4. Enrol an authenticator app. Two-factor sign-in is mandatory for every account.
+
+The page works only while there are no users, and only with the token. Further users are created by an administrator in the dashboard. See the [runbook](runbook.md#accounts-and-sign-in) for lockouts and a lost authenticator.
 
 ---
 
@@ -53,7 +62,7 @@ echo | openssl s_client -connect 127.0.0.1:443 -servername scanner.yourdomain.co
 - Versions before 1.1.1 replaced the certificate chain and private key with a self-signed pair at every container start. If the nginx log says `the certificate files for <name> were overwritten`, repair that name once (see the [runbook](runbook.md#certificates)):
 
 ```bash
-docker compose exec nginx certbot renew --cert-name scanner.yourdomain.com --force-renewal
+docker compose exec nginx certbot renew --cert-name scanner.yourdomain.com --force-renewal --no-random-sleep-on-renew
 docker compose exec nginx nginx -s reload
 ```
 
@@ -104,9 +113,10 @@ All configuration lives in `.env`. **Never commit this file.**
 |----------|---------|-------------|
 | `DOMAIN` | (empty) | Public domain for Let's Encrypt SSL |
 | `SSL_EMAIL` | (empty) | Email for Let's Encrypt registration |
-| `DASHBOARD_SECRET_KEY` | (auto-generated) | Flask session secret |
-| `TOR_CONTROL_PASSWORD` | (auto-generated) | Tor control port password |
-| `DATABASE_URL` | SQLite | SQLite or PostgreSQL connection string |
+| `DASHBOARD_SECRET_KEY` | (auto-generated) | Session secret, at least 32 characters; the dashboard does not start without it. Changing it signs everyone out |
+| `SETUP_TOKEN` | (auto-generated) | Needed once, to create the first administrator at `/register`; at least 24 characters |
+| `DATABASE_URL` | (auto-generated) | PostgreSQL connection string. Required: the dashboard and the command-line tools do not start without it |
+| `ROTATE_CIRCUIT_EVERY` | `50` | Pages crawled before the crawler moves to a new Tor circuit |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 
 ### Alerting
@@ -148,13 +158,10 @@ All configuration lives in `.env`. **Never commit this file.**
 | `TELEGRAM_CHANNELS` | (empty) | Comma-separated channel usernames (no @) |
 | `TELEGRAM_SESSION_PATH` | `/app/data/telegram.session` | Session file path |
 | `TELEGRAM_LIMIT_PER_CHANNEL` | `200` | Max messages per channel |
+| `TELEGRAM_PHONE` | (empty) | Phone number of the Telegram account, for Channel Monitor |
+| `CHANNEL_MONITOR_RETENTION_DAYS` | `90` | Channel Monitor archives are deleted after this many days |
 
-### OAuth (optional)
-
-| Variable | Description |
-|----------|-------------|
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth credentials |
-| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | GitHub OAuth credentials |
+Sign-in is by local account with a password and an authenticator app. There is no OAuth sign-in (removed in 1.2.0).
 
 ---
 
@@ -187,7 +194,7 @@ No additional setup required. Uses free public sources (crt.sh, HackerTarget, ip
 ```bash
 cd ~/threatintel-platform
 sudo ./upgrade.sh            # tip of main
-sudo ./upgrade.sh v1.1.1     # or a release tag
+sudo ./upgrade.sh v1.2.0     # or a release tag
 ```
 
 The script takes a verified database dump, checks out the release, rebuilds and recreates the containers, and checks at the end that nginx answers 200 for each site. See the [runbook](runbook.md#upgrading) for what each step does and how to roll back.
@@ -213,6 +220,12 @@ docker compose up -d dashboard
 **502 from nginx right after a rebuild:** the dashboard is still starting; nginx finds it again by itself within about 10 seconds. No nginx restart is needed.
 
 **429 on the sign-in page:** more than 10 sign-in requests a minute from one address; wait a minute.
+
+**"Too many failed attempts":** the account or the address is locked for 15 minutes after repeated failures. To lift it sooner: `docker compose exec dashboard python -m darkweb_scanner.main user-unlock NAME` (see the [runbook](runbook.md#accounts-and-sign-in)).
+
+**Lost authenticator:** another administrator resets it under Settings → Users, or on the server: `docker compose exec dashboard python -m darkweb_scanner.main user-reset-mfa NAME`.
+
+**Dashboard restarts in a loop after an upgrade:** `docker compose logs dashboard` names the cause. From 1.2.0 it needs `DATABASE_URL` and a `DASHBOARD_SECRET_KEY` of at least 32 characters.
 
 ---
 

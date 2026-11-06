@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta name="csrf-token" content="{{ csrf_token() }}"/>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23161b22'/%3E%3Ccircle cx='10' cy='16' r='3.5' fill='%23FF5C5C'/%3E%3Ccircle cx='19' cy='16' r='3.5' fill='%238b949e'/%3E%3Ccircle cx='28' cy='16' r='3.5' fill='%23d29922'/%3E%3C/svg%3E"/>
   <title>Quick Scan — Threat Intelligence Platform</title>
   <style>
@@ -28,8 +29,10 @@
     .back-link:hover { color: var(--accent); }
     .header-right { display: flex; align-items: center; gap: 10px; padding: 8px 0 8px 16px; margin-left: auto; flex-shrink: 0; }
     .user-pill { color: var(--muted); font-size: 0.82rem; }
-    .sign-out { color: var(--muted); font-size: 0.8rem; text-decoration: none; }
+    .sign-out { color: var(--muted); font-size: 0.8rem; text-decoration: none; background: none; border: none; padding: 0; cursor: pointer; font-family: inherit; }
     .sign-out:hover { color: var(--red); }
+    .sign-out-form { display: inline; margin: 0; }
+    .sign-out.help-link:hover { color: var(--accent); }
 
     main { padding: 28px; max-width: 1400px; margin: 0 auto; }
     @media (max-width: 900px) { main { padding: 16px; } header { padding: 0 16px; } }
@@ -103,7 +106,11 @@
   <a class="back-link" href="/dashboard">← Dashboard</a>
   <div class="header-right">
     <span class="user-pill">{{ username }}</span>
-    <a href="/logout" class="sign-out">Sign out</a>
+    <a href="/help" class="sign-out help-link">Help &amp; privacy</a>
+    <form method="POST" action="/logout" class="sign-out-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+      <button type="submit" class="sign-out">Sign out</button>
+    </form>
   </div>
 </header>
 
@@ -200,9 +207,57 @@
   let currentSession = null;
   let pollTimer = null;
 
+  // ── CSRF and session handling for every API call ───────────────────────────
+  // Same-origin requests other than GET and HEAD carry the session's token.
+  // 401 from the API means the session has ended: go to the sign-in page.
+  (function () {
+    const meta = document.querySelector('meta[name="csrf-token"]');
+    const csrfToken = meta ? meta.content : '';
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async function (input, init) {
+      const req = (typeof Request !== 'undefined' && input instanceof Request) ? input : null;
+      let url;
+      try { url = new URL(req ? req.url : String(input), window.location.href); } catch (e) { return nativeFetch(input, init); }
+      const sameOrigin = url.origin === window.location.origin;
+      const method = String((init && init.method) || (req && req.method) || 'GET').toUpperCase();
+      if (sameOrigin && method !== 'GET' && method !== 'HEAD') {
+        const headers = new Headers((init && init.headers) || (req && req.headers) || {});
+        headers.set('X-CSRF-Token', csrfToken);
+        init = Object.assign({}, init, { headers });
+      }
+      const res = await nativeFetch(input, init);
+      if (!sameOrigin || !url.pathname.startsWith('/api/')) return res;
+      if (res.status === 401) {
+        window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname);
+        return res;
+      }
+      if (res.status === 403) {
+        let error = '';
+        try { error = (await res.clone().json()).error || ''; } catch (e) {}
+        if (error === 'password_change_required' || error === 'mfa_setup_required') {
+          window.location.href = '/';
+        } else if (error === 'admin required') {
+          if (typeof toast === 'function') toast('Admin only', 'error');
+          return new Response(JSON.stringify({ ok: false, error: 'Admin only' }),
+            { status: 403, headers: { 'Content-Type': 'application/json' } });
+        }
+      }
+      return res;
+    };
+  })();
+
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
       ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  // http(s) links only; anything else (javascript:, data:, …) becomes '#'.
+  function safeUrl(u) {
+    const s = String(u == null ? '' : u).trim();
+    if (!s) return '#';
+    try {
+      const proto = new URL(s, window.location.origin).protocol;
+      return (proto === 'http:' || proto === 'https:') ? s : '#';
+    } catch (e) { return '#'; }
   }
   function toast(msg, kind) {
     const t = document.getElementById('toast');
@@ -214,7 +269,7 @@
   function fmtTime(iso) {
     if (!iso) return '—';
     const d = new Date(iso + 'Z');
-    return isNaN(d) ? iso : d.toLocaleString();
+    return isNaN(d) ? String(iso) : d.toLocaleString();
   }
 
   async function startScan() {
@@ -263,7 +318,7 @@
   async function pollStatus() {
     if (!currentSession) return;
     try {
-      const resp = await fetch('/api/quick-scan/status/' + currentSession);
+      const resp = await fetch('/api/quick-scan/status/' + encodeURIComponent(currentSession));
       if (!resp.ok) return;
       const s = await resp.json();
       document.getElementById('qs-status').textContent = s.status;
@@ -292,7 +347,7 @@
     const btn = document.getElementById('qs-cancel');
     btn.disabled = true;
     try {
-      const resp = await fetch('/api/quick-scan/cancel/' + currentSession, { method: 'POST' });
+      const resp = await fetch('/api/quick-scan/cancel/' + encodeURIComponent(currentSession), { method: 'POST' });
       const data = await resp.json();
       if (!resp.ok) { toast(data.error || 'Failed to cancel', 'error'); return; }
       toast('Scan cancelled');
@@ -308,7 +363,7 @@
   function reloadFindings() {
     if (!currentSession) return;
     const hiOnly = document.getElementById('qs-hi-only').checked ? '?high_signal_only=1' : '';
-    fetch('/api/quick-scan/findings/' + currentSession + hiOnly)
+    fetch('/api/quick-scan/findings/' + encodeURIComponent(currentSession) + hiOnly)
       .then(r => r.ok ? r.json() : [])
       .then(renderFindings);
   }
@@ -320,11 +375,11 @@
     if (!rows.length) { empty.style.display = 'block'; return; }
     empty.style.display = 'none';
     for (const f of rows) {
-      const ctx = f.context || '';
+      const ctx = String(f.context || '');
       const short = ctx.length > 100 ? ctx.slice(0, 100) + '…' : ctx;
       const urlCell = isOnion(f.url)
         ? '<span class="onion">' + esc(f.url) + '</span>'
-        : '<a href="' + esc(f.url) + '" target="_blank" rel="noopener noreferrer">' + esc(f.url) + '</a>';
+        : '<a href="' + esc(safeUrl(f.url)) + '" target="_blank" rel="noopener noreferrer">' + esc(f.url) + '</a>';
       const badge = f.high_signal
         ? '<span class="badge badge-hi">HIGH</span>'
         : '<span class="badge badge-lo">—</span>';

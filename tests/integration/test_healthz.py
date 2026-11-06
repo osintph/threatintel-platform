@@ -10,7 +10,7 @@ from darkweb_scanner.storage import Storage
 
 @pytest.fixture
 def client(monkeypatch):
-    monkeypatch.setenv("DASHBOARD_SECRET_KEY", "test-healthz-secret-0123456789abcdef")
+    monkeypatch.setenv("DASHBOARD_SECRET_KEY", "test-healthz-secret-0123456789abcdef0123456789")
     monkeypatch.setattr(storage_helper, "_storage", Storage("sqlite:///:memory:"))
     app_module = importlib.import_module("darkweb_scanner.dashboard.app")
     flask_app = app_module.create_app()
@@ -42,7 +42,11 @@ def test_healthcheck_requests_are_filtered_from_the_access_log():
     from darkweb_scanner.dashboard.app import _SkipHealthcheckLog
 
     f = _SkipHealthcheckLog()
-    keep = logging.LogRecord("werkzeug", logging.INFO, "", 0, '127.0.0.1 - - "GET /login HTTP/1.1" 200 -', None, None)
-    drop = logging.LogRecord("werkzeug", logging.INFO, "", 0, '127.0.0.1 - - "GET /healthz HTTP/1.1" 200 -', None, None)
+    keep = logging.LogRecord(
+        "werkzeug", logging.INFO, "", 0, '127.0.0.1 - - "GET /login HTTP/1.1" 200 -', None, None
+    )
+    drop = logging.LogRecord(
+        "werkzeug", logging.INFO, "", 0, '127.0.0.1 - - "GET /healthz HTTP/1.1" 200 -', None, None
+    )
     assert f.filter(keep) is True
     assert f.filter(drop) is False

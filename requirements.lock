@@ -2282,9 +2282,6 @@ sqlalchemy==2.1.8 \
     --hash=sha256:f50e34ebdf4ad7c96d89cfb05418e11ed23d3ac46f1f59f3d2e1d8da8091a0eb \
     --hash=sha256:ffe69b75459d90529f603d9594255c41d6a503f69220740510373374198735f6
     # via darkweb-scanner (pyproject.toml)
-stem==1.8.2 \
-    --hash=sha256:83fb19ffd4c9f82207c006051480389f80af221a7e4783000aedec4e384eb582
-    # via darkweb-scanner (pyproject.toml)
 telethon==1.45.0 \
     --hash=sha256:339e24c83aedc9f12cbe389264627edc49779e4289c535aa90aafc4ce62f7972 \
     --hash=sha256:4cb7ae269b8ab9dad9fc490b859f0bc2f885121e990f5b20407b1faa0db2a1d9

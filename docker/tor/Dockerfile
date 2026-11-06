@@ -7,14 +7,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
-COPY torrc /etc/tor/torrc
+# No torrc in the image: the entrypoint renders it at container start (see entrypoint.sh).
+COPY entrypoint.sh /usr/local/bin/tor-entrypoint
 
-# Fix ownership of torrc and data dir, then run as debian-tor (not root)
-RUN chown debian-tor:debian-tor /etc/tor/torrc \
+# The entrypoint writes /etc/tor/torrc as debian-tor (not root)
+RUN chmod 755 /usr/local/bin/tor-entrypoint \
+    && rm -f /etc/tor/torrc \
+    && chown debian-tor:debian-tor /etc/tor \
     && chown -R debian-tor:debian-tor /var/lib/tor
 
-EXPOSE 9050 9051
+EXPOSE 9050
 
 USER debian-tor
 
-CMD ["tor", "-f", "/etc/tor/torrc"]
+CMD ["/usr/local/bin/tor-entrypoint"]

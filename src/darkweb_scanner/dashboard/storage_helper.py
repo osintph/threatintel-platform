@@ -4,7 +4,7 @@ Shared storage accessor — avoids circular imports between app.py and route mod
 
 import threading
 
-from ..storage import Storage, _FLASK_SESSION_KEY
+from ..storage import _FLASK_SESSION_KEY, Storage
 
 _storage = None
 # Guards first-time construction: Storage.__init__ runs create_all, and two

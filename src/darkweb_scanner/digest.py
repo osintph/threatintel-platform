@@ -9,7 +9,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Optional
+from urllib.parse import quote
 
 import requests
 
@@ -59,7 +59,16 @@ def build_digest_pdf(feed_data: dict, scanner_summary: dict = None, date: dateti
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import mm
-    from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.platypus import (
+        HRFlowable,
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
+    )
+
+    from .pdf_text import pdf_link, pdf_plain, pdf_text
 
     if date is None:
         date = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=8)
@@ -136,19 +145,30 @@ def build_digest_pdf(feed_data: dict, scanner_summary: dict = None, date: dateti
             textColor=colors.HexColor(color), spaceBefore=10, spaceAfter=4)))
         story.append(HRFlowable(width=PW, thickness=0.5, color=colors.HexColor("#d0d7de"), spaceAfter=4))
 
-    def item_block(source, title, desc, url="", tags=None, highlight=False):
+    def skipped(section, exc):
+        # Feed text is third-party data. One item that cannot be laid out is
+        # left out; it must not take the whole digest down with it.
+        logger.warning("digest PDF: skipped one %s item: %s", section, exc)
+
+    def item_block(source, title, desc, url="", tags=None, highlight=False, max_tags=5):
+        try:
+            _item_block(source, title, desc, url, tags, highlight, max_tags)
+        except Exception as exc:
+            skipped("news", exc)
+
+    def _item_block(source, title, desc, url, tags, highlight, max_tags):
         bg = colors.HexColor("#fff8f8") if highlight else colors.HexColor("#f6f8fa")
         border = colors.HexColor("#f85149") if highlight else colors.HexColor("#d0d7de")
-        tag_str = "  ".join([f"[{t}]" for t in (tags or [])[:5]])
-        title_para = Paragraph(f"<b>{title[:120]}</b>", s_body)
-        desc_para = Paragraph((desc or "")[:350] + ("..." if len(desc or "") > 350 else ""), s_small)
+        tag_str = "  ".join([f"[{pdf_text(t, 40)}]" for t in list(tags or [])[:max_tags]])
+        title_para = Paragraph(f"<b>{pdf_text(title, 120)}</b>", s_body)
+        desc_para = Paragraph(pdf_text(desc, 350) + ("..." if len(str(desc or "")) > 350 else ""), s_small)
         inner = [[title_para], [desc_para]]
         if tag_str:
             inner.append([Paragraph(tag_str, s_src)])
         if url:
-            # Clickable link in PDF
-            inner.append([Paragraph(f'<link href="{url}" color="#0550ae">\u2192 {url[:90]}</link>', s_link)])
-        inner.append([Paragraph(f"Source: {source}", s_src)])
+            # Clickable link in PDF (http and https only)
+            inner.append([Paragraph("\u2192 " + pdf_link(url, max_len=90), s_link)])
+        inner.append([Paragraph(f"Source: {pdf_text(source, 120)}", s_src)])
         tbl = Table(inner, colWidths=[PW - 10])
         tbl.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, -1), bg),
@@ -169,12 +189,13 @@ def build_digest_pdf(feed_data: dict, scanner_summary: dict = None, date: dateti
         story.append(Spacer(1, 4))
         kd = [["CVE", "Vulnerability", "Vendor / Product", "Due"]]
         for v in kev[:10]:
-            cve_link = Paragraph(
-                f'<link href="{v["url"]}" color="#0550ae">{v["cve"]}</link>', s_mono
-            )
-            kd.append([cve_link, Paragraph(v["title"][:60], s_small),
-                       Paragraph(f"{v['vendor']} - {v['product']}"[:50], s_small),
-                       Paragraph(v["due_date"], s_small)])
+            try:
+                cve_link = Paragraph(pdf_link(v.get("url"), v.get("cve"), max_len=30), s_mono)
+                kd.append([cve_link, Paragraph(pdf_text(v.get("title"), 60), s_small),
+                           Paragraph(pdf_text(f"{v.get('vendor', '')} - {v.get('product', '')}", 50), s_small),
+                           Paragraph(pdf_text(v.get("due_date"), 20), s_small)])
+            except Exception as exc:
+                skipped("CISA KEV", exc)
         kt = Table(kd, colWidths=[PW*0.16, PW*0.36, PW*0.30, PW*0.18], repeatRows=1)
         kt.setStyle(TableStyle([
             ("BACKGROUND", (0,0),(-1,0), colors.HexColor("#f85149")),
@@ -195,12 +216,12 @@ def build_digest_pdf(feed_data: dict, scanner_summary: dict = None, date: dateti
         sec("🌏", "Philippines & SEA Threat Intelligence")
         for p in sea_otx[:6]:
             item_block(f"OTX · {p.get('author','')}", p.get("title",""), p.get("description",""),
-                      p.get("url",""), p.get("tags",[])[:5], highlight=True)
+                      p.get("url",""), p.get("tags"), highlight=True)
     if other_otx:
         sec("🔭", "Global Threat Intelligence (OTX)")
         for p in other_otx[:4]:
             item_block(f"OTX · {p.get('author','')}", p.get("title",""), p.get("description",""),
-                      p.get("url",""), p.get("tags",[])[:4])
+                      p.get("url",""), p.get("tags"), max_tags=4)
 
     rss = feed_data.get("rss", [])
     sea_rss = [r for r in rss if r.get("sea_relevant")]
@@ -208,11 +229,11 @@ def build_digest_pdf(feed_data: dict, scanner_summary: dict = None, date: dateti
     if sea_rss:
         sec("📰", "SEA Cybersecurity News")
         for r in sea_rss[:5]:
-            item_block(r["source"], r["title"], r["description"], r.get("url",""), highlight=True)
+            item_block(r.get("source",""), r.get("title",""), r.get("description",""), r.get("url",""), highlight=True)
     if other_rss:
         sec("🌐", "Global Cybersecurity News")
         for r in other_rss[:5]:
-            item_block(r["source"], r["title"], r["description"], r.get("url",""))
+            item_block(r.get("source",""), r.get("title",""), r.get("description",""), r.get("url",""))
 
     urlhaus = feed_data.get("urlhaus", [])
     feodo = [f for f in feed_data.get("feodo", []) if f.get("sea_relevant")]
@@ -222,12 +243,17 @@ def build_digest_pdf(feed_data: dict, scanner_summary: dict = None, date: dateti
             story.append(Paragraph("Recent Malicious URLs — URLhaus (abuse.ch)", s_h3))
             ud = [["Host", "Threat", "Tags", "Status"]]
             for u in urlhaus[:8]:
-                host_link = Paragraph(
-                    f'<link href="https://urlhaus.abuse.ch/host/{u["host"]}/" color="#0550ae">{u["host"][:40]}</link>',
-                    s_mono
-                )
-                ud.append([host_link, Paragraph(u["threat"][:25], s_small),
-                           Paragraph(", ".join(u["tags"][:3]), s_small), Paragraph(u["status"], s_small)])
+                try:
+                    host = pdf_plain(u.get("host"), 255)
+                    host_link = Paragraph(
+                        pdf_link(f"https://urlhaus.abuse.ch/host/{quote(host, safe='')}/", host, max_len=40),
+                        s_mono
+                    )
+                    ud.append([host_link, Paragraph(pdf_text(u.get("threat"), 25), s_small),
+                               Paragraph(pdf_text(", ".join(str(t) for t in (u.get("tags") or [])[:3]), 80), s_small),
+                               Paragraph(pdf_text(u.get("status"), 20), s_small)])
+                except Exception as exc:
+                    skipped("URLhaus", exc)
             ut = Table(ud, colWidths=[PW*0.35, PW*0.22, PW*0.28, PW*0.15], repeatRows=1)
             ut.setStyle(TableStyle([
                 ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#161b22")),("TEXTCOLOR",(0,0),(-1,0),colors.white),
@@ -242,11 +268,17 @@ def build_digest_pdf(feed_data: dict, scanner_summary: dict = None, date: dateti
             story.append(Paragraph("SEA C2 Botnet IPs — Feodo Tracker (abuse.ch)", s_h3))
             fd = [["IP", "Port", "Malware", "Country"]]
             for f in feodo[:6]:
-                ip_link = Paragraph(
-                    f'<link href="https://feodotracker.abuse.ch/browse/?search={f["ip"]}" color="#0550ae">{f["ip"]}</link>',
-                    s_mono
-                )
-                fd.append([ip_link, str(f["port"]), f["malware"], f["country"]])
+                try:
+                    ip = pdf_plain(f.get("ip"), 45)
+                    ip_link = Paragraph(
+                        pdf_link(f"https://feodotracker.abuse.ch/browse/?search={quote(ip, safe='')}", ip, max_len=45),
+                        s_mono
+                    )
+                    # Plain strings in a table cell are not parsed as markup: cleaned, not escaped.
+                    fd.append([ip_link, pdf_plain(f.get("port"), 8), pdf_plain(f.get("malware"), 40),
+                               pdf_plain(f.get("country"), 40)])
+                except Exception as exc:
+                    skipped("Feodo", exc)
             ft = Table(fd, colWidths=[PW*0.3, PW*0.12, PW*0.28, PW*0.3])
             ft.setStyle(TableStyle([
                 ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#161b22")),("TEXTCOLOR",(0,0),(-1,0),colors.white),
@@ -377,7 +409,7 @@ def send_digest(storage, recipients: list = None, date: datetime = None) -> dict
     from .feeds import fetch_all_feeds
     try:
         feed_data = fetch_all_feeds()
-    except Exception as e:
+    except Exception:
         logger.exception("Feed fetch failed")
         feed_data = {"otx_pulses":[],"cisa_kev":[],"urlhaus":[],"feodo":[],"rss":[]}
 

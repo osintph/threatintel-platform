@@ -8,17 +8,36 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-import requests
-
 from flask import Blueprint, Response, jsonify, render_template, request, session
 
-from ..auth import hash_password, require_login, validate_password_strength
-from .http_client import SafeFetchError, check_host_ssrf, safe_fetch
+from ..auth import (
+    check_password,
+    clear_failures,
+    current_user,
+    hash_password,
+    locked_for,
+    note_totp_failure,
+    record_auth_event,
+    reissue_session,
+    require_admin,
+    require_login,
+    totp_key,
+    use_totp_code,
+    validate_password_strength,
+)
+from ..pdf_text import pdf_plain, pdf_text
+from . import validation as v
+from .http_client import SafeFetchError, fetch_public, safe_fetch
 from .storage_helper import get_storage
 
 logger = logging.getLogger(__name__)
 
 dashboard_bp = Blueprint("dashboard", __name__)
+
+
+@dashboard_bp.errorhandler(v.Invalid)
+def _invalid_input(err):
+    return jsonify({"error": str(err)}), 400
 
 # Config is read-only at /app/config — write user edits to /app/data instead
 CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/app/config"))
@@ -68,9 +87,19 @@ def _load_keywords() -> dict:
 @dashboard_bp.route("/dashboard")
 @require_login
 def index():
-    storage = get_storage()
-    user = storage.get_user_by_id(session["user_id"])
-    return render_template("index.html", username=session.get("username"), is_admin=user.is_admin)
+    user = current_user()
+    return render_template("index.html", username=user.username, is_admin=bool(user.is_admin))
+
+
+@dashboard_bp.route("/help")
+@require_login
+def help_page():
+    from .channel_monitor_routes import RETENTION_DAYS
+
+    user = current_user()
+    return render_template(
+        "help.html", username=user.username, is_admin=bool(user.is_admin), retention_days=RETENTION_DAYS
+    )
 
 
 # ── Stats & Hits API ───────────────────────────────────────────────────────────
@@ -85,7 +114,7 @@ def api_stats():
 @dashboard_bp.route("/api/hits")
 @require_login
 def api_hits():
-    limit = int(request.args.get("limit", 100))
+    limit = v.int_arg("limit", 100, 1, 1000)
     keyword = request.args.get("keyword")
     storage = get_storage()
     records = (
@@ -123,16 +152,13 @@ def api_keywords_get():
 
 
 @dashboard_bp.route("/api/keywords", methods=["POST"])
-@require_login
+@require_admin
 def api_keywords_add():
+    body = v.json_body()
+    keyword = v.keyword(body.get("keyword"))
+    category = v.category(body.get("category"))
     try:
         import yaml
-
-        body = request.get_json()
-        keyword = (body.get("keyword") or "").strip()
-        category = (body.get("category") or "custom").strip()
-        if not keyword:
-            return jsonify({"error": "keyword required"}), 400
 
         _ensure_data_dir()
         cats = _load_keywords()
@@ -148,16 +174,16 @@ def api_keywords_add():
 
 
 @dashboard_bp.route("/api/keywords", methods=["DELETE"])
-@require_login
+@require_admin
 def api_keywords_delete():
+    # Deletes match what is stored, so entries saved before validation existed can still be removed.
+    body = v.json_body()
+    keyword = str(body.get("keyword") or "").strip()
+    category = str(body.get("category") or "").strip()
+    if not keyword or not category:
+        return jsonify({"error": "keyword and category required"}), 400
     try:
         import yaml
-
-        body = request.get_json()
-        keyword = (body.get("keyword") or "").strip()
-        category = (body.get("category") or "").strip()
-        if not keyword or not category:
-            return jsonify({"error": "keyword and category required"}), 400
 
         _ensure_data_dir()
         cats = _load_keywords()
@@ -183,25 +209,27 @@ def api_seeds_get():
         return jsonify({"error": str(e)}), 500
 
 
-@dashboard_bp.route("/api/seeds", methods=["POST"])
-@require_login
-def api_seeds_add():
-    try:
-        body = request.get_json()
-        # Support both single url and bulk urls array
-        urls = body.get("urls") or ([body.get("url")] if body.get("url") else [])
-        urls = [u.strip() for u in urls if u and u.strip()]
-        if not urls:
-            return jsonify({"error": "url(s) required"}), 400
-        invalid = [u for u in urls if not u.startswith("http")]
-        if invalid and len(invalid) == len(urls):
-            return jsonify({"error": "URLs must start with http"}), 400
+def _urls_from_body(body: dict) -> list[str]:
+    """``url`` or ``urls`` from a request body, each checked as an http(s) URL."""
+    urls = body.get("urls") or ([body.get("url")] if body.get("url") else [])
+    if not isinstance(urls, list) or not urls:
+        raise v.Invalid("url(s) required")
+    if len(urls) > 2000:
+        raise v.Invalid("at most 2000 URLs per request")
+    return [v.http_url(u) for u in urls if not (isinstance(u, str) and not u.strip())]
 
+
+@dashboard_bp.route("/api/seeds", methods=["POST"])
+@require_admin
+def api_seeds_add():
+    # Support both single url and bulk urls array
+    urls = _urls_from_body(v.json_body())
+    try:
         _ensure_data_dir()
         existing = _load_seeds()
         added = 0
         for url in urls:
-            if url.startswith("http") and url not in existing:
+            if url not in existing:
                 existing.append(url)
                 added += 1
         SEEDS_FILE.write_text("\n".join(existing) + "\n")
@@ -211,14 +239,12 @@ def api_seeds_add():
 
 
 @dashboard_bp.route("/api/seeds", methods=["DELETE"])
-@require_login
+@require_admin
 def api_seeds_delete():
+    url = str(v.json_body().get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "url required"}), 400
     try:
-        body = request.get_json()
-        url = (body.get("url") or "").strip()
-        if not url:
-            return jsonify({"error": "url required"}), 400
-
         _ensure_data_dir()
         seeds = [s for s in _load_seeds() if s != url]
         SEEDS_FILE.write_text("\n".join(seeds) + "\n")
@@ -257,13 +283,9 @@ def api_clearnet_seeds_get():
 
 
 @dashboard_bp.route("/api/seeds/clearnet", methods=["POST"])
-@require_login
+@require_admin
 def api_clearnet_seeds_add():
-    body = request.get_json() or {}
-    urls = body.get("urls") or ([body.get("url")] if body.get("url") else [])
-    urls = [u.strip() for u in urls if u and u.strip()]
-    if not urls:
-        return jsonify({"error": "url(s) required"}), 400
+    urls = _urls_from_body(v.json_body())
     existing = _load_clearnet_seeds()
     added = 0
     for url in urls:
@@ -275,10 +297,9 @@ def api_clearnet_seeds_add():
 
 
 @dashboard_bp.route("/api/seeds/clearnet", methods=["DELETE"])
-@require_login
+@require_admin
 def api_clearnet_seeds_delete():
-    body = request.get_json() or {}
-    url = (body.get("url") or "").strip()
+    url = str(v.json_body().get("url") or "").strip()
     if not url:
         return jsonify({"error": "url required"}), 400
     seeds = [s for s in _load_clearnet_seeds() if s != url]
@@ -296,13 +317,9 @@ def api_paste_sources_get():
 
 
 @dashboard_bp.route("/api/seeds/paste", methods=["POST"])
-@require_login
+@require_admin
 def api_paste_sources_add():
-    body = request.get_json() or {}
-    urls = body.get("urls") or ([body.get("url")] if body.get("url") else [])
-    urls = [u.strip() for u in urls if u and u.strip()]
-    if not urls:
-        return jsonify({"error": "url(s) required"}), 400
+    urls = _urls_from_body(v.json_body())
     existing = _load_paste_sources()
     added = 0
     for url in urls:
@@ -314,10 +331,9 @@ def api_paste_sources_add():
 
 
 @dashboard_bp.route("/api/seeds/paste", methods=["DELETE"])
-@require_login
+@require_admin
 def api_paste_sources_delete():
-    body = request.get_json() or {}
-    url = (body.get("url") or "").strip()
+    url = str(v.json_body().get("url") or "").strip()
     if not url:
         return jsonify({"error": "url required"}), 400
     sources = [s for s in _load_paste_sources() if s != url]
@@ -329,22 +345,25 @@ def api_paste_sources_delete():
 
 
 @dashboard_bp.route("/api/keywords/bulk", methods=["POST"])
-@require_login
+@require_admin
 def api_keywords_bulk_add():
     """Add multiple keywords in a single atomic write."""
     import yaml
-    body = request.get_json() or {}
+    body = v.json_body()
     items = body.get("keywords", [])  # [{keyword, category}, ...]
-    if not items:
+    if not isinstance(items, list) or not items:
         return jsonify({"error": "keywords array required"}), 400
+    if len(items) > 2000:
+        return jsonify({"error": "at most 2000 keywords per request"}), 400
+    pairs = []
+    for item in items:
+        if not isinstance(item, dict) or not str(item.get("keyword") or "").strip():
+            continue
+        pairs.append((v.keyword(item.get("keyword")), v.category(item.get("category"))))
     _ensure_data_dir()
     cats = _load_keywords()
     added = 0
-    for item in items:
-        kw = (item.get("keyword") or "").strip()
-        cat = (item.get("category") or "custom").strip()
-        if not kw:
-            continue
+    for kw, cat in pairs:
         cats.setdefault(cat, [])
         if kw not in cats[cat]:
             cats[cat].append(kw)
@@ -358,7 +377,8 @@ def api_keywords_bulk_add():
 @dashboard_bp.route("/api/keywords/export", methods=["GET"])
 @require_login
 def api_keywords_export():
-    import csv, io
+    import csv
+    import io
     cats = _load_keywords()
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -375,21 +395,32 @@ def api_keywords_export():
 
 
 @dashboard_bp.route("/api/keywords/import", methods=["POST"])
-@require_login
+@require_admin
 def api_keywords_import():
-    import csv, io, yaml
+    import csv
+    import io
+
+    import yaml
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
     f = request.files["file"]
-    content = f.read().decode("utf-8", errors="ignore")
+    content = f.read(1_000_001).decode("utf-8", errors="ignore")
+    if len(content) > 1_000_000:
+        return jsonify({"error": "File too large (max 1 MB)"}), 400
     reader = csv.DictReader(io.StringIO(content))
     _ensure_data_dir()
     cats = _load_keywords()
     added = 0
+    skipped = 0
     for i, row in enumerate(reader, 1):
-        kw = (row.get("keyword") or row.get("Keyword") or "").strip()
-        cat = (row.get("category") or row.get("Category") or "custom").strip()
-        if not kw:
+        try:
+            raw_kw = (row.get("keyword") or row.get("Keyword") or "").strip()
+            if not raw_kw:
+                continue
+            kw = v.keyword(raw_kw)
+            cat = v.category((row.get("category") or row.get("Category") or "").strip())
+        except v.Invalid:
+            skipped += 1
             continue
         cats.setdefault(cat, [])
         if kw not in cats[cat]:
@@ -398,7 +429,7 @@ def api_keywords_import():
     KEYWORDS_FILE.write_text(
         yaml.dump({"keywords": cats}, default_flow_style=False, allow_unicode=True)
     )
-    return jsonify({"ok": True, "added": added})
+    return jsonify({"ok": True, "added": added, "skipped": skipped})
 
 
 # ── Keyword generator ──────────────────────────────────────────────────────────
@@ -524,17 +555,18 @@ _active_scan_thread = None  # track running scan thread
 
 
 @dashboard_bp.route("/api/crawl/start", methods=["POST"])
-@require_login
+@require_admin
 def api_crawl_start():
     # Clear any stale stop flag before starting
     STOP_FLAG.unlink(missing_ok=True)
     import asyncio
     import threading
     from pathlib import Path as _Path
-    from ..main import run_scan
-    from ..crawler import CrawlConfig
-    from ..scanner import KeywordConfig
+
     from ..alerting import Alerter
+    from ..crawler import CrawlConfig
+    from ..main import run_scan
+    from ..scanner import KeywordConfig
 
     global _active_scan_thread
 
@@ -603,7 +635,7 @@ def api_crawl_start():
 
 
 @dashboard_bp.route("/api/crawl/stop", methods=["POST"])
-@require_login
+@require_admin
 def api_crawl_stop():
     try:
         _ensure_data_dir()
@@ -623,8 +655,9 @@ def api_crawl_status():
             thread_alive = any(t.name == "crawl_thread" and t.is_alive()
                                for t in __import__("threading").enumerate())
             if not thread_alive:
-                from sqlalchemy import text as _text
                 from datetime import datetime as _dt
+
+                from sqlalchemy import text as _text
                 with storage.get_session() as sess:
                     sess.execute(
                         _text(
@@ -667,22 +700,6 @@ def api_crawl_status():
 # ── User management API (admin only) ──────────────────────────────────────────
 
 
-def require_admin(f):
-    from functools import wraps
-
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not session.get("logged_in"):
-            return jsonify({"error": "unauthorized"}), 401
-        storage = get_storage()
-        user = storage.get_user_by_id(session["user_id"])
-        if not user or not user.is_admin:
-            return jsonify({"error": "admin required"}), 403
-        return f(*args, **kwargs)
-
-    return decorated
-
-
 @dashboard_bp.route("/api/users", methods=["GET"])
 @require_admin
 def api_users_list():
@@ -708,13 +725,13 @@ def api_users_list():
 @dashboard_bp.route("/api/users", methods=["POST"])
 @require_admin
 def api_users_create():
-    body = request.get_json()
-    username = (body.get("username") or "").strip()
-    email = (body.get("email") or "").strip() or None
-    password = body.get("password") or ""
-    is_admin = bool(body.get("is_admin", False))
+    body = v.json_body()
+    username = v.username(body.get("username"))
+    email = v.email(body.get("email"), required=False)
+    password = body.get("password") if isinstance(body.get("password"), str) else ""
+    is_admin = v.strict_bool(body.get("is_admin"), "is_admin")
 
-    if not username or not password:
+    if not password:
         return jsonify({"error": "username and password required"}), 400
 
     err = validate_password_strength(password)
@@ -724,6 +741,8 @@ def api_users_create():
     storage = get_storage()
     if storage.get_user_by_username(username):
         return jsonify({"error": "username already taken"}), 409
+    if email and storage.get_user_by_email(email):
+        return jsonify({"error": "email already in use"}), 409
 
     user_id = storage.create_user(
         username=username,
@@ -732,17 +751,51 @@ def api_users_create():
         is_admin=is_admin,
         must_change_password=True,  # force password change + MFA on first login
     )
+    record_auth_event("user_created", username, user_id, f"by {current_user().username}, admin={is_admin}")
     return jsonify({"ok": True, "id": user_id})
 
 
 @dashboard_bp.route("/api/users/<int:user_id>", methods=["DELETE"])
 @require_admin
 def api_users_delete(user_id):
-    if user_id == session["user_id"]:
+    me = current_user()
+    if user_id == me.id:
         return jsonify({"error": "cannot delete yourself"}), 400
     storage = get_storage()
+    target = storage.get_user_by_id(user_id)
+    if target is None:
+        return jsonify({"error": "not found"}), 404
+    name = target.username
+    # The user's sessions end with the row: every request loads the user again.
     storage.delete_user(user_id)
+    record_auth_event("user_deleted", name, user_id, f"by {me.username}")
     return jsonify({"ok": True})
+
+
+@dashboard_bp.route("/api/users/<int:user_id>/mfa/reset", methods=["POST"])
+@require_admin
+def api_users_mfa_reset(user_id):
+    """For a user who lost their authenticator: remove the second factor, end
+    their sessions and clear any lock. They enrol again at the next sign-in."""
+    me = current_user()
+    if user_id == me.id:
+        return jsonify({"error": "use Settings to change your own second factor"}), 400
+    storage = get_storage()
+    target = storage.get_user_by_id(user_id)
+    if target is None:
+        return jsonify({"error": "not found"}), 404
+    storage.disable_totp(user_id)
+    storage.bump_session_version(user_id)
+    clear_failures(totp_key(user_id))
+    record_auth_event("mfa_reset", target.username, user_id, f"by {me.username}")
+    return jsonify({"ok": True})
+
+
+@dashboard_bp.route("/api/admin/auth-events", methods=["GET"])
+@require_admin
+def api_auth_events():
+    """Sign-ins, failures, lockouts and account changes, newest first."""
+    return jsonify(get_storage().list_auth_events(limit=v.int_arg("limit", 200, 1, 1000)))
 
 
 # ── User settings API (own account) ───────────────────────────────────────────
@@ -751,54 +804,63 @@ def api_users_delete(user_id):
 @dashboard_bp.route("/api/settings/password", methods=["POST"])
 @require_login
 def api_change_password():
-    from ..auth import check_password
-
-    body = request.get_json()
-    current = body.get("current_password", "")
-    new_pw = body.get("new_password", "")
-    confirm = body.get("confirm_password", "")
+    body = v.json_body()
+    current = body.get("current_password") if isinstance(body.get("current_password"), str) else ""
+    new_pw = body.get("new_password") if isinstance(body.get("new_password"), str) else ""
+    confirm = body.get("confirm_password") if isinstance(body.get("confirm_password"), str) else ""
 
     storage = get_storage()
-    user = storage.get_user_by_id(session["user_id"])
+    user = current_user()
 
-    if user.password_hash and not check_password(current, user.password_hash):
+    if not check_password(current, user.password_hash):
+        record_auth_event("password_change_failed", user.username, user.id, "wrong current password")
         return jsonify({"error": "Current password is incorrect"}), 400
     if new_pw != confirm:
         return jsonify({"error": "Passwords do not match"}), 400
+    if new_pw == current:
+        return jsonify({"error": "The new password must differ from the current one"}), 400
     err = validate_password_strength(new_pw)
     if err:
         return jsonify({"error": err}), 400
 
-    storage.update_user_password(session["user_id"], hash_password(new_pw))
+    storage.update_user_password(user.id, hash_password(new_pw))
+    reissue_session(user)  # ends the user's other sessions, keeps this one
+    record_auth_event("password_changed", user.username, user.id)
     return jsonify({"ok": True})
 
 
 @dashboard_bp.route("/api/settings/totp/disable", methods=["POST"])
 @require_login
 def api_disable_totp():
-    from ..auth import check_password, verify_totp
-
-    body = request.get_json()
+    """Remove the second factor. Needs the password AND a current code. Two-factor
+    sign-in is mandatory, so the next page asks the user to enrol again."""
+    body = v.json_body()
     storage = get_storage()
-    user = storage.get_user_by_id(session["user_id"])
+    user = current_user()
 
-    code = body.get("totp_code", "").strip()
-    password = body.get("password", "")
+    code = body.get("totp_code") if isinstance(body.get("totp_code"), str) else ""
+    password = body.get("password") if isinstance(body.get("password"), str) else ""
 
-    if user.totp_secret and code and verify_totp(user.totp_secret, code):
-        storage.disable_totp(session["user_id"])
-        return jsonify({"ok": True})
-    if user.password_hash and password and check_password(password, user.password_hash):
-        storage.disable_totp(session["user_id"])
-        return jsonify({"ok": True})
-    return jsonify({"error": "Invalid code or password"}), 400
+    if locked_for(totp_key(user.id)):
+        return jsonify({"error": "Too many wrong codes. Try again later."}), 429
+    if not check_password(password, user.password_hash):
+        record_auth_event("mfa_disable_failed", user.username, user.id, "wrong password")
+        return jsonify({"error": "Invalid code or password"}), 400
+    if not use_totp_code(user, code):
+        note_totp_failure(user.id)
+        record_auth_event("mfa_disable_failed", user.username, user.id, "wrong code")
+        return jsonify({"error": "Invalid code or password"}), 400
+
+    storage.disable_totp(user.id)
+    reissue_session(user)
+    record_auth_event("mfa_disabled", user.username, user.id)
+    return jsonify({"ok": True})
 
 
 @dashboard_bp.route("/api/settings/profile", methods=["GET"])
 @require_login
 def api_profile():
-    storage = get_storage()
-    user = storage.get_user_by_id(session["user_id"])
+    user = current_user()
     return jsonify(
         {
             "id": user.id,
@@ -841,13 +903,10 @@ def api_telegram_channels_get():
 
 
 @dashboard_bp.route("/api/telegram/channels", methods=["POST"])
-@require_login
+@require_admin
 def api_telegram_channels_add():
+    channel = v.telegram_channel(v.json_body().get("channel"))
     try:
-        body = request.get_json()
-        channel = (body.get("channel") or "").strip().lstrip("@")
-        if not channel:
-            return jsonify({"error": "channel required"}), 400
         _ensure_data_dir()
         existing = _load_channels()
         if channel not in existing:
@@ -859,13 +918,12 @@ def api_telegram_channels_add():
 
 
 @dashboard_bp.route("/api/telegram/channels", methods=["DELETE"])
-@require_login
+@require_admin
 def api_telegram_channels_delete():
+    channel = str(v.json_body().get("channel") or "").strip().lstrip("@")
+    if not channel:
+        return jsonify({"error": "channel required"}), 400
     try:
-        body = request.get_json()
-        channel = (body.get("channel") or "").strip().lstrip("@")
-        if not channel:
-            return jsonify({"error": "channel required"}), 400
         _ensure_data_dir()
         channels = [c for c in _load_channels() if c != channel]
         TELEGRAM_CHANNELS_FILE.write_text("\n".join(channels) + "\n")
@@ -918,8 +976,8 @@ def api_session_hits(session_id):
 @require_login
 def api_report_pdf():
     try:
-        from io import BytesIO
         from datetime import datetime as dt
+        from io import BytesIO
         session_id_filter = request.args.get("session_id", type=int)
 
         from reportlab.lib import colors
@@ -1043,7 +1101,7 @@ def api_report_pdf():
         if stats["top_keywords"]:
             story.append(Paragraph("Top Keywords by Hit Count", s_h2))
             kw_data = [["Keyword", "Hits"]] + [
-                [k["keyword"], str(k["count"])] for k in stats["top_keywords"]
+                [pdf_plain(k["keyword"], 200), str(k["count"])] for k in stats["top_keywords"]
             ]
             kw_table = Table(kw_data, colWidths=[W * 0.75, W * 0.25])
             kw_table.setStyle(
@@ -1067,7 +1125,7 @@ def api_report_pdf():
         sess_data = [["Started", "Status", "Pages", "Hits"]]
         for s in sessions[:15]:
             started = s["started_at"][:16].replace("T", " ") if s.get("started_at") else "—"
-            sess_data.append([started, s.get("status") or "—", str(s.get("pages_crawled") or 0), str(s.get("hits_found") or 0)])
+            sess_data.append([started, pdf_plain(s.get("status") or "—", 40), str(s.get("pages_crawled") or 0), str(s.get("hits_found") or 0)])
         sess_table = Table(sess_data, colWidths=[W * 0.38, W * 0.22, W * 0.2, W * 0.2])
         sess_table.setStyle(
             TableStyle(
@@ -1093,10 +1151,10 @@ def api_report_pdf():
                 found = h.found_at.strftime("%m-%d %H:%M") if h.found_at else "—"
                 ctx = (h.context or "")[:120] + ("…" if len(h.context or "") > 120 else "")
                 hits_data.append([
-                    Paragraph(h.keyword or "", s_small),
-                    Paragraph(h.category or "", s_small),
-                    Paragraph(h.url or "", s_mono),
-                    Paragraph(ctx, s_small),
+                    Paragraph(pdf_text(h.keyword, 200), s_small),
+                    Paragraph(pdf_text(h.category, 100), s_small),
+                    Paragraph(pdf_text(h.url, 500), s_mono),
+                    Paragraph(pdf_text(ctx), s_small),
                     Paragraph(found, s_small),
                 ])
             hits_table = Table(
@@ -1167,24 +1225,28 @@ def api_investigations_list():
 @require_login
 def api_investigations_create():
     import asyncio
+
     from ..investigations import run_investigation
 
-    body = request.get_json()
-    name = (body.get("name") or "").strip()
+    body = v.json_body()
+    name = v.text(body.get("name"), "Investigation name", 200)
     targets = body.get("targets") or []
 
-    if not name:
-        return jsonify({"error": "Investigation name required"}), 400
-    if not targets:
+    if not isinstance(targets, list) or not targets:
         return jsonify({"error": "At least one target required"}), 400
+    if len(targets) > 50:
+        return jsonify({"error": "At most 50 targets per investigation"}), 400
 
     # Validate targets
     valid = []
     for t in targets:
-        val = (t.get("value") or "").strip()
-        ttype = (t.get("type") or "keyword").strip()
-        if val and ttype in ("email", "name", "keyword"):
-            valid.append({"value": val, "type": ttype})
+        if not isinstance(t, dict):
+            continue
+        ttype = str(t.get("type") or "keyword").strip()
+        if ttype not in ("email", "name", "keyword") or not str(t.get("value") or "").strip():
+            continue
+        val = v.email(t.get("value"), "target") if ttype == "email" else v.text(t.get("value"), "target", 200)
+        valid.append({"value": val, "type": ttype})
 
     if not valid:
         return jsonify({"error": "No valid targets provided"}), 400
@@ -1217,7 +1279,7 @@ def api_investigations_get(inv_id):
 
 
 @dashboard_bp.route("/api/investigations/<int:inv_id>", methods=["DELETE"])
-@require_login
+@require_admin
 def api_investigations_delete(inv_id):
     storage = get_storage()
     storage.delete_investigation(inv_id)
@@ -1237,16 +1299,9 @@ def api_ip_investigations_list():
 @dashboard_bp.route("/api/ip-investigations", methods=["POST"])
 @require_login
 def api_ip_investigations_create():
-    import re
     from ..ip_lookup import investigate_ip
 
-    body = request.get_json()
-    ip = (body.get("ip") or "").strip()
-
-    ipv4 = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
-    ipv6 = re.compile(r"^[0-9a-fA-F:]+$")
-    if not ip or (not ipv4.match(ip) and not ipv6.match(ip)):
-        return jsonify({"error": "Invalid IP address"}), 400
+    ip = v.ip_address(v.json_body().get("ip"))
 
     abuse_key = os.getenv("ABUSEIPDB_API_KEY", "")
     vt_key = os.getenv("VIRUSTOTAL_API_KEY", "")
@@ -1278,7 +1333,7 @@ def api_ip_investigations_get(inv_id):
 
 
 @dashboard_bp.route("/api/ip-investigations/<int:inv_id>", methods=["DELETE"])
-@require_login
+@require_admin
 def api_ip_investigations_delete(inv_id):
     storage = get_storage()
     storage.delete_ip_investigation(inv_id)
@@ -1401,6 +1456,7 @@ def api_ransomware_add_seeds():
 def api_ransomware_add_keywords():
     """Add all ransomware group names as keywords."""
     import yaml
+
     from ..ransomware_data import RANSOMWARE_GROUPS
     _ensure_data_dir()
     cats = _load_keywords()
@@ -1519,6 +1575,7 @@ def api_threat_actors_delete(slug):
 def api_threat_actors_add_keywords():
     """Add all threat actor names as keywords."""
     import yaml
+
     from ..threat_actors import THREAT_ACTORS
     _ensure_data_dir()
     cats = _load_keywords()
@@ -1549,10 +1606,7 @@ def api_digest_subscribers_get():
 @require_admin
 def api_digest_subscribers_add():
     from ..digest import add_subscriber
-    body = request.get_json()
-    email = (body.get("email") or "").strip().lower()
-    if not email or "@" not in email:
-        return jsonify({"error": "valid email required"}), 400
+    email = v.email(v.json_body().get("email"))
     added = add_subscriber(email)
     return jsonify({"ok": True, "added": added})
 
@@ -1561,8 +1615,8 @@ def api_digest_subscribers_add():
 @require_admin
 def api_digest_subscribers_remove():
     from ..digest import remove_subscriber
-    body = request.get_json()
-    email = (body.get("email") or "").strip().lower()
+    # Matches what is stored, so an address saved before validation existed can still be removed.
+    email = str(v.json_body().get("email") or "").strip().lower()
     if not email:
         return jsonify({"error": "email required"}), 400
     remove_subscriber(email)
@@ -1573,9 +1627,13 @@ def api_digest_subscribers_remove():
 @require_admin
 def api_digest_send():
     from ..digest import send_digest
-    body = request.get_json() or {}
+    body = v.json_body()
     # Optional: send to specific emails instead of subscriber list
     recipients = body.get("recipients") or None
+    if recipients is not None:
+        if not isinstance(recipients, list) or len(recipients) > 50:
+            return jsonify({"error": "recipients must be a list of at most 50 addresses"}), 400
+        recipients = [v.email(r, "recipient") for r in recipients]
     storage = get_storage()
     result = send_digest(storage, recipients=recipients)
     if result["ok"]:
@@ -1629,15 +1687,13 @@ def api_digest_feeds():
 def api_public_subscribe():
     """Public endpoint — no auth required. For static website subscribe form."""
     from ..digest import add_subscriber
-    body = request.get_json() or {}
-    email = (body.get("email") or "").strip().lower()
-    name = (body.get("name") or "").strip()[:100]
-    org = (body.get("org") or "").strip()[:200]
+    body = v.json_body()
     # Honeypot
     if body.get("website"):
         return jsonify({"ok": True})  # silently drop bots
-    if not email or "@" not in email or "." not in email.split("@")[-1]:
-        return jsonify({"error": "Valid email required"}), 400
+    email = v.email(body.get("email"))
+    name = v.text(body.get("name"), "name", 100, required=False) or ""
+    org = v.text(body.get("org"), "org", 200, required=False) or ""
     added = add_subscriber(email, name=name, org=org)
     return jsonify({"ok": True, "new": added})
 
@@ -1657,15 +1713,10 @@ def api_dns_list():
 def api_dns_start():
     """Start a DNS investigation — runs in background thread."""
     import threading
+
     from ..dns_crawler import run_dns_recon
 
-    body = request.get_json() or {}
-    domain = (body.get("domain") or "").strip().lower()
-    if not domain:
-        return jsonify({"error": "domain required"}), 400
-    # Basic sanity check
-    if len(domain) > 253 or " " in domain:
-        return jsonify({"error": "invalid domain"}), 400
+    domain = v.domain(v.json_body().get("domain"))
 
     storage = get_storage()
     inv_id = storage.create_dns_investigation(domain)
@@ -1696,7 +1747,7 @@ def api_dns_get(inv_id: int):
 
 
 @dashboard_bp.route("/api/dns/investigations/<int:inv_id>", methods=["DELETE"])
-@require_login
+@require_admin
 def api_dns_delete(inv_id: int):
     storage = get_storage()
     storage.delete_dns_investigation(inv_id)
@@ -1712,7 +1763,6 @@ def api_dns_enrich(inv_id: int):
     Requires DNSDUMPSTER_API_KEY env var.
     """
     import json as _json
-    import re as _re
 
     storage = get_storage()
     inv = storage.get_dns_investigation(inv_id)
@@ -1962,23 +2012,30 @@ def api_dns_certs(domain: str):
 @require_login
 def api_dns_pdf(inv_id: int):
     """Export DNS investigation as a rich PDF report — DNSDumpster-inspired layout."""
-    from io import BytesIO
-    from datetime import datetime as dt
     from collections import Counter
+    from datetime import datetime as dt
+    from io import BytesIO
 
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     plt.style.use('dark_background')
-    import matplotlib.patches as mpatches
     import math
 
+    import matplotlib.patches as mpatches
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import mm
     from reportlab.platypus import (
-        HRFlowable, Image, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
+        HRFlowable,
+        Image,
+        PageBreak,
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
     )
 
     storage = get_storage()
@@ -2072,8 +2129,8 @@ def api_dns_pdf(inv_id: int):
                      textColor=color or C_ACCENT, leading=14, spaceBefore=4, spaceAfter=3)))
 
     def badge(text, bg="#161b22", fg="#e6edf3"):
-        return Paragraph(f'<font color="{fg}"><b>{text}</b></font>',
-                         S(f"bd_{text[:4]}", fontSize=7, backColor=colors.HexColor(bg),
+        return Paragraph(f'<font color="{fg}"><b>{pdf_text(text, 200)}</b></font>',
+                         S("bd_badge", fontSize=7, backColor=colors.HexColor(bg),
                            borderPadding=(2,5,2,5), leading=10))
 
     def geo_str(geo_list):
@@ -2194,6 +2251,7 @@ def api_dns_pdf(inv_id: int):
         """Screenshot the real jsvectormap using Playwright — same map as the dashboard."""
         import json as _json
         from io import BytesIO as _BytesIO
+
         from reportlab.lib.utils import ImageReader as _IR
 
         if not cc_counter:
@@ -2259,8 +2317,10 @@ window._ready = true;
 </script></body></html>"""
 
         try:
+            import os as _os
+            import tempfile as _tmp
+
             from playwright.sync_api import sync_playwright as _swp
-            import tempfile as _tmp, os as _os
             with _swp() as _p:
                 _browser = _p.chromium.launch(headless=True)
                 _page = _browser.new_page(viewport={'width': 1200, 'height': 500})
@@ -2445,13 +2505,13 @@ window._ready = true;
     # Dark header band
     hdr_inner = Table([
         [
-            Paragraph(f'<font color="#f85149"><b>⬡</b></font>', S("logo", fontSize=28, leading=32, textColor=C_RED)),
+            Paragraph('<font color="#f85149"><b>⬡</b></font>', S("logo", fontSize=28, leading=32, textColor=C_RED)),
             Table([
                 [Paragraph("Infrastructure Recon Report", s_h1)],
-                [Paragraph(f'<font color="#f85149">OSINT PH  ·  osintph.info</font>',
+                [Paragraph('<font color="#f85149">OSINT PH  ·  osintph.info</font>',
                             S("tl", fontSize=9, fontName="Helvetica-Bold", textColor=C_RED, leading=13))],
-                [Paragraph(f'Target: <font color="#58a6ff"><b>{domain}</b></font>  ·  '
-                           f'Investigated: {created}  ·  Generated: {dt.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M UTC")}',
+                [Paragraph(f'Target: <font color="#58a6ff"><b>{pdf_text(domain, 253)}</b></font>  ·  '
+                           f'Investigated: {pdf_text(created, 40)}  ·  Generated: {dt.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M UTC")}',
                            S("meta", fontSize=7.5, textColor=C_MUTED, leading=11))],
             ], colWidths=[PW - 20 * mm]),
         ]
@@ -2488,7 +2548,7 @@ window._ready = true;
     for val, lbl in stat_items:
         vc = stat_colors.get(val, C_ACCENT)
         cell = Table([
-            [Paragraph(f'<b>{val}</b>', S(f"sv_{lbl}", fontSize=14, fontName="Helvetica-Bold", textColor=vc, leading=17))],
+            [Paragraph(f'<b>{pdf_text(val, 40)}</b>', S(f"sv_{lbl}", fontSize=14, fontName="Helvetica-Bold", textColor=vc, leading=17))],
             [Paragraph(lbl, S(f"sl_{lbl}", fontSize=6, textColor=C_MUTED, leading=8, fontName="Helvetica-Bold"))],
         ], colWidths=[PW / len(stat_items) - 2])
         cell.setStyle(TableStyle([
@@ -2518,7 +2578,7 @@ window._ready = true;
         alert_tbl = Table([[
             Paragraph("🚨", S("alertico", fontSize=16, leading=20)),
             Paragraph(f"<b>CRITICAL: Zone Transfer Succeeded</b><br/>"
-                      f"Nameserver(s) {', '.join(ns_vuln)} are leaking full DNS zone data. "
+                      f"Nameserver(s) {pdf_text(', '.join(ns_vuln), 500)} are leaking full DNS zone data. "
                       f"Restrict AXFR to authorised secondaries immediately.",
                       S("alerttxt", fontSize=8, textColor=C_RED, leading=12)),
         ]], colWidths=[10*mm, PW-10*mm])
@@ -2537,7 +2597,7 @@ window._ready = true;
     issues = email_sec.get("issues", [])
     if issues:
         for issue in issues:
-            story.append(Paragraph(f"⚠ {issue}", s_warn))
+            story.append(Paragraph(f"⚠ {pdf_text(issue, 500)}", s_warn))
         story.append(Spacer(1, 4))
 
     # ── Page 1: Infrastructure overview (charts side by side) ────────────────
@@ -2578,9 +2638,9 @@ window._ready = true;
         for org, cnt in org_counter.most_common(10):
             info = all_geo_by_org.get(org, {})
             asn_rows.append([
-                Paragraph(org[:45], s_body),
-                Paragraph(info.get("asn",""), s_small),
-                Paragraph(info.get("country",""), s_small),
+                Paragraph(pdf_text(org, 45), s_body),
+                Paragraph(pdf_text(info.get("asn",""), 80), s_small),
+                Paragraph(pdf_text(info.get("country",""), 60), s_small),
                 Paragraph(str(cnt), S("cnt", fontSize=8, fontName="Helvetica-Bold", textColor=C_ACCENT, leading=12)),
             ])
         asn_tbl = dark_table(
@@ -2613,7 +2673,7 @@ window._ready = true;
         graph_img = build_graph_image()
         story.append(graph_img)
     except Exception as e:
-        story.append(Paragraph(f"Graph generation failed: {e}", s_warn))
+        story.append(Paragraph(f"Graph generation failed: {pdf_text(e, 300)}", s_warn))
 
     # ── DNS Records ───────────────────────────────────────────────────────────
     section_header("DNS Records")
@@ -2626,9 +2686,9 @@ window._ready = true;
             rec_rows.append([
                 Paragraph(rtype, S(f"rt{rtype}", fontSize=7, fontName="Helvetica-Bold",
                     textColor=C_ACCENT, leading=10)),
-                Paragraph(val, s_mono),
-                Paragraph(ptr_s, s_small),
-                Paragraph(geo_s, s_small),
+                Paragraph(pdf_text(val, 1000), s_mono),
+                Paragraph(pdf_text(ptr_s, 255), s_small),
+                Paragraph(pdf_text(geo_s, 200), s_small),
             ])
     if rec_rows:
         story.append(dark_table(
@@ -2651,14 +2711,14 @@ window._ready = true;
          Paragraph("Value", S("esh3", fontSize=7.5, textColor=C_TEXT, fontName="Helvetica-Bold"))],
         [Paragraph("SPF", s_body),
          Paragraph("✓ Valid" if spf_v else "✗ Missing", S("sv2", fontSize=8, fontName="Helvetica-Bold", textColor=C_GREEN if spf_v else C_RED, leading=12)),
-         Paragraph(email_sec.get("spf") or "—", s_mono)],
+         Paragraph(pdf_text(email_sec.get("spf") or "—", 1000), s_mono)],
         [Paragraph("DMARC", s_body),
          Paragraph("✓ Valid" if dmarc_v else "✗ Missing", S("dv2", fontSize=8, fontName="Helvetica-Bold", textColor=C_GREEN if dmarc_v else C_RED, leading=12)),
-         Paragraph(email_sec.get("dmarc") or "—", s_mono)],
+         Paragraph(pdf_text(email_sec.get("dmarc") or "—", 1000), s_mono)],
         [Paragraph("DKIM", s_body),
          Paragraph(f"✓ {len(dkim_sel)} selector(s)" if dkim_sel else "✗ Not detected",
                    S("kv2", fontSize=8, fontName="Helvetica-Bold", textColor=C_GREEN if dkim_sel else C_MUTED, leading=12)),
-         Paragraph(", ".join(dkim_sel) or "No selectors found", s_small)],
+         Paragraph(pdf_text(", ".join(dkim_sel) or "No selectors found", 500), s_small)],
     ]
     esec_tbl = Table(esec_data, colWidths=[PW*0.12, PW*0.2, PW*0.68])
     esec_tbl.setStyle(TableStyle([
@@ -2711,9 +2771,9 @@ window._ready = true;
         src_col = "#bc8cff" if src == "brute" else "#58a6ff"
         src_lbl = "brute-force" if src == "brute" else "passive"
         sub_rows.append([
-            Paragraph(sub["subdomain"], s_mono),
-            Paragraph(ips, s_mono),
-            Paragraph(geo, s_small),
+            Paragraph(pdf_text(sub["subdomain"], 255), s_mono),
+            Paragraph(pdf_text(ips, 500), s_mono),
+            Paragraph(pdf_text(geo, 300), s_small),
             Paragraph(f'<font color="{src_col}"><b>{src_lbl}</b></font>',
                       S(f"src_{src}", fontSize=6.5, leading=10)),
         ])
@@ -2823,7 +2883,7 @@ window._ready = true;
                       C_YELLOW if lbl == "EXPIRING SOON" and int(val) > 0 else \
                       C_GREEN if lbl == "ACTIVE" else C_ACCENT
                 cell = Table([
-                    [Paragraph(f'<b>{val}</b>', S(f"csv_{lbl[:4]}", fontSize=13,
+                    [Paragraph(f'<b>{pdf_text(val, 40)}</b>', S(f"csv_{lbl[:4]}", fontSize=13,
                                fontName="Helvetica-Bold", textColor=col, leading=16))],
                     [Paragraph(lbl, S(f"csl_{lbl[:4]}", fontSize=5.5, textColor=C_MUTED,
                                leading=8, fontName="Helvetica-Bold"))],
@@ -2877,9 +2937,9 @@ window._ready = true;
                 san_preview = (c["sans"][0] if c.get("sans") else "—")
                 issuer_s = (c.get("issuer_org") or "—")[:32]
                 cert_rows.append([
-                    Paragraph(san_preview, s_mono),
-                    Paragraph(issuer_s, s_small),
-                    Paragraph((c.get("not_after") or "")[:10], s_small),
+                    Paragraph(pdf_text(san_preview, 255), s_mono),
+                    Paragraph(pdf_text(issuer_s, 80), s_small),
+                    Paragraph(pdf_text((c.get("not_after") or ""), 10), s_small),
                     Paragraph(f'<b>{status_txt}</b>',
                               S(f"cst_{c['id']}", fontSize=6.5, fontName="Helvetica-Bold",
                                 textColor=status_col, leading=9)),
@@ -2897,9 +2957,9 @@ window._ready = true;
             for c in passive[:100]:
                 issuer = (c.get("issuer") or "").split("O=")[-1].split(",")[0][:35]
                 cert_rows.append([
-                    Paragraph(c.get("subdomain",""), s_mono),
-                    Paragraph(issuer, s_small),
-                    Paragraph((c.get("not_after") or "")[:10], s_small),
+                    Paragraph(pdf_text(c.get("subdomain",""), 255), s_mono),
+                    Paragraph(pdf_text(issuer, 80), s_small),
+                    Paragraph(pdf_text((c.get("not_after") or ""), 10), s_small),
                 ])
             story.append(dark_table(
                 [Paragraph(h, S(f"ch{h}", fontSize=7.5, textColor=C_TEXT, fontName="Helvetica-Bold"))
@@ -2928,15 +2988,15 @@ window._ready = true;
             if not open_p and not filt_p:
                 continue
             story.append(Paragraph(
-                f'<font color="#58a6ff"><b>{ip}</b></font> — '
+                f'<font color="#58a6ff"><b>{pdf_text(ip, 60)}</b></font> — '
                 f'<font color="#3fb950"><b>{len(open_p)} open</b></font>'
                 + (f', <font color="#d29922">{len(filt_p)} filtered</font>' if filt_p else ""),
-                S(f"ip_{ip}", fontSize=8, textColor=C_TEXT, leading=12, spaceBefore=6, spaceAfter=3)
+                S("ip_head", fontSize=8, textColor=C_TEXT, leading=12, spaceBefore=6, spaceAfter=3)
             ))
             if open_p:
                 port_rows = [[
                     Paragraph(str(p["port"]), S("pn", fontSize=7, fontName="Helvetica-Bold", textColor=C_GREEN, leading=10)),
-                    Paragraph(p["service"], s_body),
+                    Paragraph(pdf_text(p["service"], 80), s_body),
                     Paragraph("OPEN", S("po", fontSize=7, fontName="Helvetica-Bold", textColor=C_GREEN, leading=10)),
                 ] for p in open_p]
                 story.append(dark_table(
@@ -2956,19 +3016,19 @@ window._ready = true;
                 if not interesting:
                     continue
                 story.append(Paragraph(
-                    f'<font color="#58a6ff"><b>{target}</b></font> — {len(interesting)} paths',
-                    S(f"dt_{target[:8]}", fontSize=8, textColor=C_TEXT, leading=12, spaceBefore=6, spaceAfter=3)
+                    f'<font color="#58a6ff"><b>{pdf_text(target, 255)}</b></font> — {len(interesting)} paths',
+                    S("dt_head", fontSize=8, textColor=C_TEXT, leading=12, spaceBefore=6, spaceAfter=3)
                 ))
                 dir_rows = []
                 for p in interesting:
                     sc = p["status_code"]
                     sc_col = "#3fb950" if sc==200 else "#58a6ff" if 300<=sc<400 else "#d29922" if sc in (401,403) else "#f85149"
                     dir_rows.append([
-                        Paragraph(f'<font color="{sc_col}"><b>{sc}</b></font>',
+                        Paragraph(f'<font color="{sc_col}"><b>{pdf_text(sc, 6)}</b></font>',
                                   S(f"dsc{sc}", fontSize=8, fontName="Helvetica-Bold", leading=12)),
-                        Paragraph(p.get("path",""), s_mono),
-                        Paragraph(p.get("content_length","") or "—", s_small),
-                        Paragraph(p.get("redirect_to","") or "—", s_small),
+                        Paragraph(pdf_text(p.get("path",""), 300), s_mono),
+                        Paragraph(pdf_text(p.get("content_length","") or "—", 20), s_small),
+                        Paragraph(pdf_text(p.get("redirect_to","") or "—", 300), s_small),
                     ])
                 story.append(dark_table(
                     [Paragraph(h, S(f"dh{h}", fontSize=7, textColor=C_TEXT, fontName="Helvetica-Bold"))
@@ -2982,9 +3042,9 @@ window._ready = true;
         for ns, info in zt.items():
             if not info.get("success"):
                 continue
-            story.append(Paragraph(f"Nameserver: {ns} — {info.get('record_count',0)} records exposed", s_warn))
+            story.append(Paragraph(f"Nameserver: {pdf_text(ns, 255)} — {pdf_text(info.get('record_count',0), 12)} records exposed", s_warn))
             zt_rows = [
-                [Paragraph(rec["name"], s_mono), Paragraph(rec["type"], s_body), Paragraph(rec["value"], s_mono)]
+                [Paragraph(pdf_text(rec["name"], 255), s_mono), Paragraph(pdf_text(rec["type"], 20), s_body), Paragraph(pdf_text(rec["value"], 1000), s_mono)]
                 for rec in (info.get("records") or [])[:80]
             ]
             if zt_rows:
@@ -3001,7 +3061,7 @@ window._ready = true;
     story.append(Spacer(1, 4))
     story.append(Paragraph(
         f"CONFIDENTIAL — Infrastructure Recon Report  ·  OSINT PH / osintph.info  ·  "
-        f"Target: {domain}  ·  Report ID: OSINTPH-DNS-{inv_id}-{dt.now(timezone.utc).replace(tzinfo=None).strftime('%Y%m%d')}",
+        f"Target: {pdf_text(domain, 253)}  ·  Report ID: OSINTPH-DNS-{inv_id}-{dt.now(timezone.utc).replace(tzinfo=None).strftime('%Y%m%d')}",
         s_foot))
 
     doc.build(story, onFirstPage=dark_page, onLaterPages=dark_page)
@@ -3024,8 +3084,8 @@ def _check_project_access(project_id: int, require_owner: bool = False):
     project = storage.get_project(project_id)
     if not project:
         return None, (jsonify({"error": "Project not found"}), 404)
-    user = storage.get_user_by_id(session["user_id"])
-    if not user.is_admin and project["owner_id"] != session["user_id"]:
+    user = current_user()
+    if not user.is_admin and project["owner_id"] != user.id:
         return None, (jsonify({"error": "Access denied"}), 403)
     return project, None
 
@@ -3034,11 +3094,11 @@ def _check_project_access(project_id: int, require_owner: bool = False):
 @require_login
 def api_projects_list():
     storage = get_storage()
-    user = storage.get_user_by_id(session["user_id"])
+    user = current_user()
     if user.is_admin:
         projects = storage.list_projects()
     else:
-        projects = storage.list_projects(owner_id=session["user_id"])
+        projects = storage.list_projects(owner_id=user.id)
     # attach owner username
     for p in projects:
         owner = storage.get_user_by_id(p["owner_id"])
@@ -3049,18 +3109,16 @@ def api_projects_list():
 @dashboard_bp.route("/api/projects", methods=["POST"])
 @require_login
 def api_projects_create():
-    body = request.get_json() or {}
-    name = (body.get("name") or "").strip()
-    if not name:
-        return jsonify({"error": "Project name required"}), 400
+    body = v.json_body()
+    name = v.text(body.get("name"), "Project name", 120)
     storage = get_storage()
     project_id = storage.create_project(
         name=name,
-        owner_id=session["user_id"],
-        description=(body.get("description") or "").strip() or None,
-        color=body.get("color") or "#f85149",
-        tags=body.get("tags") or [],
-        alert_threshold=int(body.get("alert_threshold") or 1),
+        owner_id=current_user().id,
+        description=v.free_text(body.get("description"), "description", 2000),
+        color=v.color(body.get("color")),
+        tags=v.tags(body.get("tags")),
+        alert_threshold=v.to_int(body.get("alert_threshold"), 1, 1, 1000),
     )
     return jsonify({"ok": True, "id": project_id})
 
@@ -3083,9 +3141,22 @@ def api_projects_update(project_id):
     project, err = _check_project_access(project_id)
     if err:
         return err
-    body = request.get_json() or {}
-    allowed = ["name", "description", "status", "color", "tags", "alert_threshold"]
-    updates = {k: v for k, v in body.items() if k in allowed}
+    body = v.json_body()
+    updates = {}
+    if "name" in body:
+        updates["name"] = v.text(body.get("name"), "Project name", 120)
+    if "description" in body:
+        updates["description"] = v.free_text(body.get("description"), "description", 2000)
+    if "status" in body:
+        if body.get("status") not in ("active", "paused", "archived"):
+            return jsonify({"error": "status must be active, paused, or archived"}), 400
+        updates["status"] = body["status"]
+    if "color" in body:
+        updates["color"] = v.color(body.get("color"))
+    if "tags" in body:
+        updates["tags"] = v.tags(body.get("tags"))
+    if "alert_threshold" in body:
+        updates["alert_threshold"] = v.to_int(body.get("alert_threshold"), 1, 1, 1000)
     if not updates:
         return jsonify({"error": "No valid fields to update"}), 400
     get_storage().update_project(project_id, **updates)
@@ -3108,7 +3179,7 @@ def api_projects_status(project_id):
     project, err = _check_project_access(project_id)
     if err:
         return err
-    body = request.get_json() or {}
+    body = v.json_body()
     status = body.get("status")
     if status not in ("active", "paused", "archived"):
         return jsonify({"error": "status must be active, paused, or archived"}), 400
@@ -3132,14 +3203,20 @@ def api_project_keywords_add(project_id):
     _, err = _check_project_access(project_id)
     if err:
         return err
-    body = request.get_json() or {}
-    keyword = (body.get("keyword") or "").strip()
-    if not keyword:
-        return jsonify({"error": "keyword required"}), 400
+    body = v.json_body()
+    keyword = v.keyword(body.get("keyword"))
+    is_regex = v.strict_bool(body.get("is_regex"), "is_regex")
+    if is_regex:
+        import re
+
+        try:
+            re.compile(keyword)
+        except re.error:
+            return jsonify({"error": "keyword is not a valid regular expression"}), 400
     kid = get_storage().add_project_keyword(
         project_id, keyword,
-        category=body.get("category") or "custom",
-        is_regex=bool(body.get("is_regex", False)),
+        category=v.category(body.get("category")),
+        is_regex=is_regex,
     )
     return jsonify({"ok": True, "id": kid})
 
@@ -3150,7 +3227,8 @@ def api_project_keywords_delete(project_id, keyword_id):
     _, err = _check_project_access(project_id)
     if err:
         return err
-    get_storage().delete_project_keyword(keyword_id)
+    if not get_storage().delete_project_keyword(project_id, keyword_id):
+        return jsonify({"error": "not found"}), 404
     return jsonify({"ok": True})
 
 
@@ -3170,14 +3248,12 @@ def api_project_domains_add(project_id):
     _, err = _check_project_access(project_id)
     if err:
         return err
-    body = request.get_json() or {}
-    domain = (body.get("domain") or "").strip()
-    if not domain:
-        return jsonify({"error": "domain required"}), 400
+    body = v.json_body()
+    domain = v.domain(body.get("domain"))
     did = get_storage().add_project_domain(
         project_id, domain,
-        priority=int(body.get("priority") or 3),
-        notes=body.get("notes"),
+        priority=v.to_int(body.get("priority"), 3, 1, 5),
+        notes=v.free_text(body.get("notes"), "notes", 1000),
     )
     return jsonify({"ok": True, "id": did})
 
@@ -3188,7 +3264,8 @@ def api_project_domains_delete(project_id, domain_id):
     _, err = _check_project_access(project_id)
     if err:
         return err
-    get_storage().delete_project_domain(domain_id)
+    if not get_storage().delete_project_domain(project_id, domain_id):
+        return jsonify({"error": "not found"}), 404
     return jsonify({"ok": True})
 
 
@@ -3208,15 +3285,15 @@ def api_project_entities_add(project_id):
     _, err = _check_project_access(project_id)
     if err:
         return err
-    body = request.get_json() or {}
-    entity_type = (body.get("entity_type") or "").strip()
-    value = (body.get("value") or "").strip()
+    body = v.json_body()
+    entity_type = str(body.get("entity_type") or "").strip()
     valid_types = ("person", "organization", "brand", "ip", "email", "bitcoin_address")
     if entity_type not in valid_types:
         return jsonify({"error": f"entity_type must be one of {valid_types}"}), 400
-    if not value:
-        return jsonify({"error": "value required"}), 400
-    eid = get_storage().add_project_entity(project_id, entity_type, value, body.get("notes"))
+    value = v.text(body.get("value"), "value", 300)
+    eid = get_storage().add_project_entity(
+        project_id, entity_type, value, v.free_text(body.get("notes"), "notes", 1000)
+    )
     return jsonify({"ok": True, "id": eid})
 
 
@@ -3226,7 +3303,8 @@ def api_project_entities_delete(project_id, entity_id):
     _, err = _check_project_access(project_id)
     if err:
         return err
-    get_storage().delete_project_entity(entity_id)
+    if not get_storage().delete_project_entity(project_id, entity_id):
+        return jsonify({"error": "not found"}), 404
     return jsonify({"ok": True})
 
 
@@ -3237,7 +3315,7 @@ def api_project_hits(project_id):
     _, err = _check_project_access(project_id)
     if err:
         return err
-    limit = int(request.args.get("limit", 100))
+    limit = v.int_arg("limit", 100, 1, 1000)
     return jsonify(get_storage().get_project_hits(project_id, limit=limit))
 
 
@@ -3257,7 +3335,7 @@ def api_project_stats(project_id):
 @dashboard_bp.route("/api/paste/hits", methods=["GET"])
 @require_login
 def api_paste_hits():
-    limit = int(request.args.get("limit", 100))
+    limit = v.int_arg("limit", 100, 1, 1000)
     source = request.args.get("source")
     pattern = request.args.get("pattern")
     return jsonify(get_storage().get_recent_paste_hits(limit=limit, source=source, pattern=pattern))
@@ -3270,13 +3348,10 @@ def api_paste_stats():
 
 
 @dashboard_bp.route("/api/paste/scan", methods=["POST"])
-@require_login
+@require_admin
 def api_paste_scan():
     """Trigger a one-shot paste scan (admin only)."""
     storage = get_storage()
-    user = storage.get_user_by_id(session["user_id"])
-    if not user.is_admin:
-        return jsonify({"error": "Admin only"}), 403
     try:
         from darkweb_scanner.paste_monitor import run_paste_monitor
         result = run_paste_monitor(storage, single_run=True)
@@ -3427,9 +3502,8 @@ def osint_tiktok(username):
 @require_login
 def osint_username_check(username):
     """Check a username against WhatsMyName dataset."""
-    import json as _json
     import concurrent.futures
-    from urllib.parse import urlparse as _urlparse
+    import json as _json
     try:
         _wmn = safe_fetch(
             "https://raw.githubusercontent.com/WebBreacher/WhatsMyName/main/wmn-data.json",
@@ -3449,10 +3523,9 @@ def osint_username_check(username):
         if not url.startswith("https://"):
             return None
         try:
-            _host = _urlparse(url).hostname or ""
-            check_host_ssrf(_host)
-            r = requests.get(url, timeout=6, verify=True, allow_redirects=False)
-            st, body_b = r.status_code, r.content
+            # Resolves once, refuses internal addresses, connects to the address it checked.
+            r = fetch_public(url, timeout=6, max_bytes=512_000)
+            st, body_b = r["status"], r["body"]
         except (SafeFetchError, Exception):
             return None
         text = body_b.decode("utf-8", errors="replace")
@@ -3475,8 +3548,15 @@ def osint_username_check(username):
 @dashboard_bp.route("/api/proxy/threatfox", methods=["POST"])
 @require_login
 def proxy_threatfox():
-    """Proxy ThreatFox API — avoids CORS from browser."""
-    body = request.get_data()
+    """Proxy ThreatFox API — avoids CORS from browser.
+
+    Only the recent-IOC query the page uses is relayed; the request is rebuilt
+    here, so nothing else can be sent with the organisation's key.
+    """
+    asked = v.json_body()
+    if asked.get("query") != "get_iocs":
+        return jsonify({"error": "only the get_iocs query is relayed"}), 400
+    body = json.dumps({"query": "get_iocs", "days": v.to_int(asked.get("days"), 1, 1, 7)}).encode()
     api_key = os.getenv("THREATFOX_API_KEY", "")
     _hdrs = {"Content-Type": "application/json", "User-Agent": "OSINTPH/1.0"}
     if api_key:

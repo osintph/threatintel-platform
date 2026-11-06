@@ -11,6 +11,7 @@ from flask import Flask
 
 from darkweb_scanner.dashboard.http_client import SafeFetchError
 from darkweb_scanner.dashboard.storage_helper import close_db
+from tests.helpers import login_as
 
 
 @pytest.fixture
@@ -21,15 +22,14 @@ def app():
     flask_app.teardown_appcontext(close_db)
 
     from darkweb_scanner.dashboard.dashboard_routes import dashboard_bp
+
     flask_app.register_blueprint(dashboard_bp)
     return flask_app
 
 
 def _authed_client(app):
     client = app.test_client()
-    with client.session_transaction() as sess:
-        sess["logged_in"] = True
-        sess["user_id"] = 1
+    login_as(client, user_id=1)
     return client
 
 
@@ -56,7 +56,9 @@ def test_report_pdf_error_does_not_leak_traceback(app):
 def test_safe_fetch_error_does_not_leak_ip(app):
     """Proxy routes must not return resolved private IPs from SafeFetchError messages."""
     private_ip = "10.0.0.5"
-    err_msg = f"Blocked: 'feodotracker.abuse.ch' resolves to a private/loopback address '{private_ip}'"
+    err_msg = (
+        f"Blocked: 'feodotracker.abuse.ch' resolves to a private/loopback address '{private_ip}'"
+    )
     with patch(
         "darkweb_scanner.dashboard.dashboard_routes.safe_fetch",
         side_effect=SafeFetchError(err_msg),

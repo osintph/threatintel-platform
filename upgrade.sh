@@ -19,7 +19,7 @@
 #    UPDATE_WWW=1               also move the www submodule to the recorded commit
 #
 #  What it does, in order: pre-flight checks, database dump, git checkout,
-#  .env fixes, origin lock update, image build, containers recreated one by one
+#  .env fixes and checks, origin lock update, image build, containers recreated one by one
 #  (postgres, tor, dashboard, nginx), health checks, URL checks.
 #  It never touches SSH, ufw or volumes. See docs/runbook.md for rollback.
 # =============================================================================
@@ -129,6 +129,33 @@ migrate_env() {
     success ".env: DATABASE_URL now names the psycopg2 driver."
   fi
   chmod 600 .env
+
+  # Settings no release reads any more (Tor control port, OAuth, the debug switch).
+  # Names are printed, values never. A copy of .env is kept first, next to the dumps.
+  local name copy=""
+  local -a gone=()
+  for name in TOR_CONTROL_PORT TOR_CONTROL_PASSWORD FLASK_DEBUG DASHBOARD_PORT \
+    GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET \
+    MICROSOFT_CLIENT_ID MICROSOFT_CLIENT_SECRET MICROSOFT_TENANT_ID APPLE_CLIENT_ID APPLE_CLIENT_SECRET; do
+    grep -q "^$name=" .env && gone+=("$name")
+  done
+  if [[ ${#gone[@]} -gt 0 ]]; then
+    mkdir -p backups && chmod 700 backups
+    copy="backups/env-before-$(date -u +%Y%m%dT%H%M%SZ)"
+    cp -p .env "$copy" && chmod 600 "$copy"
+    for name in "${gone[@]}"; do sed -i "/^$name=/d" .env; done
+    success ".env: removed settings that are no longer used: ${gone[*]} (copy of the old file: $copy)"
+  fi
+
+  # 1.2.0 refuses to start with a short session secret; stop before anything is rebuilt.
+  local secret
+  secret="$(env_value DASHBOARD_SECRET_KEY)"
+  if [[ ${#secret} -lt 32 ]]; then
+    secret=""
+    error "DASHBOARD_SECRET_KEY in .env is shorter than 32 characters. Set it to the output of 'openssl rand -hex 32' (everyone signs in again), then run this script again. Nothing has been rebuilt; the running containers are untouched."
+  fi
+  secret=""
+
   local missing
   missing="$(comm -23 <(grep -oE '^[A-Z][A-Z0-9_]*=' .env.example | sort -u) <(grep -oE '^[A-Z][A-Z0-9_]*=' .env | sort -u) | tr -d '=' | tr '\n' ' ')"
   [[ -n "$missing" ]] && info "Settings in .env.example that your .env does not set (defaults apply): $missing"

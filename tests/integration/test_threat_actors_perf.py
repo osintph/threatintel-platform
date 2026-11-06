@@ -14,8 +14,9 @@ import pytest
 from flask import Flask
 from sqlalchemy import event
 
-from darkweb_scanner.storage import Storage, KeywordHitRecord
 from darkweb_scanner.dashboard.storage_helper import close_db
+from darkweb_scanner.storage import KeywordHitRecord, Storage
+from tests.helpers import login_as, use_storage
 
 _TEST_DB_URL = "sqlite:///:memory:"
 
@@ -58,8 +59,9 @@ def _count_queries(engine):
 
 
 @pytest.fixture
-def test_storage():
-    storage = Storage(_TEST_DB_URL)
+def test_storage(monkeypatch):
+    # Also the storage the auth layer loads the signed-in user from.
+    storage = use_storage(monkeypatch, Storage(_TEST_DB_URL))
     # Seed 20 hits: 4 hits per actor, covering the first 4 keywords of each actor
     with storage.get_session() as session:
         for actor_idx in range(5):
@@ -86,6 +88,7 @@ def app(test_storage):
     flask_app.teardown_appcontext(close_db)
 
     from darkweb_scanner.dashboard.dashboard_routes import dashboard_bp
+
     flask_app.register_blueprint(dashboard_bp)
 
     return flask_app
@@ -104,9 +107,7 @@ def _get_response(app, test_storage):
         ),
         app.test_client() as client,
     ):
-        with client.session_transaction() as sess:
-            sess["logged_in"] = True
-            sess["user_id"] = 1
+        login_as(client, user_id=1)
         return client.get("/api/threat-actors")
 
 
@@ -155,9 +156,7 @@ def test_query_count_bounded(app, test_storage):
         ),
         app.test_client() as client,
     ):
-        with client.session_transaction() as sess:
-            sess["logged_in"] = True
-            sess["user_id"] = 1
+        login_as(client, user_id=1)
 
         with _count_queries(test_storage.engine) as queries:
             resp = client.get("/api/threat-actors")

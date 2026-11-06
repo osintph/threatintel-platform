@@ -1,4 +1,4 @@
-.PHONY: help install dev-install lock test lint format run stop logs shell stats hits check-tor clean
+.PHONY: help install dev-install lock test lint format run stop logs shell stats hits check-tor users clean
 
 help:  ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -49,7 +49,7 @@ build:  ## Build Docker images
 
 run:  ## Start dashboard (and Tor) in background
 	docker compose up -d
-	@echo "✅ Dashboard running at http://localhost:$${DASHBOARD_PORT:-8080}"
+	@echo "✅ Dashboard running at https://localhost (self-signed certificate unless DOMAIN is set)"
 
 scan:  ## Run a crawl scan (foreground)
 	docker compose --profile scan run --rm scanner python -m darkweb_scanner.main scan
@@ -75,6 +75,9 @@ stats:  ## Show scan statistics
 
 hits:  ## Show recent keyword hits
 	docker compose exec dashboard python -m darkweb_scanner.main hits
+
+users:  ## List accounts and sign-in locks (unlock: see docs/runbook.md)
+	docker compose exec dashboard python -m darkweb_scanner.main user-list
 
 # ── Maintenance ───────────────────────────────────────────────────────────────
 check-seeds:  ## Show currently configured seed URLs

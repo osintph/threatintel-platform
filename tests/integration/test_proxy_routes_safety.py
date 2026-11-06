@@ -16,6 +16,7 @@ import pytest
 from flask import Flask
 
 from darkweb_scanner.dashboard.storage_helper import close_db
+from tests.helpers import login_as
 
 _TEST_DB_URL = "sqlite:///:memory:"
 
@@ -32,6 +33,7 @@ def app():
     flask_app.teardown_appcontext(close_db)
 
     from darkweb_scanner.dashboard.dashboard_routes import dashboard_bp
+
     flask_app.register_blueprint(dashboard_bp)
     return flask_app
 
@@ -39,13 +41,12 @@ def app():
 def _authed_client(app):
     """Return a test client with a valid login session."""
     client = app.test_client()
-    with client.session_transaction() as sess:
-        sess["logged_in"] = True
-        sess["user_id"] = 1
+    login_as(client, user_id=1)
     return client
 
 
 # ── Proxy route tests ─────────────────────────────────────────────────────────
+
 
 def test_threatfox_proxy_calls_safe_fetch(app):
     with patch(
@@ -109,6 +110,7 @@ def test_dns_certs_calls_safe_fetch(app):
 
 # ── dns_crawler.fetch_crtsh uses safe_fetch ───────────────────────────────────
 
+
 def test_dns_crawler_fetch_crtsh_calls_safe_fetch():
     """fetch_crtsh must route through safe_fetch, not _safe_http directly."""
     crtsh_body = b'[{"name_value": "www.example.com\\napi.example.com"}]'
@@ -117,6 +119,7 @@ def test_dns_crawler_fetch_crtsh_calls_safe_fetch():
         return_value=_ok("https://crt.sh/?q=%.example.com&output=json", body=crtsh_body),
     ) as mock_fetch:
         from darkweb_scanner.dns_crawler import fetch_crtsh
+
         result = fetch_crtsh("example.com")
 
     mock_fetch.assert_called_once()

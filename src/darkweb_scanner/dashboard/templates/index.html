@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta name="csrf-token" content="{{ csrf_token() }}"/>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23161b22'/%3E%3Ccircle cx='10' cy='16' r='3.5' fill='%23FF5C5C'/%3E%3Ccircle cx='19' cy='16' r='3.5' fill='%238b949e'/%3E%3Ccircle cx='28' cy='16' r='3.5' fill='%23d29922'/%3E%3C/svg%3E"/>
   <title>Threat Intelligence Platform — Dashboard</title>
   <style>
@@ -37,8 +38,7 @@
     }
     .nav-tab:hover { color: var(--text); }
     .nav-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
-    .admin-only { display: none; }
-    .admin-only.visible { display: block; }
+    body:not(.is-admin) .admin-only { display: none !important; }
     .header-right { display: flex; align-items: center; gap: 10px; padding: 8px 0 8px 16px; margin-left: auto; flex-shrink: 0; }
     .theme-btn { background: none; border: 1px solid var(--border); color: var(--muted); padding: 5px 9px; cursor: pointer; font-size: 13px; border-radius: 4px; transition: all .2s; line-height:1; }
     .theme-btn:hover { border-color: var(--accent); color: var(--accent); }
@@ -47,8 +47,10 @@
     .btn-crawl:hover { opacity: .85; }
     .btn-crawl.running { background: var(--red); color: white; }
     .user-pill { color: var(--muted); font-size: 0.82rem; }
-    .sign-out { color: var(--muted); font-size: 0.8rem; text-decoration: none; }
+    .sign-out { color: var(--muted); font-size: 0.8rem; text-decoration: none; background: none; border: none; padding: 0; cursor: pointer; font-family: inherit; }
     .sign-out:hover { color: var(--red); }
+    .sign-out-form { display: inline; margin: 0; }
+    .sign-out.help-link:hover { color: var(--accent); }
 
     /* ── Layout ── */
     main { padding: 28px; max-width: 1400px; margin: 0 auto; }
@@ -456,7 +458,7 @@
   </style>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/jsvectormap@1.5.3/dist/css/jsvectormap.min.css"/>
 </head>
-<body>
+<body{% if is_admin %} class="is-admin"{% endif %}>
 
 <header>
   <div class="logo">
@@ -479,16 +481,20 @@
     <button class="nav-tab" onclick="switchTab('projects', this)">📁 Projects</button>
     <button class="nav-tab" onclick="switchTab('paste', this)">📋 Paste Monitor</button>
     <button class="nav-tab" onclick="switchTab('dns', this)">🌐 DNS</button>
-    <button class="nav-tab" onclick="switchTab('channelmonitor', this)">📡 Channel Monitor</button>
+    <button class="nav-tab admin-only" onclick="switchTab('channelmonitor', this)">📡 Channel Monitor</button>
     <button class="nav-tab" onclick="switchTab('reports', this)">📄 Reports</button>
     <button class="nav-tab" onclick="switchTab('osint', this)">🧰 OSINT Toolkit</button>
     <button class="nav-tab" onclick="switchTab('settings', this)">⚙️ Settings</button>
   </nav>
   <div class="header-right">
     <button class="theme-btn" id="themeBtn" onclick="toggleTheme()" title="Toggle light/dark mode">🌙</button>
-    <button class="btn-crawl" id="crawlBtn" onclick="toggleCrawl()">▶ Start Crawl</button>
+    <button class="btn-crawl admin-only" id="crawlBtn" onclick="toggleCrawl()">▶ Start Crawl</button>
     <span class="user-pill">{{ username }}</span>
-    <a href="/logout" class="sign-out">Sign out</a>
+    <a href="/help" class="sign-out help-link">Help &amp; privacy</a>
+    <form method="POST" action="/logout" class="sign-out-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+      <button type="submit" class="sign-out">Sign out</button>
+    </form>
   </div>
 </header>
 
@@ -652,7 +658,7 @@
       <div class="hd-card-hdr"><div class="hd-card-title">⚡ Quick Actions</div></div>
       <div class="hd-card-body">
         <div class="hd-qa-grid">
-          <button class="hd-qa-btn" onclick="toggleCrawl()"><span class="hd-qa-icon">🕷️</span><span><span class="hd-qa-label">Start Crawl</span><span class="hd-qa-sub">Dark web scan</span></span></button>
+          <button class="hd-qa-btn admin-only" onclick="toggleCrawl()"><span class="hd-qa-icon">🕷️</span><span><span class="hd-qa-label">Start Crawl</span><span class="hd-qa-sub">Dark web scan</span></span></button>
           <button class="hd-qa-btn" onclick="hdGoTo('iocfeed')"><span class="hd-qa-icon">🧪</span><span><span class="hd-qa-label">IOC Feed</span><span class="hd-qa-sub">ThreatFox live</span></span></button>
           <button class="hd-qa-btn" onclick="hdGoTo('investigations')"><span class="hd-qa-icon">🔍</span><span><span class="hd-qa-label">Investigate</span><span class="hd-qa-sub">Add target/IOC</span></span></button>
           <button class="hd-qa-btn" onclick="hdGoTo('ransomware')"><span class="hd-qa-icon">☠️</span><span><span class="hd-qa-label">Ransomware</span><span class="hd-qa-sub">Group intel</span></span></button>
@@ -776,7 +782,7 @@
         <div class="crawl-stat"><div class="val" id="livePagesVal">0</div><div class="lbl">PAGES</div></div>
         <div class="crawl-stat"><div class="val" id="liveHitsVal">0</div><div class="lbl">HITS</div></div>
       </div>
-      <button id="crawlStopBtn" onclick="stopCrawl()" style="display:none;background:rgba(248,81,73,.12);border:1px solid var(--red);color:var(--red);padding:7px 18px;font-family:var(--mono);font-size:11px;letter-spacing:.08em;cursor:pointer;transition:background .2s;flex-shrink:0">■ STOP</button>
+      <button id="crawlStopBtn" class="admin-only" onclick="stopCrawl()" style="display:none;background:rgba(248,81,73,.12);border:1px solid var(--red);color:var(--red);padding:7px 18px;font-family:var(--mono);font-size:11px;letter-spacing:.08em;cursor:pointer;transition:background .2s;flex-shrink:0">■ STOP</button>
     </div>
 
     <!-- Stats -->
@@ -846,7 +852,7 @@
       <div class="panel-header">
         <h2>Manage Keywords</h2>
         <div style="margin-left:auto;display:flex;gap:8px">
-          <label class="btn btn-secondary" style="cursor:pointer;font-size:.78rem;padding:5px 12px">
+          <label class="btn btn-secondary admin-only" style="cursor:pointer;font-size:.78rem;padding:5px 12px">
             📥 Import CSV
             <input type="file" accept=".csv" onchange="importKeywords(this)" style="display:none"/>
           </label>
@@ -900,11 +906,11 @@
       <div class="panel">
         <div class="panel-header"><h2>Onion Seeds</h2><span style="color:var(--muted);font-size:.79rem">.onion URLs for the dark web crawler</span></div>
         <div class="panel-body">
-          <div class="form-row" style="align-items:flex-end">
+          <div class="form-row admin-only" style="align-items:flex-end">
             <div class="form-group" style="flex:1"><label>Single URL</label><input type="text" id="newSeed" placeholder="http://example.onion" style="width:100%"/></div>
             <button class="btn btn-primary" onclick="addSeed()">+ Add</button>
           </div>
-          <div class="form-group" style="margin-top:12px">
+          <div class="form-group admin-only" style="margin-top:12px">
             <label style="color:var(--muted);font-size:.78rem">Bulk paste — one URL per line</label>
             <textarea id="bulkOnionSeeds" rows="4" placeholder="http://site1.onion&#10;http://site2.onion"
               style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:8px 10px;font-family:var(--mono);font-size:.8rem;resize:vertical"></textarea>
@@ -920,11 +926,11 @@
       <div class="panel">
         <div class="panel-header"><h2>Clearnet Seeds</h2><span style="color:var(--muted);font-size:.79rem">Regular websites to crawl (breach forums, mirrors, leak sites)</span></div>
         <div class="panel-body">
-          <div class="form-row" style="align-items:flex-end">
+          <div class="form-row admin-only" style="align-items:flex-end">
             <div class="form-group" style="flex:1"><label>Single URL</label><input type="text" id="newClearnetSeed" placeholder="https://example.com" style="width:100%"/></div>
             <button class="btn btn-primary" onclick="addClearnetSeed()">+ Add</button>
           </div>
-          <div class="form-group" style="margin-top:12px">
+          <div class="form-group admin-only" style="margin-top:12px">
             <label style="color:var(--muted);font-size:.78rem">Bulk paste — one URL per line</label>
             <textarea id="bulkClearnetSeeds" rows="4" placeholder="https://breachforums.st&#10;https://leakbase.io"
               style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:8px 10px;font-family:var(--mono);font-size:.8rem;resize:vertical"></textarea>
@@ -940,11 +946,11 @@
       <div class="panel">
         <div class="panel-header"><h2>Paste Sources</h2><span style="color:var(--muted);font-size:.79rem">Paste sites monitored for credential dumps and leaks</span></div>
         <div class="panel-body">
-          <div class="form-row" style="align-items:flex-end">
+          <div class="form-row admin-only" style="align-items:flex-end">
             <div class="form-group" style="flex:1"><label>Single URL</label><input type="text" id="newPasteSource" placeholder="https://pastebin.com" style="width:100%"/></div>
             <button class="btn btn-primary" onclick="addPasteSource()">+ Add</button>
           </div>
-          <div class="form-group" style="margin-top:12px">
+          <div class="form-group admin-only" style="margin-top:12px">
             <label style="color:var(--muted);font-size:.78rem">Bulk paste — one URL per line</label>
             <textarea id="bulkPasteSources" rows="4" placeholder="https://pastebin.com&#10;https://rentry.co&#10;https://controlc.com"
               style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:8px 10px;font-family:var(--mono);font-size:.8rem;resize:vertical"></textarea>
@@ -960,7 +966,7 @@
       <div class="panel">
         <div class="panel-header"><h2>Telegram Channels</h2><span style="color:var(--muted);font-size:.79rem">Public channels to scrape</span></div>
         <div class="panel-body">
-          <div class="form-row">
+          <div class="form-row admin-only">
             <div class="form-group"><label>Channel (without @)</label><input type="text" id="newChannel" style="width:260px" placeholder="channelname"/></div>
             <button class="btn btn-primary" onclick="addChannel()">+ Add Channel</button>
           </div>
@@ -972,18 +978,25 @@
   </div>
 
   <!-- ── Users Tab ── -->
-  <div class="tab-panel" id="panel-users">
+  <div class="tab-panel admin-only" id="panel-users">
     <div class="panel">
       <div class="panel-header"><h2>User Management</h2></div>
       <div class="panel-body">
         <div class="form-row" style="background:var(--surface2);padding:14px;border-radius:8px;border:1px solid var(--border)">
           <div class="form-group"><label>Username</label><input type="text" id="newUsername" placeholder="username"/></div>
           <div class="form-group"><label>Email</label><input type="email" id="newEmail" placeholder="optional"/></div>
-          <div class="form-group"><label>Password</label><input type="password" id="newUserPassword" placeholder="Min 10 chars"/></div>
+          <div class="form-group"><label>Password</label><input type="password" id="newUserPassword" placeholder="Min 12 chars, upper, number, symbol"/></div>
           <div class="form-group"><label>Role</label><select id="newUserRole" style="width:110px"><option value="0">User</option><option value="1">Admin</option></select></div>
           <button class="btn btn-primary" onclick="createUser()">+ Create</button>
         </div>
         <div id="usersList" style="margin-top:18px"><div class="empty"><div class="icon">👥</div><p>Loading…</p></div></div>
+      </div>
+    </div>
+    <div class="panel" style="margin-top:18px">
+      <div class="panel-header"><h2>Sign-in log</h2><button class="btn btn-secondary" onclick="loadAuthEvents()">Refresh</button></div>
+      <div class="panel-body">
+        <p style="color:var(--muted);font-size:.8rem;margin-bottom:10px">Sign-ins, failures, lockouts and account changes, newest first. Kept for 365 days.</p>
+        <div id="authEventsList" style="max-height:420px;overflow:auto"><div class="empty"><p>Loading…</p></div></div>
       </div>
     </div>
   </div>
@@ -1085,8 +1098,8 @@
       <button class="intel-filter-btn" onclick="filterRwRisk('hits', this)">⚡ Has Hits</button>
       <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
         {% if is_admin %}<button class="btn btn-secondary" onclick="openAddIntelModal('ransomware')">+ Add Group</button>{% endif %}
-        <button class="btn btn-secondary" onclick="addRansomwareSeeds()">+ Add .onion Seeds</button>
-        <button class="btn btn-secondary" onclick="addRansomwareKeywords()">+ Add Keywords</button>
+        <button class="btn btn-secondary admin-only" onclick="addRansomwareSeeds()">+ Add .onion Seeds</button>
+        <button class="btn btn-secondary admin-only" onclick="addRansomwareKeywords()">+ Add Keywords</button>
       </div>
     </div>
     <div class="intel-grid" id="ransomwareGrid">
@@ -1106,7 +1119,7 @@
       <button class="intel-filter-btn" onclick="filterTaType('hits', this)">⚡ Has Hits</button>
       <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
         {% if is_admin %}<button class="btn btn-secondary" onclick="openAddIntelModal('threat-actor')">+ Add Actor</button>{% endif %}
-        <button class="btn btn-secondary" onclick="addThreatActorKeywords()">+ Add Keywords</button>
+        <button class="btn btn-secondary admin-only" onclick="addThreatActorKeywords()">+ Add Keywords</button>
       </div>
     </div>
     <div class="intel-grid" id="threatActorsGrid">
@@ -1269,7 +1282,7 @@
   </div>
 
   <!-- ── Channel Monitor Tab ── -->
-  <div class="tab-panel" id="panel-channelmonitor">
+  <div class="tab-panel admin-only" id="panel-channelmonitor">
 
     <!-- Cred warning banner -->
     <div id="cmCredBanner" class="info-banner" style="display:none;background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.3);color:#f85149;padding:10px 16px;border-radius:8px;margin-bottom:18px;font-size:.83rem;">
@@ -1410,7 +1423,7 @@
     </div>
 
     <!-- Digest mailing list -->
-    <div class="panel" style="max-width:680px;margin:0 auto 24px">
+    <div class="panel admin-only" style="max-width:680px;margin:0 auto 24px">
       <div class="panel-header">
         <h2>📬 Daily Digest — Mailing List</h2>
         <button class="btn btn-primary" onclick="sendDigestNow()" id="digestSendBtn">▶ Send Now</button>
@@ -1613,10 +1626,49 @@
 
 <script>
   let isAdmin = {{ 'true' if is_admin else 'false' }};
+  const currentUsername = {{ username|tojson }};
   let crawlActive = false;
 
+  // ── CSRF and session handling for every API call ───────────────────────────
+  // Same-origin requests other than GET and HEAD carry the session's token.
+  // 401 from the API means the session has ended: go to the sign-in page.
+  (function () {
+    const meta = document.querySelector('meta[name="csrf-token"]');
+    const csrfToken = meta ? meta.content : '';
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async function (input, init) {
+      const req = (typeof Request !== 'undefined' && input instanceof Request) ? input : null;
+      let url;
+      try { url = new URL(req ? req.url : String(input), window.location.href); } catch (e) { return nativeFetch(input, init); }
+      const sameOrigin = url.origin === window.location.origin;
+      const method = String((init && init.method) || (req && req.method) || 'GET').toUpperCase();
+      if (sameOrigin && method !== 'GET' && method !== 'HEAD') {
+        const headers = new Headers((init && init.headers) || (req && req.headers) || {});
+        headers.set('X-CSRF-Token', csrfToken);
+        init = Object.assign({}, init, { headers });
+      }
+      const res = await nativeFetch(input, init);
+      if (!sameOrigin || !url.pathname.startsWith('/api/')) return res;
+      if (res.status === 401) {
+        window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname);
+        return res;
+      }
+      if (res.status === 403) {
+        let error = '';
+        try { error = (await res.clone().json()).error || ''; } catch (e) {}
+        if (error === 'password_change_required' || error === 'mfa_setup_required') {
+          window.location.href = '/';
+        } else if (error === 'admin required') {
+          if (typeof toast === 'function') toast('Admin only', 'error');
+          return new Response(JSON.stringify({ ok: false, error: 'Admin only' }),
+            { status: 403, headers: { 'Content-Type': 'application/json' } });
+        }
+      }
+      return res;
+    };
+  })();
+
   document.addEventListener('DOMContentLoaded', () => {
-    if (isAdmin) document.getElementById('tab-users').classList.add('visible');
     fetchStats();
     hdInit();
     loadSessions();
@@ -1625,16 +1677,49 @@
     setInterval(pollCrawlStatus, 5000);
   });
 
+  // ── Output safety ──────────────────────────────────────────────────────────
+  // Every value that goes into markup passes through esc(), in text and in
+  // attributes alike.
   function esc(s) {
-    if (!s) return '';
-    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+      ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
+  // Links and image sources built from data: http(s) only, anything else becomes '#'.
+  function safeUrl(u) {
+    const s = String(u == null ? '' : u).trim();
+    if (!s) return '#';
+    try {
+      const proto = new URL(s, window.location.origin).protocol;
+      return (proto === 'http:' || proto === 'https:') ? s : '#';
+    } catch (e) { return '#'; }
+  }
+  // Colours from data that end up in a style attribute: hex colours only.
+  function safeColor(c, fallback) {
+    return /^#[0-9a-fA-F]{3,8}$/.test(String(c == null ? '' : c)) ? c : (fallback || 'var(--muted)');
+  }
+  // Data never goes into an on* attribute. Markup built from data carries
+  // data-act="<name>" data-args="<JSON array>" (see act()), and this one
+  // delegated listener calls the function registered under that name in
+  // ACTIONS (filled in at the end of this script) with those arguments.
+  const ACTIONS = {};
+  function act(name, ...args) {
+    return `data-act="${esc(name)}" data-args="${esc(JSON.stringify(args))}"`;
+  }
+  document.addEventListener('click', ev => {
+    const el = ev.target instanceof Element ? ev.target.closest('[data-act]') : null;
+    if (!el) return;
+    const fn = Object.prototype.hasOwnProperty.call(ACTIONS, el.dataset.act) ? ACTIONS[el.dataset.act] : null;
+    if (!fn) return;
+    let args;
+    try { args = JSON.parse(el.dataset.args || '[]'); } catch (e) { return; }
+    fn.apply(el, Array.isArray(args) ? args : []);
+  });
   function fmtTime(iso) {
     if (!iso) return '—';
     try {
       const d = new Date(iso.includes('T') ? (iso.endsWith('Z') ? iso : iso + 'Z') : iso);
       return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
-    } catch(e) { return iso; }
+    } catch(e) { return '—'; }
   }
   function toast(msg, type = 'success') {
     const t = document.getElementById('toast');
@@ -1651,7 +1736,7 @@
     btn.classList.add('active');
     if (tab === 'keywords') { loadKeywords(); _populateGenProjectDropdown(); }
     if (tab === 'seeds') { loadSeeds(); loadChannels(); }
-    if (tab === 'users' && isAdmin) loadUsers();
+    if (tab === 'users' && isAdmin) { loadUsers(); loadAuthEvents(); }
     if (tab === 'investigations') loadInvestigations();
     if (tab === 'iplookup') loadIPInvestigations();
     if (tab === 'ransomware') loadRansomware();
@@ -1661,7 +1746,7 @@
     if (tab === 'dns') loadDNSInvestigations();
     if (tab === 'reports') { loadReportPreview(); if (isAdmin) loadSubscribers(); }
     if (tab === 'settings') loadSettings();
-    if (tab === 'channelmonitor') cmInit();
+    if (tab === 'channelmonitor' && isAdmin) cmInit();
     if (tab === 'home') hdInit();
     if (tab === 'iocfeed') iocLoadAll();
   }
@@ -1678,7 +1763,7 @@
         el.innerHTML = '<span style="color:var(--muted);font-size:.84rem;padding:4px">No hits yet.</span>';
       } else {
         el.innerHTML = data.top_keywords.map(k =>
-          `<div class="kw-pill" onclick="filterSession('${esc(k.keyword)}')">${esc(k.keyword)}<span class="count">${k.count}</span></div>`
+          `<div class="kw-pill" ${act('filterSession', k.keyword)}>${esc(k.keyword)}<span class="count">${esc(k.count)}</span></div>`
         ).join('');
       }
     } catch(e) { document.getElementById('statusDot').style.background='var(--red)'; }
@@ -1700,11 +1785,11 @@
         card.className = 'crawl-card active';
         dot.className = 'crawl-dot pulse';
         title.textContent = 'Crawl in progress';
-        sub.innerHTML = `Session #${data.session.id} — started ${fmtTime(data.session.started_at)}`;
+        sub.textContent = `Session #${data.session.id} — started ${fmtTime(data.session.started_at)}`;
         liveStats.style.display = 'flex';
         document.getElementById('livePagesVal').textContent = (data.session.pages_crawled||0).toLocaleString();
         document.getElementById('liveHitsVal').textContent = (data.session.hits_found||0).toLocaleString();
-        btn.className = 'btn-crawl running';
+        btn.classList.add('running');
         btn.textContent = '⏹ Running…';
         btn.disabled = true;
         document.getElementById('crawlStopBtn').style.display = 'inline-block';
@@ -1714,7 +1799,7 @@
         title.textContent = 'No active crawl';
         sub.innerHTML = 'Click ▶ Start Crawl to begin scanning';
         liveStats.style.display = 'none';
-        btn.className = 'btn-crawl';
+        btn.classList.remove('running');
         btn.textContent = '▶ Start Crawl';
         btn.disabled = false;
         document.getElementById('crawlStopBtn').style.display = 'none';
@@ -1752,7 +1837,7 @@
         const data = await res.json();
         if (data.ok) {
           toast('Crawl started.');
-          btn.className = 'btn-crawl running';
+          btn.classList.add('running');
           btn.textContent = '⏹ Stop Crawl';
           pollStatus();
         } else {
@@ -1812,16 +1897,16 @@
       duration = 'Running…';
     }
     return `
-      <tr class="session-row" onclick="expandSession(${s.id}, true)" id="sess-${s.id}">
-        <td style="font-family:var(--mono);font-size:.8rem;color:var(--muted)">#${s.id}</td>
-        <td class="time-cell">${started}</td>
-        <td class="time-cell">${duration}</td>
-        <td><strong>${(s.pages_crawled||0).toLocaleString()}</strong></td>
-        <td><strong style="color:${s.hits_found>0?'var(--accent)':'var(--muted)'}">${(s.hits_found||0).toLocaleString()}</strong></td>
-        <td><span class="status-badge ${statusClass}">${s.status||'completed'}</span></td>
+      <tr class="session-row" ${act('expandSession', s.id, true)} id="sess-${esc(s.id)}">
+        <td style="font-family:var(--mono);font-size:.8rem;color:var(--muted)">#${esc(s.id)}</td>
+        <td class="time-cell">${esc(started)}</td>
+        <td class="time-cell">${esc(duration)}</td>
+        <td><strong>${esc((s.pages_crawled||0).toLocaleString())}</strong></td>
+        <td><strong style="color:${s.hits_found>0?'var(--accent)':'var(--muted)'}">${esc((s.hits_found||0).toLocaleString())}</strong></td>
+        <td><span class="status-badge ${esc(statusClass)}">${esc(s.status||'completed')}</span></td>
       </tr>
-      <tr class="session-detail" id="sess-detail-${s.id}">
-        <td colspan="6"><div class="session-detail-inner" id="sess-inner-${s.id}">Loading…</div></td>
+      <tr class="session-detail" id="sess-detail-${esc(s.id)}">
+        <td colspan="6"><div class="session-detail-inner" id="sess-inner-${esc(s.id)}">Loading…</div></td>
       </tr>`;
   }
 
@@ -1872,7 +1957,7 @@
           <table><thead><tr><th>Keyword</th><th style="width:80px">Action</th></tr></thead>
           <tbody>${(kws||[]).map(kw => `<tr class="kw-row" data-kw="${esc(kw).toLowerCase()}">
             <td><span class="keyword-tag">${esc(kw)}</span></td>
-            <td><button class="btn btn-danger" onclick="deleteKeyword('${esc(kw).replace(/'/g,"\\'")}','${esc(cat).replace(/'/g,"\\'")}')">Remove</button></td>
+            <td><button class="btn btn-danger admin-only" ${act('deleteKeyword', kw, cat)}>Remove</button></td>
           </tr>`).join('')}</tbody></table>
         </div>`).join('');
     } catch(e) { el.innerHTML = '<div class="empty" style="color:var(--red)">Error.</div>'; }
@@ -1889,6 +1974,7 @@
       if (data.ok) { document.getElementById('newKeyword').value=''; toast(`Keyword added to project!`); }
       else toast(data.error||'Error', 'error');
     } else {
+      if (!isAdmin) { toast('Admin only — tick "Project Specific" to add to a project', 'error'); return; }
       const res = await fetch('/api/keywords', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({keyword:kw,category:cat}) });
       const data = await res.json();
       if (data.ok) { document.getElementById('newKeyword').value=''; toast('Keyword added!'); loadKeywords(); }
@@ -1926,7 +2012,7 @@
         sel.innerHTML = '<option value="">No projects yet</option>';
         return;
       }
-      sel.innerHTML = projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
+      sel.innerHTML = projects.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
     } catch(e) { sel.innerHTML = '<option value="">Error loading projects</option>'; }
   }
 
@@ -1939,7 +2025,7 @@
       el.innerHTML = data.seeds.map(s => `
         <div class="seed-item">
           <span>${esc(s)}</span>
-          <button class="btn btn-danger" onclick="deleteSeed('${esc(s).replace(/'/g,"\\'")}')">Remove</button>
+          <button class="btn btn-danger admin-only" ${act('deleteSeed', s)}>Remove</button>
         </div>`).join('');
     } catch(e) { el.innerHTML = '<div class="empty" style="color:var(--red)">Error.</div>'; }
   }
@@ -1980,7 +2066,7 @@
       el.innerHTML = data.seeds.map(s => `
         <div class="seed-item">
           <span>${esc(s)}</span>
-          <button class="btn btn-danger" onclick="deleteClearnetSeed('${esc(s).replace(/'/g,"\\'")}')">Remove</button>
+          <button class="btn btn-danger admin-only" ${act('deleteClearnetSeed', s)}>Remove</button>
         </div>`).join('');
     } catch(e) { el.innerHTML = '<div class="empty" style="color:var(--red)">Error.</div>'; }
   }
@@ -2010,7 +2096,7 @@
       el.innerHTML = data.sources.map(s => `
         <div class="seed-item">
           <span>${esc(s)}</span>
-          <button class="btn btn-danger" onclick="deletePasteSource('${esc(s).replace(/'/g,"\\'")}')">Remove</button>
+          <button class="btn btn-danger admin-only" ${act('deletePasteSource', s)}>Remove</button>
         </div>`).join('');
     } catch(e) { el.innerHTML = '<div class="empty" style="color:var(--red)">Error.</div>'; }
   }
@@ -2084,7 +2170,7 @@
       if (!sel) return;
       const projects = Array.isArray(pd) ? pd : (pd.projects || []);
       sel.innerHTML = '<option value="">+ Add to Project (optional)</option>' +
-        projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
+        projects.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
     } catch(e) {}
   }
 
@@ -2116,7 +2202,7 @@
       for (const [cat, kws] of Object.entries(results)) {
         total += kws.length;
         html += `<div style="margin-bottom:14px">
-          <div style="font-size:.72rem;color:${catColors[cat]||'var(--muted)'};font-family:var(--mono);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">${esc(cat)} (${kws.length})</div>
+          <div style="font-size:.72rem;color:${catColors[cat]||'var(--muted)'};font-family:var(--mono);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">${esc(cat)} (${esc(kws.length)})</div>
           <div>`;
         for (const kw of kws) {
           html += `<span class="gen-kw-item selected" onclick="toggleGenKw(this)" data-kw="${esc(kw)}" data-cat="${esc(cat)}"><input type="checkbox" checked onclick="event.stopPropagation()"> ${esc(kw)}</span>`;
@@ -2162,6 +2248,7 @@
       }
       toast(`Added ${added} keyword${added!==1?'s':''} to project!`);
     } else {
+      if (!isAdmin) { toast('Admin only — tick "Project Specific" to add to a project', 'error'); return; }
       const res = await fetch('/api/keywords/bulk', {
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({keywords})
@@ -2182,7 +2269,7 @@
       el.innerHTML = data.channels.map(ch => `
         <div class="seed-item">
           <span>@${esc(ch)}</span>
-          <button class="btn btn-danger" onclick="deleteChannel('${esc(ch)}')">Remove</button>
+          <button class="btn btn-danger admin-only" ${act('deleteChannel', ch)}>Remove</button>
         </div>`).join('');
     } catch(e) { el.innerHTML = '<div class="empty" style="color:var(--muted)">Configure TELEGRAM_API_ID in .env</div>'; }
   }
@@ -2217,7 +2304,33 @@
           <td>${u.is_admin?'<span class="badge-admin">Admin</span>':'<span class="badge-user">User</span>'}</td>
           <td>${u.totp_enabled?'<span class="badge-2fa">✓</span>':'<span style="color:var(--muted);font-size:.79rem">Off</span>'}</td>
           <td class="time-cell">${fmtTime(u.last_login)}</td>
-          <td><button class="btn btn-danger" onclick="deleteUser(${u.id},'${esc(u.username)}')">Remove</button></td>
+          <td style="white-space:nowrap">${u.username !== currentUsername && u.totp_enabled ? `<button class="btn btn-secondary" ${act('resetUserMfa', u.id, u.username)}>Reset 2FA</button> ` : ''}<button class="btn btn-danger" ${act('deleteUser', u.id, u.username)}>Remove</button></td>
+        </tr>`).join('')}</tbody></table>`;
+    } catch(e) { el.innerHTML = '<div class="empty" style="color:var(--red)">Error.</div>'; }
+  }
+
+  // For a user who lost their authenticator: they enrol a new one at the next sign-in.
+  async function resetUserMfa(id, username) {
+    if (!confirm(`Remove the second factor of "${username}"? Their sessions end and they enrol again at the next sign-in.`)) return;
+    const res = await fetch(`/api/users/${encodeURIComponent(id)}/mfa/reset`, { method:'POST' });
+    const data = await res.json();
+    if (data.ok) { toast('Second factor reset'); loadUsers(); loadAuthEvents(); }
+    else toast(data.error||'Error','error');
+  }
+
+  async function loadAuthEvents() {
+    const el = document.getElementById('authEventsList');
+    try {
+      const events = await (await fetch('/api/admin/auth-events?limit=200')).json();
+      if (!Array.isArray(events) || !events.length) { el.innerHTML = '<div class="empty"><p>No entries yet.</p></div>'; return; }
+      el.innerHTML = `<table>
+        <thead><tr><th>Time</th><th>Event</th><th>User</th><th>Address</th><th>Detail</th></tr></thead>
+        <tbody>${events.map(e => `<tr>
+          <td class="time-cell">${fmtTime(e.ts)}</td>
+          <td>${esc(e.event)}</td>
+          <td>${esc(e.username||'—')}</td>
+          <td style="font-family:monospace;font-size:.78rem">${esc(e.ip||'—')}</td>
+          <td style="color:var(--muted)">${esc(e.detail||'')}</td>
         </tr>`).join('')}</tbody></table>`;
     } catch(e) { el.innerHTML = '<div class="empty" style="color:var(--red)">Error.</div>'; }
   }
@@ -2277,8 +2390,8 @@
     const source = document.getElementById('pasteSourceFilter').value;
     const pattern = document.getElementById('pastePatternFilter').value;
     let url = `/api/paste/hits?limit=200`;
-    if (source) url += `&source=${source}`;
-    if (pattern) url += `&pattern=${pattern}`;
+    if (source) url += `&source=${encodeURIComponent(source)}`;
+    if (pattern) url += `&pattern=${encodeURIComponent(pattern)}`;
 
     const [hits, stats] = await Promise.all([
       apiFetch(url),
@@ -2297,20 +2410,20 @@
     row.innerHTML = `
       <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px">
         <div style="font-size:.72rem;color:var(--muted);text-transform:uppercase;margin-bottom:4px">Total Hits</div>
-        <div style="font-size:1.5rem;font-weight:700;color:var(--accent)">${stats.total_hits || 0}</div>
+        <div style="font-size:1.5rem;font-weight:700;color:var(--accent)">${esc(stats.total_hits || 0)}</div>
       </div>
       <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px">
         <div style="font-size:.72rem;color:var(--muted);text-transform:uppercase;margin-bottom:4px">Pastes Scanned</div>
-        <div style="font-size:1.5rem;font-weight:700">${stats.total_scanned || 0}</div>
+        <div style="font-size:1.5rem;font-weight:700">${esc(stats.total_scanned || 0)}</div>
       </div>
       <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px">
         <div style="font-size:.72rem;color:var(--muted);text-transform:uppercase;margin-bottom:4px">Pastes w/ Hits</div>
-        <div style="font-size:1.5rem;font-weight:700;color:#d29922">${stats.total_with_hits || 0}</div>
+        <div style="font-size:1.5rem;font-weight:700;color:#d29922">${esc(stats.total_with_hits || 0)}</div>
       </div>
       ${(stats.by_source || []).map(s => `
       <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px">
-        <div style="font-size:.72rem;color:var(--muted);text-transform:uppercase;margin-bottom:4px">${s.source}</div>
-        <div style="font-size:1.5rem;font-weight:700;color:${PASTE_SOURCE_COLORS[s.source]||'var(--text)'}">${s.count}</div>
+        <div style="font-size:.72rem;color:var(--muted);text-transform:uppercase;margin-bottom:4px">${esc(s.source)}</div>
+        <div style="font-size:1.5rem;font-weight:700;color:${safeColor(PASTE_SOURCE_COLORS[s.source], 'var(--text)')}">${esc(s.count)}</div>
       </div>`).join('')}`;
   }
 
@@ -2330,14 +2443,14 @@
         <th>Found At</th>
       </tr></thead>
       <tbody>${hits.map(h => `<tr>
-        <td><span style="background:rgba(56,139,253,.15);color:#58a6ff;padding:2px 8px;border-radius:4px;font-size:.75rem;white-space:nowrap">${PASTE_PATTERN_LABELS[h.matched_pattern] || h.matched_pattern}</span></td>
-        <td style="font-family:monospace;font-size:.8rem;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${h.matched_value||''}">${h.matched_value || '—'}</td>
-        <td><span style="background:${PASTE_SOURCE_COLORS[h.source]||'var(--surface)'}22;color:${PASTE_SOURCE_COLORS[h.source]||'var(--muted)'};padding:2px 8px;border-radius:4px;font-size:.75rem">${h.source}</span></td>
+        <td><span style="background:rgba(56,139,253,.15);color:#58a6ff;padding:2px 8px;border-radius:4px;font-size:.75rem;white-space:nowrap">${esc(Object.prototype.hasOwnProperty.call(PASTE_PATTERN_LABELS, h.matched_pattern) ? PASTE_PATTERN_LABELS[h.matched_pattern] : h.matched_pattern)}</span></td>
+        <td style="font-family:monospace;font-size:.8rem;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(h.matched_value||'')}">${esc(h.matched_value || '—')}</td>
+        <td><span style="background:${safeColor(PASTE_SOURCE_COLORS[h.source], '#8b949e')}22;color:${safeColor(PASTE_SOURCE_COLORS[h.source])};padding:2px 8px;border-radius:4px;font-size:.75rem">${esc(h.source)}</span></td>
         <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
-          <a href="${h.url}" target="_blank" style="color:var(--accent);font-size:.78rem">${h.url.replace('https://','')}</a>
+          <a href="${esc(safeUrl(h.url))}" target="_blank" rel="noopener noreferrer" style="color:var(--accent);font-size:.78rem">${esc(String(h.url||'').replace('https://',''))}</a>
         </td>
-        <td style="font-size:.78rem;color:var(--muted);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(h.context||'').replace(/"/g,'&quot;')}">${h.context ? h.context.slice(0,80)+'…' : '—'}</td>
-        <td style="font-size:.75rem;white-space:nowrap;color:var(--muted)">${h.found_at ? h.found_at.slice(0,16).replace('T',' ') : '—'}</td>
+        <td style="font-size:.78rem;color:var(--muted);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(h.context||'')}">${h.context ? esc(String(h.context).slice(0,80))+'…' : '—'}</td>
+        <td style="font-size:.75rem;white-space:nowrap;color:var(--muted)">${h.found_at ? esc(String(h.found_at).slice(0,16).replace('T',' ')) : '—'}</td>
       </tr>`).join('')}</tbody>
     </table>`;
   }
@@ -2377,18 +2490,18 @@
     }
     grid.innerHTML = projects.map(p => {
       const statusColor = p.status === 'active' ? '#3fb950' : p.status === 'paused' ? '#d29922' : '#8b949e';
-      const tags = (p.tags || []).map(t => `<span style="background:var(--surface2,#21262d);color:var(--muted);padding:2px 7px;border-radius:4px;font-size:.72rem">${t}</span>`).join(' ');
-      return `<div class="project-card" onclick="openProjectDetail(${p.id})">
-        <div class="card-accent" style="background:${p.color}"></div>
+      const tags = (p.tags || []).map(t => `<span style="background:var(--surface2,#21262d);color:var(--muted);padding:2px 7px;border-radius:4px;font-size:.72rem">${esc(t)}</span>`).join(' ');
+      return `<div class="project-card" ${act('openProjectDetail', p.id)}>
+        <div class="card-accent" style="background:${safeColor(p.color, '#f85149')}"></div>
         <div style="margin-left:8px">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-            <span style="font-weight:700;font-size:.95rem">${p.name}</span>
-            <span style="font-size:.72rem;padding:2px 8px;border-radius:10px;background:${statusColor}22;color:${statusColor}">${p.status}</span>
+            <span style="font-weight:700;font-size:.95rem">${esc(p.name)}</span>
+            <span style="font-size:.72rem;padding:2px 8px;border-radius:10px;background:${statusColor}22;color:${statusColor}">${esc(p.status)}</span>
           </div>
-          ${p.description ? `<div style="font-size:.8rem;color:var(--muted);margin-bottom:8px">${p.description}</div>` : ''}
+          ${p.description ? `<div style="font-size:.8rem;color:var(--muted);margin-bottom:8px">${esc(p.description)}</div>` : ''}
           <div style="display:flex;gap:16px;font-size:.8rem;color:var(--muted);margin-bottom:8px">
-            <span>⚡ <strong style="color:var(--text)">${p.hit_count || 0}</strong> hits</span>
-            ${p.owner_username ? `<span>👤 ${p.owner_username}</span>` : ''}
+            <span>⚡ <strong style="color:var(--text)">${esc(p.hit_count || 0)}</strong> hits</span>
+            ${p.owner_username ? `<span>👤 ${esc(p.owner_username)}</span>` : ''}
           </div>
           ${tags ? `<div style="display:flex;gap:4px;flex-wrap:wrap">${tags}</div>` : ''}
         </div>
@@ -2401,7 +2514,7 @@
     const st = document.getElementById('projectStatusFilter').value;
     renderProjects(allProjects.filter(p =>
       (st === 'all' || p.status === st) &&
-      (p.name.toLowerCase().includes(q) || (p.description || '').toLowerCase().includes(q))
+      (String(p.name || '').toLowerCase().includes(q) || String(p.description || '').toLowerCase().includes(q))
     ));
   }
 
@@ -2450,12 +2563,12 @@
   function renderProjectOverview(p) {
     if (!p) return;
     const panel = document.getElementById('proj-panel-overview');
-    const top = (p.tags || []).map(t => `<span style="background:var(--surface);border:1px solid var(--border);color:var(--muted);padding:2px 8px;border-radius:4px;font-size:.75rem">${t}</span>`).join(' ');
+    const top = (p.tags || []).map(t => `<span style="background:var(--surface);border:1px solid var(--border);color:var(--muted);padding:2px 8px;border-radius:4px;font-size:.75rem">${esc(t)}</span>`).join(' ');
     panel.innerHTML = `
       <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin-bottom:20px">
         <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px">
           <div style="font-size:.72rem;color:var(--muted);text-transform:uppercase;margin-bottom:4px">Total Hits</div>
-          <div style="font-size:1.6rem;font-weight:700;color:var(--accent)">${p.hit_count || 0}</div>
+          <div style="font-size:1.6rem;font-weight:700;color:var(--accent)">${esc(p.hit_count || 0)}</div>
         </div>
         <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px">
           <div style="font-size:.72rem;color:var(--muted);text-transform:uppercase;margin-bottom:4px">Keywords</div>
@@ -2470,9 +2583,9 @@
           <div style="font-size:1.6rem;font-weight:700">${(p.entities || []).length}</div>
         </div>
       </div>
-      ${p.description ? `<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;font-size:.85rem;color:var(--muted)">${p.description}</div>` : ''}
+      ${p.description ? `<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;font-size:.85rem;color:var(--muted)">${esc(p.description)}</div>` : ''}
       ${top ? `<div style="margin-bottom:16px;display:flex;gap:6px;flex-wrap:wrap">${top}</div>` : ''}
-      <div style="font-size:.75rem;color:var(--muted)">Created ${p.created_at ? p.created_at.slice(0,10) : '—'} · Alert threshold: ${p.alert_threshold} hit(s)</div>`;
+      <div style="font-size:.75rem;color:var(--muted)">Created ${p.created_at ? esc(String(p.created_at).slice(0,10)) : '—'} · Alert threshold: ${esc(p.alert_threshold)} hit(s)</div>`;
   }
 
   // Keywords sub-tab
@@ -2492,10 +2605,10 @@
       <table class="proj-table">
         <thead><tr><th>Keyword</th><th>Category</th><th>Regex</th><th></th></tr></thead>
         <tbody>${(kws||[]).map(k => `<tr>
-          <td>${k.keyword}</td>
-          <td><span style="background:var(--surface);border:1px solid var(--border);padding:1px 7px;border-radius:4px;font-size:.75rem">${k.category}</span></td>
+          <td>${esc(k.keyword)}</td>
+          <td><span style="background:var(--surface);border:1px solid var(--border);padding:1px 7px;border-radius:4px;font-size:.75rem">${esc(k.category)}</span></td>
           <td>${k.is_regex ? '✓' : ''}</td>
-          <td><button class="btn btn-danger" style="padding:3px 10px;font-size:.75rem" onclick="deleteProjectKeyword(${k.id})">Remove</button></td>
+          <td><button class="btn btn-danger" style="padding:3px 10px;font-size:.75rem" ${act('deleteProjectKeyword', k.id)}>Remove</button></td>
         </tr>`).join('') || '<tr><td colspan="4" style="color:var(--muted);text-align:center">No keywords yet</td></tr>'}</tbody>
       </table>`;
   }
@@ -2537,10 +2650,10 @@
       <table class="proj-table">
         <thead><tr><th>Domain</th><th>Priority</th><th>Notes</th><th></th></tr></thead>
         <tbody>${(domains||[]).map(d => `<tr>
-          <td style="font-family:monospace;font-size:.8rem">${d.domain}</td>
-          <td>${'★'.repeat(d.priority || 3)}</td>
-          <td style="color:var(--muted);font-size:.8rem">${d.notes || ''}</td>
-          <td><button class="btn btn-danger" style="padding:3px 10px;font-size:.75rem" onclick="deleteProjectDomain(${d.id})">Remove</button></td>
+          <td style="font-family:monospace;font-size:.8rem">${esc(d.domain)}</td>
+          <td>${'★'.repeat(Math.max(1, Math.min(5, parseInt(d.priority, 10) || 3)))}</td>
+          <td style="color:var(--muted);font-size:.8rem">${esc(d.notes || '')}</td>
+          <td><button class="btn btn-danger" style="padding:3px 10px;font-size:.75rem" ${act('deleteProjectDomain', d.id)}>Remove</button></td>
         </tr>`).join('') || '<tr><td colspan="4" style="color:var(--muted);text-align:center">No domains yet</td></tr>'}</tbody>
       </table>`;
   }
@@ -2582,10 +2695,10 @@
       <table class="proj-table">
         <thead><tr><th>Type</th><th>Value</th><th>Notes</th><th></th></tr></thead>
         <tbody>${(entities||[]).map(e => `<tr>
-          <td><span style="background:var(--surface);border:1px solid var(--border);padding:1px 7px;border-radius:4px;font-size:.75rem">${e.entity_type}</span></td>
-          <td style="font-size:.85rem">${e.value}</td>
-          <td style="color:var(--muted);font-size:.8rem">${e.notes || ''}</td>
-          <td><button class="btn btn-danger" style="padding:3px 10px;font-size:.75rem" onclick="deleteProjectEntity(${e.id})">Remove</button></td>
+          <td><span style="background:var(--surface);border:1px solid var(--border);padding:1px 7px;border-radius:4px;font-size:.75rem">${esc(e.entity_type)}</span></td>
+          <td style="font-size:.85rem">${esc(e.value)}</td>
+          <td style="color:var(--muted);font-size:.8rem">${esc(e.notes || '')}</td>
+          <td><button class="btn btn-danger" style="padding:3px 10px;font-size:.75rem" ${act('deleteProjectEntity', e.id)}>Remove</button></td>
         </tr>`).join('') || '<tr><td colspan="4" style="color:var(--muted);text-align:center">No entities yet</td></tr>'}</tbody>
       </table>`;
   }
@@ -2617,11 +2730,11 @@
     panel.innerHTML = `<table class="proj-table">
       <thead><tr><th>Keyword</th><th>Matched On</th><th>URL</th><th>Context</th><th>Found At</th></tr></thead>
       <tbody>${hits.map(h => `<tr>
-        <td><span class="keyword-badge">${h.keyword}</span></td>
-        <td><span style="font-size:.72rem;padding:2px 7px;border-radius:4px;background:rgba(56,139,253,.15);color:#58a6ff">${h.matched_on}: ${h.matched_value||''}</span></td>
-        <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a href="${h.url}" target="_blank" style="color:var(--accent);font-size:.75rem">${h.url}</a></td>
-        <td style="font-size:.78rem;color:var(--muted);max-width:220px">${(h.context||'').slice(0,100)}…</td>
-        <td style="font-size:.75rem;white-space:nowrap;color:var(--muted)">${h.found_at ? h.found_at.slice(0,16).replace('T',' ') : '—'}</td>
+        <td><span class="keyword-badge">${esc(h.keyword)}</span></td>
+        <td><span style="font-size:.72rem;padding:2px 7px;border-radius:4px;background:rgba(56,139,253,.15);color:#58a6ff">${esc(h.matched_on)}: ${esc(h.matched_value||'')}</span></td>
+        <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a href="${esc(safeUrl(h.url))}" target="_blank" rel="noopener noreferrer" style="color:var(--accent);font-size:.75rem">${esc(h.url)}</a></td>
+        <td style="font-size:.78rem;color:var(--muted);max-width:220px">${esc(String(h.context||'').slice(0,100))}…</td>
+        <td style="font-size:.75rem;white-space:nowrap;color:var(--muted)">${h.found_at ? esc(String(h.found_at).slice(0,16).replace('T',' ')) : '—'}</td>
       </tr>`).join('')}</tbody>
     </table>`;
   }
@@ -2702,7 +2815,7 @@
       ]);
       reportSessions = sessions;
       document.getElementById('reportStats').innerHTML =
-        `<strong>${stats.total_hits}</strong> keyword hits across <strong>${stats.total_sessions}</strong> sessions · <strong>${stats.total_pages}</strong> pages crawled`;
+        `<strong>${esc(stats.total_hits)}</strong> keyword hits across <strong>${esc(stats.total_sessions)}</strong> sessions · <strong>${esc(stats.total_pages)}</strong> pages crawled`;
       // Populate session dropdown
       const sel = document.getElementById('reportScope');
       sel.innerHTML = '<option value="all">All sessions (full history)</option>';
@@ -2746,14 +2859,16 @@
       const profile = await (await fetch('/api/settings/profile')).json();
       document.getElementById('profileInfo').innerHTML = `
         <div style="display:grid;gap:9px">
-          ${[['Username',profile.username],['Email',profile.email||'—'],['Role',profile.is_admin?'<span class="badge-admin">Admin</span>':'<span class="badge-user">User</span>'],['OAuth',profile.oauth_provider||'None'],['Last login',fmtTime(profile.last_login)],['Member since',fmtTime(profile.created_at)]].map(([l,v])=>`
+          ${[['Username',esc(profile.username)],['Email',esc(profile.email||'—')],['Role',profile.is_admin?'<span class="badge-admin">Admin</span>':'<span class="badge-user">User</span>'],['OAuth',esc(profile.oauth_provider||'None')],['Last login',esc(fmtTime(profile.last_login))],['Member since',esc(fmtTime(profile.created_at))]].map(([l,v])=>`
           <div style="display:flex;justify-content:space-between;font-size:.84rem"><span style="color:var(--muted)">${l}</span><span>${v}</span></div>`).join('')}
         </div>`;
       const totpEl = document.getElementById('totpStatus');
       if (profile.totp_enabled) {
         totpEl.innerHTML = `<p style="color:var(--green);font-size:.84rem;margin-bottom:14px">✓ 2FA is enabled.</p>
-          <div class="form-group" style="margin-bottom:10px"><label>TOTP code or password to disable</label><input type="text" id="disableTotpCode" style="width:100%"/></div>
-          <button class="btn btn-danger" onclick="disableTotp()">Disable 2FA</button>`;
+          <div class="form-group" style="margin-bottom:10px"><label>Current password</label><input type="password" id="disableTotpPassword" autocomplete="current-password" style="width:100%"/></div>
+          <div class="form-group" style="margin-bottom:10px"><label>Current 6-digit code</label><input type="text" id="disableTotpCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6" style="width:100%"/></div>
+          <button class="btn btn-danger" onclick="disableTotp()">Disable 2FA</button>
+          <a href="/totp/setup" class="btn btn-secondary" style="margin-left:8px">Move 2FA to a new device</a>`;
       } else {
         totpEl.innerHTML = `<p style="color:var(--muted);font-size:.84rem;margin-bottom:14px">2FA is not enabled.</p>
           <a href="/totp/setup" class="btn btn-primary">Set Up 2FA</a>`;
@@ -2770,12 +2885,17 @@
   }
 
   async function disableTotp() {
-    const val = document.getElementById('disableTotpCode').value.trim();
-    const body = val.length===6 && /^\d+$/.test(val) ? {totp_code:val} : {password:val};
+    // Both are required: the password alone, or a code alone, does not switch 2FA off.
+    const body = {
+      password: document.getElementById('disableTotpPassword').value,
+      totp_code: document.getElementById('disableTotpCode').value.trim(),
+    };
+    if (!body.password || !/^\d{6}$/.test(body.totp_code)) { toast('Enter your password and a current 6-digit code', 'error'); return; }
     const res = await fetch('/api/settings/totp/disable', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
     const data = await res.json();
-    if (data.ok) { toast('2FA disabled'); loadSettings(); }
-    else toast(data.error||'Invalid code','error');
+    // 2FA is mandatory, so the next step is enrolling again.
+    if (data.ok) { toast('2FA disabled'); window.location.href = '/totp/setup'; }
+    else toast(data.error||'Invalid password or code','error');
   }
 
   // ── Investigations ─────────────────────────────────────────────────────────
@@ -2793,7 +2913,8 @@
     div.innerHTML = `
       <span style="font-size:.75rem;font-weight:600;color:${colors[type]};width:62px;flex-shrink:0">${labels[type]}</span>
       <input type="text" data-type="${type}" style="flex:1;max-width:360px" placeholder="${placeholders[type]}"/>
-      <button class="btn btn-danger" onclick="document.getElementById('${id}').remove()" style="padding:4px 10px">✕</button>`;
+      <button class="btn btn-danger" style="padding:4px 10px">✕</button>`;
+    div.querySelector('button').addEventListener('click', () => div.remove());
     document.getElementById('invTargets').appendChild(div);
     div.querySelector('input').focus();
   }
@@ -2889,15 +3010,15 @@
       el.innerHTML = `<table>
         <thead><tr><th>Name</th><th>Targets</th><th>Status</th><th>Created</th><th></th></tr></thead>
         <tbody>${invs.map(inv => `
-          <tr class="session-row" onclick="expandInvestigation(${inv.id})" id="inv-${inv.id}">
+          <tr class="session-row" ${act('expandInvestigation', inv.id)} id="inv-${esc(inv.id)}">
             <td><strong>${esc(inv.name)}</strong></td>
-            <td style="color:var(--muted)">${inv.target_count} target${inv.target_count !== 1 ? 's' : ''}</td>
-            <td><span class="status-badge status-${inv.status}">${inv.status}</span></td>
+            <td style="color:var(--muted)">${esc(inv.target_count)} target${inv.target_count !== 1 ? 's' : ''}</td>
+            <td><span class="status-badge status-${esc(inv.status)}">${esc(inv.status)}</span></td>
             <td class="time-cell">${fmtTime(inv.created_at)}</td>
-            <td><button class="btn btn-danger" onclick="event.stopPropagation();deleteInvestigation(${inv.id})" style="padding:3px 10px">✕</button></td>
+            <td><button class="btn btn-danger admin-only" ${act('deleteInvestigation', inv.id)} style="padding:3px 10px">✕</button></td>
           </tr>
-          <tr class="session-detail" id="inv-detail-${inv.id}">
-            <td colspan="5"><div class="session-detail-inner" id="inv-inner-${inv.id}"></div></td>
+          <tr class="session-detail" id="inv-detail-${esc(inv.id)}">
+            <td colspan="5"><div class="session-detail-inner" id="inv-inner-${esc(inv.id)}"></div></td>
           </tr>`).join('')}
         </tbody></table>`;
     } catch(e) {
@@ -2929,7 +3050,7 @@
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
         <span style="font-size:1.1rem">${typeIcons[t.target_type] || '🎯'}</span>
         <strong style="color:${typeColors[t.target_type] || 'var(--text)'}">${esc(t.value)}</strong>
-        <span style="font-size:.72rem;color:var(--muted)">${t.target_type}</span>
+        <span style="font-size:.72rem;color:var(--muted)">${esc(t.target_type)}</span>
         ${t.error ? `<span style="color:var(--yellow);font-size:.75rem">⚠ ${esc(t.error)}</span>` : ''}
       </div>`;
 
@@ -2944,7 +3065,7 @@
                 <strong style="color:var(--red)">${esc(b.breach_name)}</strong>
                 <span style="color:var(--muted);font-size:.75rem">${esc(b.breach_date)}</span>
               </div>
-              <div style="font-size:.75rem;color:var(--muted);margin-bottom:5px">${esc(b.description?.replace(/<[^>]+>/g,'').slice(0,200) || '')}</div>
+              <div style="font-size:.75rem;color:var(--muted);margin-bottom:5px">${esc(String(b.description||'').replace(/<[^>]+>/g,'').slice(0,200))}</div>
               <div style="display:flex;flex-wrap:wrap;gap:4px">
                 ${(b.data_classes||[]).map(dc => `<span style="background:rgba(248,81,73,.1);color:var(--red);border-radius:3px;padding:1px 6px;font-size:.7rem">${esc(dc)}</span>`).join('')}
               </div>
@@ -2962,7 +3083,7 @@
         ${t.darkweb_hits.slice(0,5).map(h => `
           <div style="background:rgba(240,136,62,.06);border:1px solid rgba(240,136,62,.2);border-radius:6px;padding:10px;margin-bottom:6px">
             <div style="font-family:var(--mono);font-size:.75rem;color:var(--accent);margin-bottom:4px">${esc(h.url)}</div>
-            <div style="font-size:.75rem;color:var(--muted);font-family:var(--mono)">${esc((h.context||'').slice(0,200))}</div>
+            <div style="font-size:.75rem;color:var(--muted);font-family:var(--mono)">${esc(String(h.context||'').slice(0,200))}</div>
             <div style="font-size:.7rem;color:var(--muted);margin-top:4px">${esc(h.found_at||'')}</div>
           </div>`).join('')}
         ${t.darkweb_hits.length > 5 ? `<p style="color:var(--muted);font-size:.75rem">…and ${t.darkweb_hits.length - 5} more</p>` : ''}
@@ -3032,17 +3153,17 @@
           const score = i.abuse_score ?? '—';
           const scoreColor = i.abuse_score >= 80 ? 'var(--red)' : i.abuse_score >= 30 ? 'var(--yellow)' : 'var(--green)';
           const vtColor = i.vt_malicious > 5 ? 'var(--red)' : i.vt_malicious > 0 ? 'var(--yellow)' : 'var(--green)';
-          return `<tr class="session-row" onclick="expandIPInvestigation(${i.id})" id="ipinv-${i.id}">
+          return `<tr class="session-row" ${act('expandIPInvestigation', i.id)} id="ipinv-${esc(i.id)}">
             <td style="font-family:var(--mono);font-weight:600">${esc(i.ip)}</td>
             <td>${esc(i.country || '—')}</td>
             <td style="color:var(--muted);font-size:.8rem">${esc(i.isp || '—')}</td>
-            <td><strong style="color:${scoreColor}">${score}%</strong></td>
-            <td><strong style="color:${vtColor}">${i.vt_malicious ?? '—'}</strong></td>
+            <td><strong style="color:${scoreColor}">${esc(score)}%</strong></td>
+            <td><strong style="color:${vtColor}">${esc(i.vt_malicious ?? '—')}</strong></td>
             <td class="time-cell">${fmtTime(i.created_at)}</td>
-            <td><button class="btn btn-danger" onclick="event.stopPropagation();deleteIPInv(${i.id})" style="padding:3px 10px">✕</button></td>
+            <td><button class="btn btn-danger admin-only" ${act('deleteIPInv', i.id)} style="padding:3px 10px">✕</button></td>
           </tr>
-          <tr class="session-detail" id="ipinv-detail-${i.id}">
-            <td colspan="7"><div class="session-detail-inner" id="ipinv-inner-${i.id}"></div></td>
+          <tr class="session-detail" id="ipinv-detail-${esc(i.id)}">
+            <td colspan="7"><div class="session-detail-inner" id="ipinv-inner-${esc(i.id)}"></div></td>
           </tr>`;
         }).join('')}</tbody></table>`;
     } catch(e) {
@@ -3084,7 +3205,7 @@
       const scoreColor = score >= 80 ? 'var(--red)' : score >= 30 ? 'var(--yellow)' : 'var(--green)';
       html += `
         <div style="text-align:center;margin-bottom:16px">
-          <div style="font-size:2.8rem;font-weight:800;color:${scoreColor}">${score}%</div>
+          <div style="font-size:2.8rem;font-weight:800;color:${scoreColor}">${esc(score)}%</div>
           <div style="color:var(--muted);font-size:.75rem">Abuse Confidence Score</div>
         </div>
         ${ipRow('IP', a.ip)}
@@ -3103,10 +3224,10 @@
           ${a.reports.slice(0,5).map(r => `
             <div style="background:var(--surface2);border-radius:5px;padding:8px;margin-bottom:5px;font-size:.76rem">
               <div style="display:flex;justify-content:space-between;margin-bottom:3px">
-                <span style="color:var(--red)">${(r.categories||[]).join(', ') || 'Unknown'}</span>
-                <span style="color:var(--muted)">${r.reporter_country || ''}</span>
+                <span style="color:var(--red)">${esc([].concat(r.categories||[]).join(', ') || 'Unknown')}</span>
+                <span style="color:var(--muted)">${esc(r.reporter_country || '')}</span>
               </div>
-              ${r.comment ? `<div style="color:var(--muted);font-family:var(--mono)">${esc(r.comment.slice(0,150))}</div>` : ''}
+              ${r.comment ? `<div style="color:var(--muted);font-family:var(--mono)">${esc(String(r.comment).slice(0,150))}</div>` : ''}
             </div>`).join('')}
         </div>`;
       }
@@ -3129,10 +3250,10 @@
       const malColor = mal > 5 ? 'var(--red)' : mal > 0 ? 'var(--yellow)' : 'var(--green)';
       html += `
         <div style="text-align:center;margin-bottom:16px">
-          <div style="font-size:2.8rem;font-weight:800;color:${malColor}">${mal}/${total}</div>
+          <div style="font-size:2.8rem;font-weight:800;color:${malColor}">${esc(mal)}/${esc(total)}</div>
           <div style="color:var(--muted);font-size:.75rem">Malicious Detections</div>
           <div style="font-size:.75rem;color:var(--muted);margin-top:2px">
-            ${sus} suspicious · ${stats.harmless||0} harmless · ${stats.undetected||0} undetected
+            ${esc(sus)} suspicious · ${esc(stats.harmless||0)} harmless · ${esc(stats.undetected||0)} undetected
           </div>
         </div>
         ${ipRow('ASN', v.asn ? `AS${v.asn} — ${v.as_owner||''}` : '—')}
@@ -3141,13 +3262,13 @@
         ${ipRow('Network', v.network || '—')}
         ${ipRow('Registry', v.regional_internet_registry || '—')}
         ${ipRow('Reputation', v.reputation !== undefined ? String(v.reputation) : '—')}
-        ${ipRow('JARM', v.jarm ? v.jarm.slice(0,24)+'…' : '—')}
-        ${v.tags?.length ? ipRow('Tags', v.tags.join(', ')) : ''}
+        ${ipRow('JARM', v.jarm ? String(v.jarm).slice(0,24)+'…' : '—')}
+        ${v.tags?.length ? ipRow('Tags', [].concat(v.tags).join(', ')) : ''}
         ${ipRow('Last Analysis', v.last_analysis_date ? fmtTime(v.last_analysis_date) : '—')}`;
 
       if (v.malicious_engines?.length) {
         html += `<div style="margin-top:12px">
-          <div style="font-size:.75rem;font-weight:600;color:var(--red);text-transform:uppercase;margin-bottom:8px">Flagged by ${v.malicious_engines.length} engine(s)</div>
+          <div style="font-size:.75rem;font-weight:600;color:var(--red);text-transform:uppercase;margin-bottom:8px">Flagged by ${esc(v.malicious_engines.length)} engine(s)</div>
           ${v.malicious_engines.slice(0,8).map(e => `
             <div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border);font-size:.76rem">
               <span>${esc(e.engine)}</span>
@@ -3171,7 +3292,7 @@
     // ── Resolutions ──
     if (v.resolutions?.length) {
       html += `<div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;margin-top:4px">
-        <div style="font-size:.8rem;font-weight:600;margin-bottom:10px">📡 Historical DNS Resolutions (${v.resolutions.length})</div>
+        <div style="font-size:.8rem;font-weight:600;margin-bottom:10px">📡 Historical DNS Resolutions (${esc(v.resolutions.length)})</div>
         <table style="font-size:.78rem">
           <thead><tr><th>Hostname</th><th>Date</th></tr></thead>
           <tbody>${v.resolutions.slice(0,15).map(r => `<tr>
@@ -3185,14 +3306,14 @@
     // ── Communicating files ──
     if (v.communicating_files?.length) {
       html += `<div style="background:var(--bg);border:1px solid rgba(248,81,73,.25);border-radius:8px;padding:14px;margin-top:8px">
-        <div style="font-size:.8rem;font-weight:600;color:var(--red);margin-bottom:10px">⚠ Malware communicating with this IP (${v.communicating_files.length} samples)</div>
+        <div style="font-size:.8rem;font-weight:600;color:var(--red);margin-bottom:10px">⚠ Malware communicating with this IP (${esc(v.communicating_files.length)} samples)</div>
         <table style="font-size:.76rem">
           <thead><tr><th>Name</th><th>Type</th><th>SHA256</th><th>Malicious</th></tr></thead>
           <tbody>${v.communicating_files.map(f => `<tr>
             <td style="color:var(--red)">${esc(f.name||'unknown')}</td>
             <td style="color:var(--muted)">${esc(f.type||'—')}</td>
-            <td style="font-family:var(--mono);font-size:.7rem;color:var(--muted)">${(f.sha256||'').slice(0,16)}…</td>
-            <td style="color:${f.malicious>0?'var(--red)':'var(--muted)'}">${f.malicious||0}</td>
+            <td style="font-family:var(--mono);font-size:.7rem;color:var(--muted)">${esc(String(f.sha256||'').slice(0,16))}…</td>
+            <td style="color:${f.malicious>0?'var(--red)':'var(--muted)'}">${esc(f.malicious||0)}</td>
           </tr>`).join('')}</tbody>
         </table>
       </div>`;
@@ -3212,8 +3333,8 @@
   function ipRow(label, value, style = '') {
     if (!value || value === '—' || value === 'undefined') return '';
     return `<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border);font-size:.8rem">
-      <span style="color:var(--muted)">${label}</span>
-      <span style="text-align:right;max-width:60%;word-break:break-all;${style}">${esc(String(value))}</span>
+      <span style="color:var(--muted)">${esc(label)}</span>
+      <span style="text-align:right;max-width:60%;word-break:break-all;${esc(style)}">${esc(String(value))}</span>
     </div>`;
   }
 
@@ -3251,7 +3372,7 @@
   function renderRansomware() {
     const q = (document.getElementById('rwSearch')?.value || '').toLowerCase();
     let data = rwData.filter(g => {
-      if (q && !g.name.toLowerCase().includes(q) && !g.description.toLowerCase().includes(q)) return false;
+      if (q && !String(g.name||'').toLowerCase().includes(q) && !String(g.description||'').toLowerCase().includes(q)) return false;
       if (rwRiskFilter === 'critical') return g.risk_level === 'critical';
       if (rwRiskFilter === 'high') return g.risk_level === 'high';
       if (rwRiskFilter === 'disrupted') return g.status === 'disrupted';
@@ -3264,7 +3385,7 @@
     grid.innerHTML = data.map((g, i) => {
       _intelCache['rw_'+i] = g;
       return `
-      <div class="intel-card risk-${g.risk_level}" onclick="openIntelDetail('rw_${i}')" style="cursor:pointer">
+      <div class="intel-card risk-${esc(g.risk_level)}" ${act('openIntelDetail', 'rw_' + i)} style="cursor:pointer">
         <div class="intel-card-header">
           <div style="flex:1;min-width:0">
             <div class="intel-card-name">${esc(g.name)}${g.is_custom ? ' <span style="font-size:.6rem;color:var(--accent);font-weight:400">[custom]</span>' : ''}</div>
@@ -3272,19 +3393,19 @@
           </div>
           <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;margin-left:8px">
             ${lastSeenBadge(g.last_seen)}
-            ${g.is_custom ? `<button class="btn btn-secondary" style="font-size:.65rem;padding:2px 7px;color:var(--red);border-color:rgba(248,81,73,.3)" onclick="event.stopPropagation();deleteIntel('ransomware','${g.slug}')">Delete</button>` : ''}
+            ${g.is_custom ? `<button class="btn btn-secondary admin-only" style="font-size:.65rem;padding:2px 7px;color:var(--red);border-color:rgba(248,81,73,.3)" ${act('deleteIntel', 'ransomware', g.slug)}>Delete</button>` : ''}
           </div>
         </div>
         <div class="intel-badges">
-          <span class="intel-badge badge-${g.risk_level}">${g.risk_level.toUpperCase()}</span>
-          <span class="intel-badge badge-${g.status}">${g.status.toUpperCase()}</span>
+          <span class="intel-badge badge-${esc(g.risk_level)}">${esc(String(g.risk_level||'').toUpperCase())}</span>
+          <span class="intel-badge badge-${esc(g.status)}">${esc(String(g.status||'').toUpperCase())}</span>
           ${g.targeting_sea ? '<span class="intel-badge badge-sea">🌏 SEA</span>' : ''}
-          ${g.sea_victims?.length ? `<span class="intel-badge badge-high">⚠ ${g.sea_victims.length} victim${g.sea_victims.length > 1 ? 's' : ''}</span>` : ''}
+          ${g.sea_victims?.length ? `<span class="intel-badge badge-high">⚠ ${esc(g.sea_victims.length)} victim${g.sea_victims.length > 1 ? 's' : ''}</span>` : ''}
         </div>
-        <div class="intel-desc">${esc(g.description.length > 160 ? g.description.slice(0,160)+'…' : g.description)}</div>
-        <div class="intel-ttps">${(g.ttps||[]).slice(0,4).map(t => `<span class="ttp-tag">${esc(t)}</span>`).join('')}${(g.ttps||[]).length > 4 ? `<span class="ttp-tag" style="color:var(--accent)">+${g.ttps.length-4} more</span>` : ''}</div>
+        <div class="intel-desc">${esc(String(g.description||'').length > 160 ? String(g.description).slice(0,160)+'…' : g.description)}</div>
+        <div class="intel-ttps">${(g.ttps||[]).slice(0,4).map(t => `<span class="ttp-tag">${esc(t)}</span>`).join('')}${(g.ttps||[]).length > 4 ? `<span class="ttp-tag" style="color:var(--accent)">+${esc(g.ttps.length-4)} more</span>` : ''}</div>
         <div class="intel-hits">
-          <span class="intel-hit-count ${g.hit_count > 0 ? 'has-hits' : ''}">${g.hit_count}</span>
+          <span class="intel-hit-count ${g.hit_count > 0 ? 'has-hits' : ''}">${esc(g.hit_count)}</span>
           <span>keyword hits</span>
           <span style="margin-left:auto;font-size:.7rem;color:var(--accent)">Click to expand →</span>
         </div>
@@ -3319,6 +3440,7 @@
   // ── Last Seen Badge ────────────────────────────────────────────────────────
   function lastSeenBadge(isoDate) {
     if (!isoDate) return '<span class="last-seen-badge last-seen-old">No hits</span>';
+    isoDate = String(isoDate);
     const days = Math.floor((Date.now() - new Date(isoDate + (isoDate.includes('T') ? '' : 'T00:00:00Z'))) / 86400000);
     if (days <= 7) return `<span class="last-seen-badge last-seen-fresh">🟢 ${days === 0 ? 'Today' : days + 'd ago'}</span>`;
     if (days <= 30) return `<span class="last-seen-badge last-seen-recent">🟡 ${days}d ago</span>`;
@@ -3339,8 +3461,8 @@
       : `🌍 ${d.origin} · ${typeIcon[d.type] || '👤'} ${d.type} · Since ${d.first_seen || '?'}`;
     // Badges
     const badgeHtml = [
-      `<span class="intel-badge badge-${d.risk_level}">${d.risk_level.toUpperCase()}</span>`,
-      `<span class="intel-badge badge-${d.status === 'active' ? 'active' : 'disrupted'}">${d.status.toUpperCase()}</span>`,
+      `<span class="intel-badge badge-${esc(d.risk_level)}">${esc(String(d.risk_level||'').toUpperCase())}</span>`,
+      `<span class="intel-badge badge-${d.status === 'active' ? 'active' : 'disrupted'}">${esc(String(d.status||'').toUpperCase())}</span>`,
       d.targeting_sea ? '<span class="intel-badge badge-sea">🌏 SEA</span>' : '',
       d.type ? `<span class="intel-badge badge-type">${esc(d.type)}</span>` : '',
     ].filter(Boolean).join('');
@@ -3404,7 +3526,7 @@
     html += `<div class="intel-modal-section">
       <div class="intel-modal-section-title">
         📡 Database Hits
-        <span style="margin-left:8px;font-size:.8rem;font-weight:400;color:${d.hit_count > 0 ? 'var(--red)' : 'var(--muted)'}">${d.hit_count} total · ${lastSeenBadge(d.last_seen)}</span>
+        <span style="margin-left:8px;font-size:.8rem;font-weight:400;color:${d.hit_count > 0 ? 'var(--red)' : 'var(--muted)'}">${esc(d.hit_count)} total · ${lastSeenBadge(d.last_seen)}</span>
       </div>`;
     if (d.recent_hits?.length) {
       html += `<table class="intel-modal-hits-table">
@@ -3412,7 +3534,7 @@
         <tbody>${d.recent_hits.map(h => `
           <tr>
             <td><span style="color:var(--accent);font-family:var(--mono);font-size:.72rem">${esc(h.keyword)}</span></td>
-            <td style="white-space:nowrap;color:var(--muted)">${h.found_at ? new Date(h.found_at+'Z').toLocaleDateString() : '—'}</td>
+            <td style="white-space:nowrap;color:var(--muted)">${h.found_at ? esc(new Date(h.found_at+'Z').toLocaleDateString()) : '—'}</td>
             <td class="hit-url">${esc(h.url)}</td>
           </tr>
           ${h.context ? `<tr><td colspan="3" class="hit-context" style="padding-top:0;padding-bottom:8px">${esc(h.context)}</td></tr>` : ''}
@@ -3439,7 +3561,7 @@
   // ── Delete Custom Intel ────────────────────────────────────────────────────
   async function deleteIntel(type, slug) {
     if (!confirm(`Delete this custom entry? This cannot be undone.`)) return;
-    const url = type === 'ransomware' ? `/api/ransomware/groups/${slug}` : `/api/threat-actors/${slug}`;
+    const url = type === 'ransomware' ? `/api/ransomware/groups/${encodeURIComponent(slug)}` : `/api/threat-actors/${encodeURIComponent(slug)}`;
     const res = await fetch(url, { method: 'DELETE' });
     const d = await res.json();
     if (d.ok) {
@@ -3635,7 +3757,7 @@
   function renderThreatActors() {
     const q = (document.getElementById('taSearch')?.value || '').toLowerCase();
     let data = taData.filter(a => {
-      if (q && !a.name.toLowerCase().includes(q) && !a.description.toLowerCase().includes(q) && !(a.aliases||[]).join(' ').toLowerCase().includes(q)) return false;
+      if (q && !String(a.name||'').toLowerCase().includes(q) && !String(a.description||'').toLowerCase().includes(q) && ![].concat(a.aliases||[]).join(' ').toLowerCase().includes(q)) return false;
       if (taTypeFilter === 'nation-state') return a.type === 'nation-state';
       if (taTypeFilter === 'cybercriminal') return a.type === 'cybercriminal';
       if (taTypeFilter === 'hacktivist') return a.type === 'hacktivist';
@@ -3649,7 +3771,7 @@
     grid.innerHTML = data.map((a, i) => {
       _intelCache['ta_'+i] = a;
       return `
-      <div class="intel-card risk-${a.risk_level}" onclick="openIntelDetail('ta_${i}')" style="cursor:pointer">
+      <div class="intel-card risk-${esc(a.risk_level)}" ${act('openIntelDetail', 'ta_' + i)} style="cursor:pointer">
         <div class="intel-card-header">
           <div style="flex:1;min-width:0">
             <div class="intel-card-name">${esc(a.name)}${a.is_custom ? ' <span style="font-size:.6rem;color:var(--accent);font-weight:400">[custom]</span>' : ''}</div>
@@ -3657,20 +3779,20 @@
           </div>
           <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;margin-left:8px">
             ${lastSeenBadge(a.last_seen)}
-            ${a.is_custom ? `<button class="btn btn-secondary" style="font-size:.65rem;padding:2px 7px;color:var(--red);border-color:rgba(248,81,73,.3)" onclick="event.stopPropagation();deleteIntel('threat-actor','${a.slug}')">Delete</button>` : ''}
+            ${a.is_custom ? `<button class="btn btn-secondary admin-only" style="font-size:.65rem;padding:2px 7px;color:var(--red);border-color:rgba(248,81,73,.3)" ${act('deleteIntel', 'threat-actor', a.slug)}>Delete</button>` : ''}
           </div>
         </div>
         <div class="intel-badges">
-          <span class="intel-badge badge-${a.risk_level}">${a.risk_level.toUpperCase()}</span>
+          <span class="intel-badge badge-${esc(a.risk_level)}">${esc(String(a.risk_level||'').toUpperCase())}</span>
           <span class="intel-badge badge-type">${esc(a.type)}</span>
-          <span class="intel-badge badge-${a.status === 'active' ? 'active' : 'disrupted'}">${a.status.toUpperCase()}</span>
+          <span class="intel-badge badge-${a.status === 'active' ? 'active' : 'disrupted'}">${esc(String(a.status||'').toUpperCase())}</span>
           ${a.targeting_sea ? '<span class="intel-badge badge-sea">🌏 SEA</span>' : ''}
         </div>
-        ${a.aliases?.length ? `<div style="font-size:.71rem;color:var(--muted);margin-bottom:6px">Also known as: ${a.aliases.slice(0,3).map(al => esc(al)).join(', ')}${a.aliases.length > 3 ? ' +' + (a.aliases.length-3) + ' more' : ''}</div>` : ''}
-        <div class="intel-desc">${esc(a.description.length > 160 ? a.description.slice(0,160)+'…' : a.description)}</div>
-        <div class="intel-ttps">${(a.ttps||[]).slice(0,4).map(t => `<span class="ttp-tag">${esc(t)}</span>`).join('')}${(a.ttps||[]).length > 4 ? `<span class="ttp-tag" style="color:var(--accent)">+${a.ttps.length-4} more</span>` : ''}</div>
+        ${a.aliases?.length ? `<div style="font-size:.71rem;color:var(--muted);margin-bottom:6px">Also known as: ${a.aliases.slice(0,3).map(al => esc(al)).join(', ')}${a.aliases.length > 3 ? ' +' + esc(a.aliases.length-3) + ' more' : ''}</div>` : ''}
+        <div class="intel-desc">${esc(String(a.description||'').length > 160 ? String(a.description).slice(0,160)+'…' : a.description)}</div>
+        <div class="intel-ttps">${(a.ttps||[]).slice(0,4).map(t => `<span class="ttp-tag">${esc(t)}</span>`).join('')}${(a.ttps||[]).length > 4 ? `<span class="ttp-tag" style="color:var(--accent)">+${esc(a.ttps.length-4)} more</span>` : ''}</div>
         <div class="intel-hits">
-          <span class="intel-hit-count ${a.hit_count > 0 ? 'has-hits' : ''}">${a.hit_count}</span>
+          <span class="intel-hit-count ${a.hit_count > 0 ? 'has-hits' : ''}">${esc(a.hit_count)}</span>
           <span>keyword hits</span>
           <span style="margin-left:auto;font-size:.7rem;color:var(--accent)">Click to expand →</span>
         </div>
@@ -3692,7 +3814,7 @@
       el.innerHTML = subs.map(s => `
         <div class="subscriber-row">
           <span style="font-family:var(--mono)">${esc(s)}</span>
-          <button class="btn btn-secondary" style="font-size:.72rem;padding:3px 10px;color:var(--red);border-color:rgba(248,81,73,.3)" onclick="removeSubscriber('${esc(s)}')">Remove</button>
+          <button class="btn btn-secondary" style="font-size:.72rem;padding:3px 10px;color:var(--red);border-color:rgba(248,81,73,.3)" ${act('removeSubscriber', s)}>Remove</button>
         </div>
       `).join('');
     } catch(e) { /* not admin */ }
@@ -3759,16 +3881,16 @@
         return;
       }
       el.innerHTML = '<div style="padding:14px 20px">' + data.map(r => `
-        <div onclick="loadDNSResult(${r.id})" style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:8px;cursor:pointer;display:flex;align-items:center;gap:12px;transition:border-color .15s;" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
+        <div ${act('loadDNSResult', r.id)} style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:8px;cursor:pointer;display:flex;align-items:center;gap:12px;transition:border-color .15s;" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
           <div style="flex:1">
             <div style="font-weight:700;font-family:var(--mono);font-size:.9rem">${esc(r.domain)}</div>
-            <div style="font-size:.73rem;color:var(--muted);margin-top:3px">${fmtTime(r.created_at)} &nbsp;·&nbsp; ${r.subdomain_count ?? '?'} subdomains &nbsp;·&nbsp; ${r.resolved_count ?? '?'} resolved</div>
+            <div style="font-size:.73rem;color:var(--muted);margin-top:3px">${fmtTime(r.created_at)} &nbsp;·&nbsp; ${esc(r.subdomain_count ?? '?')} subdomains &nbsp;·&nbsp; ${esc(r.resolved_count ?? '?')} resolved</div>
           </div>
           ${r.zone_transfer_success ? '<span class="rc rc-crit">⚠ ZONE XFR</span>' : ''}
           <span class="rc ${r.has_spf?'rc-ok':'rc-warn'}">${r.has_spf?'✓ SPF':'✗ SPF'}</span>
           <span class="rc ${r.has_dmarc?'rc-ok':'rc-warn'}">${r.has_dmarc?'✓ DMARC':'✗ DMARC'}</span>
-          <span class="dns-badge-${r.status==='complete'?'ok':r.status==='running'?'warn':'fail'}" style="font-size:.72rem;font-weight:700">${r.status.toUpperCase()}</span>
-          <button class="btn btn-secondary" style="font-size:.7rem;padding:3px 8px;color:var(--red)" onclick="event.stopPropagation();deleteDNS(${r.id})">✕</button>
+          <span class="dns-badge-${r.status==='complete'?'ok':r.status==='running'?'warn':'fail'}" style="font-size:.72rem;font-weight:700">${esc(String(r.status||'').toUpperCase())}</span>
+          <button class="btn btn-secondary admin-only" style="font-size:.7rem;padding:3px 8px;color:var(--red)" ${act('deleteDNS', r.id)}>✕</button>
         </div>`).join('') + '</div>';
     } catch(e) {
       el.innerHTML = '<div class="empty"><div class="icon">⚠️</div><p>Failed to load history.</p></div>';
@@ -3813,7 +3935,7 @@
             renderDNSResult(data);
           } catch(renderErr) {
             console.error('renderDNSResult failed:', renderErr);
-            el.innerHTML = '<div class="empty" style="padding:60px 0"><div class="icon">⚠️</div><p>Render error: ' + renderErr.message + '</p><pre style="font-size:.7rem;color:var(--muted);text-align:left;padding:10px">' + renderErr.stack + '</pre></div>';
+            el.innerHTML = '<div class="empty" style="padding:60px 0"><div class="icon">⚠️</div><p>Render error: ' + esc(renderErr.message) + '</p><pre style="font-size:.7rem;color:var(--muted);text-align:left;padding:10px">' + esc(renderErr.stack) + '</pre></div>';
           }
         } else if (data.status === 'error') {
           clearInterval(dnsPolling); clearInterval(stepTimer);
@@ -3887,9 +4009,9 @@
       <div style="margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <code style="font-size:.9rem;font-weight:700;color:var(--accent)">${esc(data.domain)}</code>
         <span style="font-size:.73rem;color:var(--muted)">${fmtTime(data.created_at)}</span>
-        <button class="btn btn-secondary" style="font-size:.75rem;padding:4px 10px" id="portScanBtn" onclick="triggerPortScan(${data.id})">${hasScanData ? '↺ Re-Scan Ports/Dirs' : '🔌 Scan Ports & Dirs'}</button>
-        <button class="btn btn-secondary" style="font-size:.75rem;padding:4px 10px" id="ddEnrichBtn" onclick="triggerDNSDumpsterEnrich(${data.id})">🔍 Enrich w/ DNSDumpster</button>
-        <button class="btn btn-primary" style="font-size:.75rem;padding:4px 10px" onclick="exportDNSpdf(${data.id},'${esc(data.domain)}')">⬇ PDF</button>
+        <button class="btn btn-secondary" style="font-size:.75rem;padding:4px 10px" id="portScanBtn" ${act('triggerPortScan', data.id)}>${hasScanData ? '↺ Re-Scan Ports/Dirs' : '🔌 Scan Ports &amp; Dirs'}</button>
+        <button class="btn btn-secondary" style="font-size:.75rem;padding:4px 10px" id="ddEnrichBtn" ${act('triggerDNSDumpsterEnrich', data.id)}>🔍 Enrich w/ DNSDumpster</button>
+        <button class="btn btn-primary" style="font-size:.75rem;padding:4px 10px" ${act('exportDNSpdf', data.id, data.domain)}>⬇ PDF</button>
         <button class="btn btn-secondary" style="font-size:.75rem;padding:4px 10px" onclick="showDNSHistory()">← Back</button>
       </div>
     </div>`;
@@ -3924,6 +4046,13 @@
     return h;
   }
 
+
+  // Flag emoji for a two-letter country code; '' for anything else.
+  function flagEmoji(cc) {
+    cc = String(cc || '').toUpperCase();
+    if (!/^[A-Z]{2}$/.test(cc)) return '';
+    return cc.split('').map(c => String.fromCodePoint(c.charCodeAt(0) + 127397)).join('');
+  }
 
   // ── DNSDumpster-style Infrastructure Panel ──────────────────────────────────
   function buildInfraPanel(domain, dns, resolved, bruteforce, ipGeo, services, mainIPs) {
@@ -3990,7 +4119,7 @@
     const jvmMarkers = activeCountries
       .filter(cc => markerLatLng[cc])
       .map(cc => ({
-        name: `${countryNames[cc]||cc}: ${countryCounts[cc]} IP(s)`,
+        name: `${String(countryNames[cc]||cc).replace(/[<>&"']/g, '')}: ${countryCounts[cc]} IP(s)`,
         coords: markerLatLng[cc],
         style: { fill: '#4a90d9' }
       }));
@@ -3999,9 +4128,7 @@
       .map(cc => cc.toLowerCase())
       .filter(cc => cc.length === 2);
 
-    const flagRow = activeCountries.slice(0,8).map(cc =>
-      cc.split('').map(c=>String.fromCodePoint(c.charCodeAt(0)+127397)).join('')
-    ).join(' ');
+    const flagRow = esc(activeCountries.slice(0,8).map(flagEmoji).filter(Boolean).join(' '));
 
     // Store for initInfraMap() called after DOM injection
     window._jvmMarkers = jvmMarkers;
@@ -4010,9 +4137,9 @@
     // ── ASN bars ──
     const asnBars = topOrgs.map(([org, cnt]) => `
       <div class="asn-bar-row">
-        <div class="asn-bar-label" title="${esc(org)}">${esc(org.replace(/^AS\d+\s*/,'').slice(0,22))}</div>
+        <div class="asn-bar-label" title="${esc(org)}">${esc(String(org).replace(/^AS\d+\s*/,'').slice(0,22))}</div>
         <div class="asn-bar-track"><div class="asn-bar-fill" style="width:${Math.round(cnt/maxOrg*100)}%"></div></div>
-        <div class="asn-bar-count">${cnt}</div>
+        <div class="asn-bar-count">${esc(cnt)}</div>
       </div>`).join('');
 
     // ── Services donut SVG ──
@@ -4029,13 +4156,13 @@
         const xi1=cx+r*Math.cos(startAngle-angle), yi1=cy+r*Math.sin(startAngle-angle);
         const xi2=cx+r*Math.cos(startAngle), yi2=cy+r*Math.sin(startAngle);
         const large = angle > Math.PI ? 1 : 0;
-        return `<path d="M${x1.toFixed(1)},${y1.toFixed(1)} A${R},${R} 0 ${large},1 ${x2.toFixed(1)},${y2.toFixed(1)} L${xi2.toFixed(1)},${yi2.toFixed(1)} A${r},${r} 0 ${large},0 ${xi1.toFixed(1)},${yi1.toFixed(1)} Z" fill="${svcColors[i%svcColors.length]}"><title>${name}: ${cnt}</title></path>`;
+        return `<path d="M${x1.toFixed(1)},${y1.toFixed(1)} A${R},${R} 0 ${large},1 ${x2.toFixed(1)},${y2.toFixed(1)} L${xi2.toFixed(1)},${yi2.toFixed(1)} A${r},${r} 0 ${large},0 ${xi1.toFixed(1)},${yi1.toFixed(1)} Z" fill="${svcColors[i%svcColors.length]}"><title>${esc(name)}: ${esc(cnt)}</title></path>`;
       });
       donutSvg = `<svg width="84" height="84" class="svc-donut"><g>${slices.join('')}</g></svg>`;
     }
 
     const svcRows = topSvcs.map(([name,cnt],i) =>
-      `<div class="svc-row"><span class="svc-name" style="color:${svcColors[i%svcColors.length]}">${esc(name)}</span><span class="svc-cnt">${cnt}</span></div>`
+      `<div class="svc-row"><span class="svc-name" style="color:${svcColors[i%svcColors.length]}">${esc(name)}</span><span class="svc-cnt">${esc(cnt)}</span></div>`
     ).join('');
 
     // ── A Records table ──
@@ -4057,11 +4184,11 @@
         svcData.server && svcData.server !== 'unknown' ? svcData.server : '',
         ...(svcData.tech||[])
       ])].filter(Boolean).map(t => `<span class="svc-badge">${esc(t)}</span>`).join('');
-      const status = svcData.status_code ? `<span style="font-size:.68rem;color:var(--muted)">${svcData.status_code}</span>` : '';
-      const title = svcData.title ? `<div style="font-size:.67rem;color:var(--muted);margin-top:2px">${esc(svcData.title.slice(0,50))}</div>` : '';
-      const asn = geo.as || '';
+      const status = svcData.status_code ? `<span style="font-size:.68rem;color:var(--muted)">${esc(svcData.status_code)}</span>` : '';
+      const title = svcData.title ? `<div style="font-size:.67rem;color:var(--muted);margin-top:2px">${esc(String(svcData.title).slice(0,50))}</div>` : '';
+      const asn = String(geo.as || '');
       const asnShort = asn.replace(/^AS\d+\s*/,'').slice(0,20);
-      const flag = geo.countryCode ? geo.countryCode.split('').map(c=>String.fromCodePoint(c.charCodeAt(0)+127397)).join('') : '';
+      const flag = esc(flagEmoji(geo.countryCode));
       return `<tr>
         <td style="font-family:var(--mono);font-size:.76rem">${esc(sub.subdomain)}</td>
         <td style="font-family:var(--mono);font-size:.74rem;color:var(--accent)">${ips.map(ip=>`<div>${esc(ip)}</div>`).join('')}</td>
@@ -4146,10 +4273,7 @@
           hover:   { fill: '#79c0ff', r: 8 }
         },
         selectedRegions: window._jvmRegions || [],
-        markers: window._jvmMarkers || [],
-        onMarkerTooltipShow(e, tooltip, index) {
-          tooltip.text(tooltip.text(), true);
-        }
+        markers: window._jvmMarkers || []
       });
     } catch(err) {
       console.warn('jsVectorMap init failed:', err);
@@ -4288,8 +4412,8 @@
     if (!allSubs.length) return h + '<div class="empty" style="padding:32px 0"><div class="icon">🔎</div><p>No subdomains found</p></div>';
 
     h += `<table class="sub-tbl"><thead><tr><th>Subdomain</th><th>IP(s)</th><th>Location</th><th>Source</th></tr></thead><tbody>`;
-    for (const s of allSubs.sort((a,b)=>a.subdomain.localeCompare(b.subdomain))) {
-      const ips = (s.ips||[]).join(', ');
+    for (const s of allSubs.sort((a,b)=>String(a.subdomain).localeCompare(String(b.subdomain)))) {
+      const ips = [].concat(s.ips||[]).join(', ');
       const srcs = [...(s.sources||new Set(['passive']))];
       const srcBadges = srcs.map(src => {
         if (src==='brute') return `<span class="sub-src sub-src-brute">brute-force</span>`;
@@ -4298,7 +4422,7 @@
       }).join(' ');
       h += `<tr><td style="font-family:var(--mono);font-size:.79rem">${esc(s.subdomain)}</td>
         <td style="font-family:var(--mono);font-size:.76rem;color:var(--accent)">${esc(ips)||'—'}</td>
-        <td style="font-size:.74rem;color:var(--muted)">${geoStr(s.geo)}</td>
+        <td style="font-size:.74rem;color:var(--muted)">${esc(geoStr(s.geo))}</td>
         <td>${srcBadges}</td></tr>`;
     }
     h += '</tbody></table>';
@@ -4309,7 +4433,7 @@
         const rows = (info.records||[]).slice(0,100).map(rec =>
           `<tr><td style="font-family:var(--mono);font-size:.74rem">${esc(rec.name)}</td><td><span class="rc rc-info" style="font-size:.65rem">${esc(rec.type)}</span></td><td style="font-family:var(--mono);font-size:.72rem">${esc(rec.value)}</td></tr>`
         ).join('');
-        h += infraSec(`🚨 Zone Transfer — ${esc(ns)} (${info.record_count} records leaked)`,
+        h += infraSec(`🚨 Zone Transfer — ${esc(ns)} (${esc(info.record_count)} records leaked)`,
           `<p style="color:var(--red);font-size:.8rem;font-weight:600;margin-bottom:8px">Restrict AXFR to authorised nameservers immediately.</p>
            <table class="sub-tbl"><thead><tr><th>Name</th><th>Type</th><th>Value</th></tr></thead><tbody>${rows}</tbody></table>`);
       }
@@ -4325,8 +4449,8 @@
         <div style="font-size:2rem;margin-bottom:12px">🔌</div>
         <div style="font-weight:600;margin-bottom:6px">Port scan not yet run</div>
         <div style="color:var(--muted);font-size:.83rem;margin-bottom:16px">Click the button below to actively scan all resolved IPs for open ports.</div>
-        <button class="btn btn-primary" onclick="triggerPortScan(${_dnsCurrent?.id})">🔌 Run Port Scan</button>
-        <div style="margin-top:10px;font-size:.75rem;color:var(--muted)">Scans ${mainIPs.length} IPs across 30 common ports</div>
+        <button class="btn btn-primary" ${act('triggerPortScan', _dnsCurrent?.id)}>🔌 Run Port Scan</button>
+        <div style="margin-top:10px;font-size:.75rem;color:var(--muted)">Scans ${esc(mainIPs.length)} IPs across 30 common ports</div>
       </div>`;
     }
 
@@ -4338,19 +4462,19 @@
         <div class="is-hdr" onclick="toggleIS(this)">
           <span class="is-title">
             <code style="color:var(--accent)">${esc(ip)}</code>
-            <span class="rc rc-ok">${open.length} open</span>
-            ${filtered.length?`<span class="rc rc-warn">${filtered.length} filtered</span>`:''}
+            <span class="rc rc-ok">${esc(open.length)} open</span>
+            ${filtered.length?`<span class="rc rc-warn">${esc(filtered.length)} filtered</span>`:''}
           </span>
           <span style="color:var(--muted);font-size:.8rem">▾</span>
         </div>
         <div class="is-body">
           <div class="port-heatmap">
-            ${ports.map(p=>`<div class="port-cell ${p.status}" title="${p.service} (${p.status})">
-              <div class="pn">${p.port}</div>
-              <div class="ps">${p.service}</div>
+            ${ports.map(p=>`<div class="port-cell ${esc(p.status)}" title="${esc(p.service)} (${esc(p.status)})">
+              <div class="pn">${esc(p.port)}</div>
+              <div class="ps">${esc(p.service)}</div>
             </div>`).join('')}
           </div>
-          ${open.length?`<div style="margin-top:10px"><span style="font-size:.77rem;font-weight:600;color:var(--green)">Open ports: </span><span style="font-family:var(--mono);font-size:.77rem">${open.map(p=>`${p.port}/${p.service}`).join(', ')}</span></div>`:''}
+          ${open.length?`<div style="margin-top:10px"><span style="font-size:.77rem;font-weight:600;color:var(--green)">Open ports: </span><span style="font-family:var(--mono);font-size:.77rem">${esc(open.map(p=>`${p.port}/${p.service}`).join(', '))}</span></div>`:''}
         </div>
       </div>`;
     }
@@ -4364,8 +4488,8 @@
       return `<div style="text-align:center;padding:40px 20px">
         <div style="font-size:2rem;margin-bottom:12px">📂</div>
         <div style="font-weight:600;margin-bottom:6px">Directory enumeration not yet run</div>
-        <div style="color:var(--muted);font-size:.83rem;margin-bottom:16px">Probes ${domain} and its IPs for exposed paths using a 70-entry wordlist.</div>
-        <button class="btn btn-primary" onclick="triggerPortScan(${_dnsCurrent?.id})">📂 Run Dir Enum</button>
+        <div style="color:var(--muted);font-size:.83rem;margin-bottom:16px">Probes ${esc(domain)} and its IPs for exposed paths using a 70-entry wordlist.</div>
+        <button class="btn btn-primary" ${act('triggerPortScan', _dnsCurrent?.id)}>📂 Run Dir Enum</button>
       </div>`;
     }
     let h = '';
@@ -4376,13 +4500,13 @@
         const sc = p.status_code;
         const cls = sc===200?'status-200':sc>=300&&sc<400?`status-${sc}`:sc===401||sc===403?`status-${sc}`:'status-500';
         return `<tr>
-          <td><span class="${cls}">${sc}</span></td>
+          <td><span class="${esc(cls)}">${esc(sc)}</span></td>
           <td style="font-family:var(--mono);font-size:.78rem">${esc(p.path)}</td>
-          <td style="font-size:.74rem;color:var(--muted)">${p.content_length ? p.content_length+' bytes' : '—'}</td>
+          <td style="font-size:.74rem;color:var(--muted)">${p.content_length ? esc(p.content_length)+' bytes' : '—'}</td>
           <td style="font-size:.74rem;color:var(--accent);font-family:var(--mono)">${p.redirect_to?esc(p.redirect_to):'—'}</td>
         </tr>`;
       }).join('');
-      h += infraSec(`📂 ${esc(target)} — ${interesting.length} paths found`,
+      h += infraSec(`📂 ${esc(target)} — ${esc(interesting.length)} paths found`,
         `<table class="dir-table"><thead><tr><th>Status</th><th>Path</th><th>Size</th><th>Redirect</th></tr></thead><tbody>${rows}</tbody></table>`);
     }
     return h;
@@ -4435,11 +4559,11 @@
     let rows = '';
     for (const type of recTypes) {
       if (!dns[type]) continue;
-      for (const val of dns[type]) {
+      for (const val of [].concat(dns[type])) {
         const geo = (type==='A'||type==='AAAA') ? ipGeo[val] : null;
-        const g = geo ? `<span style="font-size:.7rem;color:var(--muted)">${[geo.city,geo.countryCode].filter(Boolean).join(' ')} ${geo.org||''}</span>` : '';
+        const g = geo ? `<span style="font-size:.7rem;color:var(--muted)">${esc([geo.city,geo.countryCode].filter(Boolean).join(' '))} ${esc(geo.org||'')}</span>` : '';
         const p = ptr[val] ? `<span style="color:var(--muted);font-size:.7rem"> → ${esc(ptr[val])}</span>` : '';
-        rows += `<tr><td><span class="rc rc-info" style="font-size:.65rem">${type}</span></td><td style="font-family:var(--mono);font-size:.78rem">${esc(val)}${p}</td><td>${g}</td></tr>`;
+        rows += `<tr><td><span class="rc rc-info" style="font-size:.65rem">${esc(type)}</span></td><td style="font-family:var(--mono);font-size:.78rem">${esc(val)}${p}</td><td>${g}</td></tr>`;
       }
     }
     return rows
@@ -4454,13 +4578,13 @@
     if (btn) { btn.disabled = true; btn.textContent = '⏳ Scanning…'; }
     toast('Port scan & directory enumeration started — this may take 30–60 seconds');
     try {
-      const res = await fetch(`/api/dns/investigations/${invId}/scan`, {method:'POST'});
+      const res = await fetch(`/api/dns/investigations/${encodeURIComponent(invId)}/scan`, {method:'POST'});
       const d = await res.json();
       if (!d.ok) { toast(d.error||'Error', 'error'); if(btn){btn.disabled=false;btn.textContent='🔌 Scan Ports & Dirs';} return; }
       // Poll for results
       const poll = setInterval(async () => {
         try {
-          const r = await (await fetch(`/api/dns/investigations/${invId}/scan/status`)).json();
+          const r = await (await fetch(`/api/dns/investigations/${encodeURIComponent(invId)}/scan/status`)).json();
           if (r.ready) {
             clearInterval(poll);
             toast('Port scan complete!');
@@ -4478,7 +4602,7 @@
     if (btn) { btn.disabled = true; btn.textContent = '⏳ Enriching…'; }
     toast('Fetching DNSDumpster data — merging into results…');
     try {
-      const res = await fetch(`/api/dns/investigations/${invId}/enrich`, {method:'POST'});
+      const res = await fetch(`/api/dns/investigations/${encodeURIComponent(invId)}/enrich`, {method:'POST'});
       const d = await res.json();
       if (d.error) {
         toast(d.error, 'error');
@@ -4512,7 +4636,7 @@
     return `<div id="certPanelInner">
       <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap">
         <span style="font-weight:700;font-size:.9rem">🔒 Certificate Transparency History</span>
-        <span style="font-size:.75rem;color:var(--muted)">${cached} certs from initial scan</span>
+        <span style="font-size:.75rem;color:var(--muted)">${esc(cached)} certs from initial scan</span>
         <button class="btn btn-secondary" style="font-size:.73rem;padding:3px 9px;margin-left:auto" onclick="if(_dnsCurrent)loadCertHistory(_dnsCurrent.domain,document.getElementById('dv-certs'),true)">↺ Refresh</button>
       </div>
       <div id="certPanelContent">
@@ -4543,11 +4667,11 @@
 
     // ── Stat cards ──
     let html = `<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">
-      <div class="dns-stat-chip"><div class="sv">${total}</div><div class="sl">Total Certs</div></div>
-      <div class="dns-stat-chip sok"><div class="sv">${active}</div><div class="sl">Active</div></div>
-      <div class="dns-stat-chip ${expired?'sdanger':'sok'}"><div class="sv">${expired}</div><div class="sl">Expired</div></div>
-      <div class="dns-stat-chip ${expiring_soon?'sdanger':''}"><div class="sv">${expiring_soon}</div><div class="sl">Expiring ≤30d</div></div>
-      <div class="dns-stat-chip"><div class="sv">${unique_sans}</div><div class="sl">Unique SANs</div></div>
+      <div class="dns-stat-chip"><div class="sv">${esc(total)}</div><div class="sl">Total Certs</div></div>
+      <div class="dns-stat-chip sok"><div class="sv">${esc(active)}</div><div class="sl">Active</div></div>
+      <div class="dns-stat-chip ${expired?'sdanger':'sok'}"><div class="sv">${esc(expired)}</div><div class="sl">Expired</div></div>
+      <div class="dns-stat-chip ${expiring_soon?'sdanger':''}"><div class="sv">${esc(expiring_soon)}</div><div class="sl">Expiring ≤30d</div></div>
+      <div class="dns-stat-chip"><div class="sv">${esc(unique_sans)}</div><div class="sl">Unique SANs</div></div>
     </div>`;
 
     // ── Issuer breakdown ──
@@ -4557,9 +4681,9 @@
         <div class="infra-card-title">🏢 Issuers</div>
         ${Object.entries(issuers).map(([name, cnt]) => `
           <div class="asn-bar-row">
-            <div class="asn-bar-label" title="${esc(name)}">${esc(name.slice(0,32))}</div>
+            <div class="asn-bar-label" title="${esc(name)}">${esc(String(name).slice(0,32))}</div>
             <div class="asn-bar-track"><div class="asn-bar-fill" style="width:${Math.round(cnt/maxIss*100)}%"></div></div>
-            <div class="asn-bar-count">${cnt}</div>
+            <div class="asn-bar-count">${esc(cnt)}</div>
           </div>`).join('')}
       </div>`;
     }
@@ -4568,7 +4692,7 @@
     const byYear = {};
     for (const c of certs) {
       if (!c.not_before) continue;
-      const yr = c.not_before.slice(0,4);
+      const yr = String(c.not_before).slice(0,4);
       byYear[yr] = (byYear[yr]||0) + 1;
     }
     const years = Object.keys(byYear).sort();
@@ -4583,8 +4707,8 @@
         const y = svgH - 18 - bh;
         return `<g>
           <rect x="${x}" y="${y}" width="${barW}" height="${bh}" fill="#58a6ff" rx="2" opacity=".8"/>
-          <text x="${x+barW/2}" y="${svgH-4}" text-anchor="middle" font-size="8" fill="#8b949e">${yr.slice(2)}</text>
-          <title>${yr}: ${cnt} cert${cnt!==1?'s':''}</title>
+          <text x="${x+barW/2}" y="${svgH-4}" text-anchor="middle" font-size="8" fill="#8b949e">${esc(yr.slice(2))}</text>
+          <title>${esc(yr)}: ${esc(cnt)} cert${cnt!==1?'s':''}</title>
         </g>`;
       }).join('');
       html += `<div class="infra-card" style="margin-bottom:16px">
@@ -4595,11 +4719,11 @@
 
     // ── SAN discovery (unique subdomains from certs) ──
     if (all_sans.length) {
-      const wildcards = all_sans.filter(s => s.startsWith('*'));
-      const normal = all_sans.filter(s => !s.startsWith('*'));
+      const wildcards = all_sans.filter(s => String(s).startsWith('*'));
+      const normal = all_sans.filter(s => !String(s).startsWith('*'));
       html += `<div class="infra-card" style="margin-bottom:16px">
         <div class="infra-card-title" style="display:flex;align-items:center;gap:8px">
-          🌐 SAN Names — ${unique_sans} unique hosts/domains
+          🌐 SAN Names — ${esc(unique_sans)} unique hosts/domains
           <button class="btn btn-secondary" style="font-size:.68rem;padding:2px 7px;margin-left:auto" onclick="copyCertSANs()">⎘ Copy All</button>
         </div>
         <div id="certSANlist" style="max-height:240px;overflow-y:auto;margin-top:8px">
@@ -4614,7 +4738,7 @@
     const pageSize = 50;
     const pageCerts = certs.slice(0, pageSize);
     html += `<div class="infra-card">
-      <div class="infra-card-title">📜 Certificates (${total} total, showing ${pageCerts.length})</div>
+      <div class="infra-card-title">📜 Certificates (${esc(total)} total, showing ${esc(pageCerts.length)})</div>
       <div style="overflow-x:auto">
       <table class="infra-a-tbl" style="min-width:700px">
         <thead><tr>
@@ -4625,23 +4749,23 @@
             const status = c.is_expired
               ? `<span style="color:var(--red);font-size:.72rem">Expired</span>`
               : c.expiring_soon
-                ? `<span style="color:#d29922;font-size:.72rem">⚠ ${c.days_remaining}d left</span>`
+                ? `<span style="color:#d29922;font-size:.72rem">⚠ ${esc(c.days_remaining)}d left</span>`
                 : `<span style="color:var(--green);font-size:.72rem">Active</span>`;
-            const issuer = esc((c.issuer_cn || c.issuer_org || '').slice(0, 36));
-            const sanPreview = c.sans.slice(0,3).map(s=>esc(s)).join('<br>') + (c.san_count>3?`<br><span style="color:var(--muted);font-size:.68rem">+${c.san_count-3} more</span>`:'');
+            const issuer = esc(String(c.issuer_cn || c.issuer_org || '').slice(0, 36));
+            const sanPreview = [].concat(c.sans||[]).slice(0,3).map(s=>esc(s)).join('<br>') + (c.san_count>3?`<br><span style="color:var(--muted);font-size:.68rem">+${esc(c.san_count-3)} more</span>`:'');
             return `<tr>
-              <td style="font-size:.74rem;white-space:nowrap">${(c.not_before||'').slice(0,10)}</td>
-              <td style="font-size:.74rem;white-space:nowrap">${(c.not_after||'').slice(0,10)}</td>
+              <td style="font-size:.74rem;white-space:nowrap">${esc(String(c.not_before||'').slice(0,10))}</td>
+              <td style="font-size:.74rem;white-space:nowrap">${esc(String(c.not_after||'').slice(0,10))}</td>
               <td>${status}</td>
               <td style="font-size:.74rem">${issuer}</td>
               <td style="font-family:var(--mono);font-size:.71rem;max-width:260px">${sanPreview}</td>
-              <td><a href="https://crt.sh/?id=${c.id}" target="_blank" style="font-size:.7rem;color:var(--accent)">#${c.id}</a></td>
+              <td><a href="https://crt.sh/?id=${esc(encodeURIComponent(c.id))}" target="_blank" rel="noopener noreferrer" style="font-size:.7rem;color:var(--accent)">#${esc(c.id)}</a></td>
             </tr>`;
           }).join('')}
         </tbody>
       </table>
       </div>
-      ${certs.length > pageSize ? `<div style="font-size:.75rem;color:var(--muted);margin-top:8px;text-align:center">Showing ${pageSize} of ${certs.length} — <a href="https://crt.sh/?q=%.${esc(data.domain)}" target="_blank" style="color:var(--accent)">view all on crt.sh ↗</a></div>` : ''}
+      ${certs.length > pageSize ? `<div style="font-size:.75rem;color:var(--muted);margin-top:8px;text-align:center">Showing ${pageSize} of ${esc(certs.length)} — <a href="https://crt.sh/?q=%25.${esc(encodeURIComponent(data.domain))}" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">view all on crt.sh ↗</a></div>` : ''}
     </div>`;
 
     return html;
@@ -4675,9 +4799,11 @@
   function geoStr(geoArr) {
     if (!geoArr) return '';
     const arr = Array.isArray(geoArr) ? geoArr : [geoArr];
+    // Plain text; callers escape it.
     return arr.filter(g=>g&&g.country).map(g=>[g.city,g.countryCode].filter(Boolean).join(' ')).join(' / ');
   }
 
+  // title and body are markup: callers escape the data they put into them.
   function infraSec(title, body) {
     const id = 'is'+Math.random().toString(36).slice(2,8);
     return `<div class="is"><div class="is-hdr" onclick="toggleIS(this)"><span class="is-title">${title}</span><span style="color:var(--muted);font-size:.8rem" id="arr${id}">▾</span></div><div class="is-body" id="${id}">${body}</div></div>`;
@@ -4695,7 +4821,7 @@
 
   function exportDNSpdf(id, domain) {
     toast(`Generating PDF for ${domain}…`);
-    window.location.href = `/api/dns/investigations/${id}/pdf`;
+    window.location.href = `/api/dns/investigations/${encodeURIComponent(id)}/pdf`;
   }
 
   async function deleteDNS(id) {
@@ -4772,7 +4898,7 @@
     _cmPollTimer = setInterval(async () => {
       if (!_cmActiveJobId) return;
       try {
-        const data = await (await fetch(`/api/channel-monitor/jobs/${_cmActiveJobId}/log?since=${_cmLogOffset}`)).json();
+        const data = await (await fetch(`/api/channel-monitor/jobs/${encodeURIComponent(_cmActiveJobId)}/log?since=${encodeURIComponent(_cmLogOffset)}`)).json();
         if (data.log && data.log.length) {
           const box = document.getElementById('cmLogBox');
           box.textContent += data.log.join('\n') + '\n';
@@ -4809,7 +4935,7 @@
 
   function cmDownloadJob() {
     if (!_cmActiveJobId) return;
-    window.location.href = `/api/channel-monitor/jobs/${_cmActiveJobId}/download`;
+    window.location.href = `/api/channel-monitor/jobs/${encodeURIComponent(_cmActiveJobId)}/download`;
   }
 
   async function cmLoadJobs() {
@@ -4821,22 +4947,22 @@
         return;
       }
       tbody.innerHTML = jobs.map(j => {
-        const ts = j.started_at ? j.started_at.replace('T',' ').slice(0,16) : '—';
+        const ts = j.started_at ? String(j.started_at).replace('T',' ').slice(0,16) : '—';
         const statusHtml = j.status === 'completed'
           ? '<span class="status-badge status-completed">✓ Completed</span>'
           : j.status === 'running'
           ? '<span class="status-badge" style="background:rgba(88,166,255,.12);color:var(--accent);border:1px solid rgba(88,166,255,.3);">⏳ Running</span>'
           : '<span class="status-badge" style="background:rgba(248,81,73,.1);color:var(--red);border:1px solid rgba(248,81,73,.3);">✗ Error</span>';
         const dlBtn = (j.status === 'completed' || j.status === 'error')
-          ? `<button class="btn btn-secondary" onclick="cmDownloadJobById('${j.id}')" style="font-size:.72rem;padding:3px 9px;">⬇ ZIP</button>`
+          ? `<button class="btn btn-secondary" ${act('cmDownloadJobById', j.id)} style="font-size:.72rem;padding:3px 9px;">⬇ ZIP</button>`
           : '';
-        const viewBtn = `<button class="btn btn-secondary" onclick="cmViewJob('${j.id}')" style="font-size:.72rem;padding:3px 9px;">📋 Log</button>`;
+        const viewBtn = `<button class="btn btn-secondary" ${act('cmViewJob', j.id)} style="font-size:.72rem;padding:3px 9px;">📋 Log</button>`;
         const delBtn  = j.status !== 'running'
-          ? `<button class="btn" onclick="cmDeleteJob('${j.id}')" style="font-size:.72rem;padding:3px 9px;background:rgba(248,81,73,.1);color:var(--red);border:1px solid rgba(248,81,73,.3);">🗑</button>`
+          ? `<button class="btn" ${act('cmDeleteJob', j.id)} style="font-size:.72rem;padding:3px 9px;background:rgba(248,81,73,.1);color:var(--red);border:1px solid rgba(248,81,73,.3);">🗑</button>`
           : '';
         return `<tr>
-          <td><span style="font-family:var(--mono);color:var(--accent);">@${j.channel}</span></td>
-          <td class="time-cell">${ts}</td>
+          <td><span style="font-family:var(--mono);color:var(--accent);">@${esc(j.channel)}</span></td>
+          <td class="time-cell">${esc(ts)}</td>
           <td>${statusHtml}</td>
           <td style="display:flex;gap:6px;">${viewBtn}${dlBtn}${delBtn}</td>
         </tr>`;
@@ -4846,7 +4972,7 @@
 
   async function cmViewJob(jobId) {
     try {
-      const data = await (await fetch(`/api/channel-monitor/jobs/${jobId}`)).json();
+      const data = await (await fetch(`/api/channel-monitor/jobs/${encodeURIComponent(jobId)}`)).json();
       _cmActiveJobId = jobId;
       _cmLogOffset   = data.log.length;
       const panel = document.getElementById('cmActivePanel');
@@ -4861,12 +4987,18 @@
   }
 
   function cmDownloadJobById(jobId) {
-    window.location.href = `/api/channel-monitor/jobs/${jobId}/download`;
+    window.location.href = `/api/channel-monitor/jobs/${encodeURIComponent(jobId)}/download`;
   }
 
   async function cmDeleteJob(jobId) {
     if (!confirm('Delete this job and its output files?')) return;
-    await fetch(`/api/channel-monitor/jobs/${jobId}`, {method:'DELETE'});
+    const res = await fetch(`/api/channel-monitor/jobs/${encodeURIComponent(jobId)}`, {method:'DELETE'});
+    if (!res.ok) {
+      let msg = 'Could not delete the job';
+      try { msg = (await res.json()).error || msg; } catch (e) {}
+      toast(res.status === 409 ? 'A running job cannot be deleted; wait until it has finished' : msg, 'error');
+      return;
+    }
     if (_cmActiveJobId === jobId) {
       document.getElementById('cmActivePanel').style.display = 'none';
       _cmActiveJobId = null;
@@ -4887,7 +5019,7 @@
   }
 
   function osintLoading(id, msg) {
-    document.getElementById(id).innerHTML = `<div style="color:var(--muted);font-size:.82rem;padding:12px 0;display:flex;align-items:center;gap:8px"><span style="display:inline-block;width:14px;height:14px;border:2px solid var(--accent);border-top-color:transparent;border-radius:50%;animation:spin .8s linear infinite"></span>${msg}</div>`;
+    document.getElementById(id).innerHTML = `<div style="color:var(--muted);font-size:.82rem;padding:12px 0;display:flex;align-items:center;gap:8px"><span style="display:inline-block;width:14px;height:14px;border:2px solid var(--accent);border-top-color:transparent;border-radius:50%;animation:spin .8s linear infinite"></span>${esc(msg)}</div>`;
   }
   function osintError(id, msg) {
     document.getElementById(id).innerHTML = `<div style="color:#f85149;font-size:.82rem;background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.2);border-radius:6px;padding:10px 14px">⚠️ ${esc(msg)}</div>`;
@@ -4895,7 +5027,7 @@
   function osintKV(pairs) {
     const rows = pairs.filter(([,v])=>v!=null&&v!==''&&v!==false);
     if (!rows.length) return '';
-    return `<div class="osint-kv">${rows.map(([k,v])=>`<span class="osint-kv-key">${k}</span><span class="osint-kv-val">${esc(String(v))}</span>`).join('')}</div>`;
+    return `<div class="osint-kv">${rows.map(([k,v])=>`<span class="osint-kv-key">${esc(k)}</span><span class="osint-kv-val">${esc(String(v))}</span>`).join('')}</div>`;
   }
 
   // ── GitHub ──
@@ -4912,7 +5044,7 @@
       el.innerHTML = `
         <div class="osint-result-card">
           <div style="display:flex;gap:14px;align-items:flex-start;margin-bottom:12px">
-            <img src="${esc(p.avatar_url||'')}" style="width:64px;height:64px;border-radius:50%;border:2px solid var(--border)" onerror="this.style.display='none'"/>
+            <img src="${esc(safeUrl(p.avatar_url))}" style="width:64px;height:64px;border-radius:50%;border:2px solid var(--border)" onerror="this.style.display='none'"/>
             <div>
               <div style="font-size:1rem;font-weight:700;color:var(--text)">${esc(p.name||p.login)}</div>
               <div style="color:var(--muted);font-size:.78rem">@${esc(p.login)}</div>
@@ -4934,8 +5066,8 @@
             ['Hireable', p.hireable === true ? 'Yes' : p.hireable === false ? 'No' : null],
           ])}
           <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-            <a href="${esc(p.html_url)}" target="_blank" rel="noopener noreferrer" class="btn btn-primary" style="font-size:.78rem;padding:5px 12px">🔗 GitHub Profile</a>
-            ${emails.length ? `<a href="mailto:${esc(emails[0])}" class="osint-found-badge">📧 ${esc(emails[0])}</a>` : ''}
+            <a href="${esc(safeUrl(p.html_url))}" target="_blank" rel="noopener noreferrer" class="btn btn-primary" style="font-size:.78rem;padding:5px 12px">🔗 GitHub Profile</a>
+            ${emails.length ? `<a href="mailto:${esc(encodeURIComponent(emails[0]))}" class="osint-found-badge">📧 ${esc(emails[0])}</a>` : ''}
           </div>
         </div>`;
     } catch(e) { osintError(el.id, e.message); }
@@ -4957,10 +5089,10 @@
       el.innerHTML = `
         <div class="osint-result-card">
           <div style="display:flex;gap:14px;align-items:flex-start;margin-bottom:12px">
-            ${p.icon_img ? `<img src="${esc(p.icon_img.split('?')[0])}" style="width:64px;height:64px;border-radius:50%;border:2px solid var(--border)" onerror="this.style.display='none'"/>` : '<div style="width:64px;height:64px;border-radius:50%;background:rgba(255,69,0,.2);display:flex;align-items:center;justify-content:center;font-size:1.5rem">🟠</div>'}
+            ${p.icon_img ? `<img src="${esc(safeUrl(String(p.icon_img).split('?')[0]))}" style="width:64px;height:64px;border-radius:50%;border:2px solid var(--border)" onerror="this.style.display='none'"/>` : '<div style="width:64px;height:64px;border-radius:50%;background:rgba(255,69,0,.2);display:flex;align-items:center;justify-content:center;font-size:1.5rem">🟠</div>'}
             <div>
               <div style="font-size:1rem;font-weight:700;color:var(--text)">u/${esc(p.name)}</div>
-              ${p.subreddit?.public_description ? `<div style="font-size:.8rem;color:var(--muted);margin-top:4px">${esc(p.subreddit.public_description.slice(0,120))}</div>` : ''}
+              ${p.subreddit?.public_description ? `<div style="font-size:.8rem;color:var(--muted);margin-top:4px">${esc(String(p.subreddit.public_description).slice(0,120))}</div>` : ''}
             </div>
           </div>
           ${osintKV([
@@ -4977,7 +5109,7 @@
             ['Subscribers', p.subreddit?.subscribers?.toLocaleString() || null],
           ])}
           <div style="margin-top:10px">
-            <a href="https://reddit.com/user/${esc(u)}" target="_blank" rel="noopener noreferrer" class="btn btn-primary" style="font-size:.78rem;padding:5px 12px">🔗 Reddit Profile</a>
+            <a href="https://reddit.com/user/${esc(encodeURIComponent(u))}" target="_blank" rel="noopener noreferrer" class="btn btn-primary" style="font-size:.78rem;padding:5px 12px">🔗 Reddit Profile</a>
           </div>
         </div>`;
     } catch(e) { osintError(el.id, e.message); }
@@ -4999,7 +5131,7 @@
       el.innerHTML = `
         <div class="osint-result-card">
           <div style="display:flex;gap:14px;align-items:flex-start;margin-bottom:12px">
-            ${avatar ? `<img src="${esc(avatar)}" style="width:64px;height:64px;border-radius:50%;border:2px solid var(--border)" onerror="this.style.display='none'"/>` : '<div style="width:64px;height:64px;border-radius:50%;background:rgba(88,101,242,.2);display:flex;align-items:center;justify-content:center;font-size:1.5rem">💬</div>'}
+            ${avatar ? `<img src="${esc(safeUrl(avatar))}" style="width:64px;height:64px;border-radius:50%;border:2px solid var(--border)" onerror="this.style.display='none'"/>` : '<div style="width:64px;height:64px;border-radius:50%;background:rgba(88,101,242,.2);display:flex;align-items:center;justify-content:center;font-size:1.5rem">💬</div>'}
             <div>
               <div style="font-size:1rem;font-weight:700;color:var(--text)">${esc(p.global_name || p.username || uid)}</div>
               ${p.username ? `<div style="color:var(--muted);font-size:.78rem">@${esc(p.username)}</div>` : ''}
@@ -5012,7 +5144,7 @@
             ['Account Created (Snowflake)', snowTs.toLocaleString()],
             ['Bot', p.bot ? 'Yes' : 'No'],
             ['System Account', p.system ? 'Yes' : 'No'],
-            ['Badges', (p.badges||[]).join(', ') || 'None'],
+            ['Badges', [].concat(p.badges||[]).join(', ') || 'None'],
             ['Accent Color', p.accent_color || null],
             ['Banner', p.banner?.link || null],
           ])}
@@ -5036,11 +5168,11 @@
       el.innerHTML = `
         <div class="osint-result-card">
           <div style="display:flex;gap:14px;align-items:flex-start;margin-bottom:12px">
-            ${p.avatarMedium ? `<img src="${esc(p.avatarMedium)}" style="width:64px;height:64px;border-radius:50%;border:2px solid var(--border)" onerror="this.style.display='none'"/>` : '<div style="width:64px;height:64px;border-radius:50%;background:rgba(254,44,85,.15);display:flex;align-items:center;justify-content:center;font-size:1.5rem">🎵</div>'}
+            ${p.avatarMedium ? `<img src="${esc(safeUrl(p.avatarMedium))}" style="width:64px;height:64px;border-radius:50%;border:2px solid var(--border)" onerror="this.style.display='none'"/>` : '<div style="width:64px;height:64px;border-radius:50%;background:rgba(254,44,85,.15);display:flex;align-items:center;justify-content:center;font-size:1.5rem">🎵</div>'}
             <div>
               <div style="font-size:1rem;font-weight:700;color:var(--text)">@${esc(p.uniqueId)}</div>
               <div style="color:var(--muted);font-size:.78rem">${esc(p.nickname||'')}</div>
-              ${p.signature ? `<div style="font-size:.8rem;color:var(--text);margin-top:4px">${esc(p.signature.slice(0,120))}</div>` : ''}
+              ${p.signature ? `<div style="font-size:.8rem;color:var(--text);margin-top:4px">${esc(String(p.signature).slice(0,120))}</div>` : ''}
             </div>
           </div>
           ${osintKV([
@@ -5058,12 +5190,12 @@
             ['Created', created ? created.toLocaleDateString() : null],
           ])}
           <div style="margin-top:10px">
-            <a href="https://tiktok.com/@${esc(u)}" target="_blank" rel="noopener noreferrer" class="btn btn-primary" style="font-size:.78rem;padding:5px 12px">🔗 TikTok Profile</a>
+            <a href="https://tiktok.com/@${esc(encodeURIComponent(u))}" target="_blank" rel="noopener noreferrer" class="btn btn-primary" style="font-size:.78rem;padding:5px 12px">🔗 TikTok Profile</a>
           </div>
         </div>`;
     } catch(e) {
       osintError(el.id, e.message);
-      document.getElementById('osint-tiktok-results').innerHTML += `<div style="margin-top:8px;font-size:.78rem;color:var(--muted)">Also try: <a href="https://tiktok.com/@${esc(u)}" target="_blank" style="color:var(--accent)">TikTok Profile</a></div>`;
+      document.getElementById('osint-tiktok-results').innerHTML += `<div style="margin-top:8px;font-size:.78rem;color:var(--muted)">Also try: <a href="https://tiktok.com/@${esc(encodeURIComponent(u))}" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">TikTok Profile</a></div>`;
     }
   }
 
@@ -5082,7 +5214,7 @@
         const w = data.rdap;
         const registrar = w.entities?.find(e => (e.roles||[]).includes('registrar'));
         const regName = registrar?.vcardArray?.[1]?.find(v=>v[0]==='fn')?.[3];
-        const ns = w.nameservers?.map(n=>n.ldhName).join(', ');
+        const ns = Array.isArray(w.nameservers) ? w.nameservers.map(n=>n.ldhName).join(', ') : null;
         const reg = w.events?.find(e=>e.eventAction==='registration')?.eventDate;
         const exp = w.events?.find(e=>e.eventAction==='expiration')?.eventDate;
         const upd = w.events?.find(e=>e.eventAction==='last changed')?.eventDate;
@@ -5091,7 +5223,7 @@
           ${osintKV([
             ['Domain', w.ldhName || domain],
             ['Registrar', regName || null],
-            ['Status', (w.status||[]).slice(0,3).join(', ') || null],
+            ['Status', [].concat(w.status||[]).slice(0,3).join(', ') || null],
             ['Name Servers', ns || null],
             ['Registered', reg ? new Date(reg).toLocaleDateString() : null],
             ['Expires', exp ? new Date(exp).toLocaleDateString() : null],
@@ -5106,7 +5238,7 @@
       if (data.crtsh?.length) {
         const names = data.crtsh.slice(0, 60);
         crtHtml = `<div class="osint-result-card" style="margin-bottom:10px">
-          <h3 style="font-size:.85rem;font-weight:700;margin:0 0 8px">🔐 Certificate Transparency — ${names.length}${data.crtsh.length > 60 ? '+' : ''} unique names</h3>
+          <h3 style="font-size:.85rem;font-weight:700;margin:0 0 8px">🔐 Certificate Transparency — ${esc(names.length)}${data.crtsh.length > 60 ? '+' : ''} unique names</h3>
           <div style="display:flex;flex-wrap:wrap;gap:5px;max-height:180px;overflow-y:auto">
             ${names.map(d=>`<span style="font-family:var(--mono);font-size:.72rem;background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:2px 7px">${esc(d)}</span>`).join('')}
           </div>
@@ -5115,12 +5247,12 @@
 
       el.innerHTML = whoisHtml + crtHtml + `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">
         ${[
-          ['Shodan', `https://www.shodan.io/search?query=${domain}`],
-          ['VirusTotal', `https://www.virustotal.com/gui/domain/${domain}`],
-          ['URLScan.io', `https://urlscan.io/search/#domain:${domain}`],
-          ['SecurityTrails', `https://securitytrails.com/domain/${domain}/dns`],
+          ['Shodan', `https://www.shodan.io/search?query=${encodeURIComponent(domain)}`],
+          ['VirusTotal', `https://www.virustotal.com/gui/domain/${encodeURIComponent(domain)}`],
+          ['URLScan.io', `https://urlscan.io/search/#domain:${encodeURIComponent(domain)}`],
+          ['SecurityTrails', `https://securitytrails.com/domain/${encodeURIComponent(domain)}/dns`],
           ['DNSDumpster', `https://dnsdumpster.com/`],
-        ].map(([n,u])=>`<a href="${esc(u)}" target="_blank" rel="noopener noreferrer" class="osint-found-badge">🔗 ${esc(n)}</a>`).join('')}
+        ].map(([n,u])=>`<a href="${esc(safeUrl(u))}" target="_blank" rel="noopener noreferrer" class="osint-found-badge">🔗 ${esc(n)}</a>`).join('')}
       </div>`;
     } catch(e) { osintError(el.id, e.message); }
   }
@@ -5146,7 +5278,7 @@
           ['Intelligence X', `https://intelx.io/?s=${encodeURIComponent(email)}`],
           ['Holehe (CLI)', `https://github.com/megadose/holehe`],
           ['GHunt (CLI)', `https://github.com/mxrch/GHunt`],
-        ].map(([n,u])=>`<a href="${esc(u)}" target="_blank" rel="noopener noreferrer" class="osint-found-badge">🔗 ${esc(n)}</a>`).join('')}
+        ].map(([n,u])=>`<a href="${esc(safeUrl(u))}" target="_blank" rel="noopener noreferrer" class="osint-found-badge">🔗 ${esc(n)}</a>`).join('')}
       </div>
       <div style="margin-top:12px;padding:10px;background:var(--surface);border-radius:6px;font-size:.75rem;color:var(--muted)">
         💡 For full Google account OSINT, run <code>ghunt email ${esc(email)}</code> on your GHunt server or use Epieos which does this automatically.
@@ -5171,7 +5303,7 @@
           ['Dehashed', `https://dehashed.com/search?query=${encodeURIComponent(email)}`],
           ['Snusbase', `https://snusbase.com/`],
           ['Holehe (CLI)', `https://github.com/megadose/holehe`],
-        ].map(([n,u])=>`<a href="${esc(u)}" target="_blank" rel="noopener noreferrer" class="osint-found-badge">🔗 ${esc(n)}</a>`).join('')}
+        ].map(([n,u])=>`<a href="${esc(safeUrl(u))}" target="_blank" rel="noopener noreferrer" class="osint-found-badge">🔗 ${esc(n)}</a>`).join('')}
       </div>
     </div>`;
   }
@@ -5198,7 +5330,7 @@
       if (found.length === 0) {
         foundEl.innerHTML = '<div style="color:var(--muted);font-size:.8rem;padding:8px 0">No accounts found across checked platforms.</div>';
       } else {
-        foundEl.innerHTML = found.map(f => `<a href="${esc(f.url)}" target="_blank" rel="noopener noreferrer" class="osint-found-badge">✓ ${esc(f.name)}</a>`).join('');
+        foundEl.innerHTML = found.map(f => `<a href="${esc(safeUrl(f.url))}" target="_blank" rel="noopener noreferrer" class="osint-found-badge">✓ ${esc(f.name)}</a>`).join('');
       }
     } catch(e) {
       foundEl.innerHTML = `<div style="color:#f85149;font-size:.82rem">${esc(e.message)}</div>`;
@@ -5235,7 +5367,7 @@
       { title: 'Hunter.io', url: 'https://hunter.io', cat: 'Email', desc: 'Find professional email addresses' },
     ];
     document.getElementById('osint-resource-grid').innerHTML = resources.map(r => `
-      <a href="${esc(r.url)}" target="_blank" rel="noopener noreferrer" class="osint-resource-card">
+      <a href="${esc(safeUrl(r.url))}" target="_blank" rel="noopener noreferrer" class="osint-resource-card">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:5px">
           <span class="osint-resource-card-title">${esc(r.title)}</span>
           <span style="font-size:.68rem;background:rgba(88,166,255,.1);color:var(--accent);border:1px solid rgba(88,166,255,.2);border-radius:3px;padding:1px 6px">${esc(r.cat)}</span>
@@ -5314,15 +5446,15 @@
         const seaD   = await seaReq.json();
         if (seaD.ok) {
           seaD.data.forEach(v => {
-            const c = (v.country||'').toUpperCase();
+            const c = String(v.country||'').toUpperCase();
             seaCounts[c] = (seaCounts[c]||0) + 1;
           });
           hdRenderSeaBars(seaCounts);
         }
       } catch(e) { console.warn('SEA counts failed', e); }
       el.innerHTML = d.data.slice(0,10).map(v => {
-        const date = (v.attackdate||'').slice(0,10);
-        const sea  = ['PH','TH','ID','MY','VN','SG','MM','KH','LA','BN'].includes((v.country||'').toUpperCase());
+        const date = String(v.attackdate||'').slice(0,10);
+        const sea  = ['PH','TH','ID','MY','VN','SG','MM','KH','LA','BN'].includes(String(v.country||'').toUpperCase());
         return `<div class="hd-victim-row">
           <span class="hd-victim-group">${esc(v.group||'?')}</span>
           <span class="hd-victim-name" title="${esc(v.victim||'')}">
@@ -5374,14 +5506,14 @@
       const seaSlugs = ['lockbit3','lockbit','ransomhub','akira','dragonforce','clop','cl0p','play','blackbasta','medusa','8base','hunters'];
       el.innerHTML = groups.map(g => {
         const vc    = (g.victims||0).toLocaleString();
-        const slug  = (g.group||g.name||'').toLowerCase();
+        const slug  = String(g.group||g.name||'').toLowerCase();
         const isSEA = g._sea_targeting || seaSlugs.includes(slug);
         const dot   = (g.victims||0) > 500 ? 'var(--red)' : (g.victims||0) > 100 ? 'var(--orange)' : 'var(--green)';
         return `<div class="hd-group-row" onclick="hdGoTo('ransomware')">
           <span class="hd-group-dot" style="background:${dot}"></span>
           <span class="hd-group-name">${esc(g.group||g.name||'')}</span>
           ${isSEA ? '<span class="hd-sea-tag">SEA</span>' : ''}
-          <span class="hd-group-victims">${vc}</span>
+          <span class="hd-group-victims">${esc(vc)}</span>
         </div>`;
       }).join('');
     } catch(e) { el.innerHTML = '<div style="color:var(--muted);font-size:.78rem">Error: '+esc(String(e))+'</div>'; }
@@ -5399,11 +5531,10 @@
       const iocs = (d.data||[]).slice(0,8);
       if (!iocs.length) { el.innerHTML = '<div style="color:var(--muted);font-size:.78rem">No IOC data</div>'; return; }
       el.innerHTML = iocs.map(ioc => {
-        const type = (ioc.ioc_type||'').replace('_hash','');
-        const cls  = 'ioc-chip-' + type.replace(':','');
+        const type = String(ioc.ioc_type||'').replace('_hash','');
         return `<div class="hd-ioc-row">
           <span class="hd-ioc-type">${esc(type)}</span>
-          <span class="hd-ioc-val" title="${esc(ioc.ioc||'')}"> ${esc((ioc.ioc||'').slice(0,45))}</span>
+          <span class="hd-ioc-val" title="${esc(ioc.ioc||'')}"> ${esc(String(ioc.ioc||'').slice(0,45))}</span>
           <span class="hd-ioc-malware">${esc(ioc.malware||'')}</span>
         </div>`;
       }).join('');
@@ -5432,10 +5563,10 @@
   function hdPressItem(p) {
     const title = p.title || p.headline || 'Untitled';
     const url   = p.url || p.link || '#';
-    const date  = (p.date||p.published||'').slice(0,10);
+    const date  = String(p.date||p.published||'').slice(0,10);
     const src   = p.source || p.group || '';
     return `<div class="hd-press-item">
-      <div class="hd-press-title"><a href="${esc(url)}" target="_blank" rel="noopener">${esc(title)}</a></div>
+      <div class="hd-press-title"><a href="${esc(safeUrl(url))}" target="_blank" rel="noopener noreferrer">${esc(title)}</a></div>
       <div class="hd-press-meta">${esc(src)}${src && date ? ' · ' : ''}${esc(date)}</div>
     </div>`;
   }
@@ -5524,7 +5655,7 @@
       iocAllData = (d.urls||[]).map(u => ({
         type:       'url',
         value:      u.url || '',
-        malware:    (u.tags||[]).join(', '),
+        malware:    [].concat(u.tags||[]).join(', '),
         confidence: 80,
         tags:       u.tags||[],
         first_seen: u.date_added||'',
@@ -5566,19 +5697,19 @@
     const typeF   = document.getElementById('iocTypeFilter')?.value||'';
     let filtered  = iocAllData;
     if (typeF) filtered = filtered.filter(i=>i.type===typeF);
-    if (q)     filtered = filtered.filter(i=>(i.value+i.malware+(i.tags||[]).join(' ')).toLowerCase().includes(q));
+    if (q)     filtered = filtered.filter(i=>(i.value+i.malware+[].concat(i.tags||[]).join(' ')).toLowerCase().includes(q));
     document.getElementById('iocTableCount').textContent = filtered.length + ' IOCs';
     if (!filtered.length) {
       document.getElementById('iocTableContainer').innerHTML = '<div style="text-align:center;padding:30px;color:var(--muted)">No IOCs match filter</div>';
       return;
     }
     const rows = filtered.slice(0,200).map(ioc => {
-      const typeCls = 'ioc-chip-' + (ioc.type||'').replace('_hash','').replace(':','');
-      const conf    = Math.round(ioc.confidence||0);
-      const date    = (ioc.first_seen||'').slice(0,10);
+      const typeCls = 'ioc-chip-' + String(ioc.type||'').replace('_hash','').replace(':','');
+      const conf    = Math.max(0, Math.min(100, Math.round(Number(ioc.confidence)||0)));
+      const date    = String(ioc.first_seen||'').slice(0,10);
       return `<tr>
-        <td><span class="ioc-type-chip ${typeCls}">${esc(ioc.type||'')}</span></td>
-        <td class="ioc-val-cell" title="${esc(ioc.value||'')}">${esc((ioc.value||'').slice(0,60))}</td>
+        <td><span class="ioc-type-chip ${esc(typeCls)}">${esc(ioc.type||'')}</span></td>
+        <td class="ioc-val-cell" title="${esc(ioc.value||'')}">${esc(String(ioc.value||'').slice(0,60))}</td>
         <td><span class="ioc-malware-chip">${esc(ioc.malware||'—')}</span></td>
         <td><div class="ioc-conf-bar"><div class="ioc-conf-track"><div class="ioc-conf-fill" style="width:${conf}%"></div></div><span style="font-size:.65rem;color:var(--muted)">${conf}%</span></div></td>
         <td style="font-size:.68rem;color:var(--muted)">${esc(date)}</td>
@@ -5591,6 +5722,38 @@
         <tbody>${rows}</tbody>
       </table>`;
   }
+
+  // Functions that markup built from data may call through data-act (see act()).
+  Object.assign(ACTIONS, {
+    cmDeleteJob,
+    cmDownloadJobById,
+    cmViewJob,
+    deleteChannel,
+    deleteClearnetSeed,
+    deleteDNS,
+    deleteIPInv,
+    deleteIntel,
+    deleteInvestigation,
+    deleteKeyword,
+    deletePasteSource,
+    deleteProjectDomain,
+    deleteProjectEntity,
+    deleteProjectKeyword,
+    deleteSeed,
+    deleteUser,
+    expandIPInvestigation,
+    expandInvestigation,
+    expandSession,
+    exportDNSpdf,
+    filterSession,
+    loadDNSResult,
+    openIntelDetail,
+    openProjectDetail,
+    removeSubscriber,
+    resetUserMfa,
+    triggerDNSDumpsterEnrich,
+    triggerPortScan,
+  });
 
 </script>
 

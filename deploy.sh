@@ -127,6 +127,13 @@ PG_PASS="$(openssl rand -hex 24)"
 sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=${PG_PASS}/" .env
 sed -i "s|^DATABASE_URL=.*|DATABASE_URL=postgresql+psycopg2://scanner:${PG_PASS}@postgres:5432/darkweb_scanner|" .env
 
+# One-time token for creating the first administrator at /register. Generated only
+# when the setting is empty, so a re-run does not replace a token already handed out.
+grep -q '^SETUP_TOKEN=' .env || echo 'SETUP_TOKEN=' >> .env
+if [[ -z "$(grep '^SETUP_TOKEN=' .env | cut -d= -f2- | tr -d '[:space:]')" ]]; then
+  sed -i "s/^SETUP_TOKEN=.*/SETUP_TOKEN=$(openssl rand -hex 24)/" .env
+fi
+
 # Set domain and SSL email if provided
 if [[ -n "$DOMAIN" ]]; then
   sed -i "s/^DOMAIN=.*/DOMAIN=${DOMAIN}/" .env
@@ -141,27 +148,10 @@ success "Configuration patched."
 # ── Validate secret key ────────────────────────────────────────────────────────
 # The app will also check on startup, but fail fast here before building images.
 _SECRET_VAL=$(grep '^DASHBOARD_SECRET_KEY=' .env | cut -d= -f2- | tr -d '[:space:]')
-if [[ -z "$_SECRET_VAL" || "$_SECRET_VAL" == "changeme" || "$_SECRET_VAL" == "change-me-in-production" || "$_SECRET_VAL" == "change-me-to-a-long-random-string" ]]; then
-  error "DASHBOARD_SECRET_KEY is empty or set to a placeholder. Edit .env and set a real secret before deploying."
+if [[ -z "$_SECRET_VAL" || "$_SECRET_VAL" == "changeme" || "$_SECRET_VAL" == "change-me-in-production" || "$_SECRET_VAL" == "change-me-to-a-long-random-string" || ${#_SECRET_VAL} -lt 32 ]]; then
+  error "DASHBOARD_SECRET_KEY is empty, a placeholder, or shorter than 32 characters. Edit .env and set a real secret before deploying."
 fi
 success "Secret key validated."
-
-# ── Generate Tor control password ─────────────────────────────────────────────
-info "Building Tor image to generate control password hash..."
-docker compose build tor
-
-TOR_PLAIN_PASS="$(openssl rand -hex 16)"
-TOR_HASH="$(docker run --rm darkweb-scanner-tor tor --hash-password "${TOR_PLAIN_PASS}" 2>/dev/null | grep '^16:' | tail -1)"
-
-if [[ -n "$TOR_HASH" ]]; then
-  sed -i "s|^# HashedControlPassword is injected.*|HashedControlPassword ${TOR_HASH}|" docker/tor/torrc
-  grep -q "^HashedControlPassword" docker/tor/torrc || echo "HashedControlPassword ${TOR_HASH}" >> docker/tor/torrc
-  sed -i "s/^TOR_CONTROL_PASSWORD=.*/TOR_CONTROL_PASSWORD=${TOR_PLAIN_PASS}/" .env
-  success "Tor control password configured."
-else
-  warn "Could not generate Tor hash — circuit rotation may not work."
-  sed -i '/^# HashedControlPassword is injected/d' docker/tor/torrc
-fi
 
 # ── Build all images ──────────────────────────────────────────────────────────
 info "Building all Docker images (this may take a few minutes)..."
@@ -305,16 +295,19 @@ fi
 echo ""
 echo -e "${YELLOW}First-time setup — create your admin account:${NC}"
 if [[ -n "$DOMAIN" ]]; then
-  echo -e "  Visit ${CYAN}https://${DOMAIN}/register${NC} to create your admin account"
+  echo -e "  1. Visit ${CYAN}https://${DOMAIN}/register${NC}"
 else
-  echo -e "  Visit ${CYAN}https://YOUR_SERVER_IP/register${NC} to create your admin account"
+  echo -e "  1. Visit ${CYAN}https://YOUR_SERVER_IP/register${NC}"
 fi
-echo -e "  (Registration is only open when no users exist — it closes after the first account is created)"
+echo -e "  2. Enter the setup token. Show it with:"
+echo -e "       ${CYAN}grep '^SETUP_TOKEN=' ${INSTALL_DIR}/.env${NC}"
+echo -e "  3. Choose a user name and password, then enrol an authenticator app (mandatory)."
+echo -e "  (The page works only while no users exist, and only with the token.)"
 echo ""
 echo -e "${YELLOW}Edit your configuration before running scans:${NC}"
-echo -e "  nano ${INSTALL_DIR}/.env"
-echo -e "  nano ${INSTALL_DIR}/config/keywords.yaml"
-echo -e "  nano ${INSTALL_DIR}/config/seeds.txt"
+echo -e "  vi ${INSTALL_DIR}/.env"
+echo -e "  vi ${INSTALL_DIR}/config/keywords.yaml"
+echo -e "  vi ${INSTALL_DIR}/config/seeds.txt"
 echo ""
 echo -e "${YELLOW}Useful commands (run from ${INSTALL_DIR}):${NC}"
 echo -e "  make scan          # run a crawl (foreground)"

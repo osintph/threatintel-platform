@@ -4,7 +4,9 @@ Place at: src/darkweb_scanner/dashboard/ransomware_live_routes.py
 """
 
 import logging
-from flask import Blueprint, jsonify, request, Response
+
+from flask import Blueprint, Response, jsonify, request
+
 from ..auth import require_login
 
 logger = logging.getLogger(__name__)

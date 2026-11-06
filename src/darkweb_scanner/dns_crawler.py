@@ -5,13 +5,15 @@ Sources: dnspython (active), crt.sh (passive CT logs),
 No paid API keys required.
 """
 
-import logging
-import socket
 import json
+import logging
 import re
+import socket
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -32,6 +34,38 @@ def _clean_domain(domain: str) -> str:
     return domain
 
 
+# A probe target: a host name or IPv4 address, optionally with a port.
+_PROBE_TARGET_RE = re.compile(r"^[a-z0-9]([a-z0-9._-]{0,251}[a-z0-9])?(:[0-9]{1,5})?$", re.IGNORECASE)
+
+
+def _probe_host(target: str) -> Optional[str]:
+    """Host part of a probe target, or None when the target is not a plain host[:port]."""
+    if not _PROBE_TARGET_RE.match(target or ""):
+        return None
+    try:
+        parsed = urlparse(f"//{target}")
+        parsed.port  # raises ValueError when out of range
+        return parsed.hostname
+    except ValueError:
+        return None
+
+
+def _clean_text(value, max_len: int) -> str:
+    """Text taken from a probed host, kept as data: one line, no control or
+    invisible formatting characters, at most max_len characters."""
+    text = "".join(" " if unicodedata.category(ch)[0] == "C" else ch for ch in str(value or ""))
+    return " ".join(text.split())[:max_len]
+
+
+def _redirect_target(url: str, location: str, max_len: int) -> str:
+    """The Location of a 3xx answer as an absolute URL, for display only. It is never requested."""
+    try:
+        location = urljoin(url, location)
+    except ValueError:
+        pass
+    return _clean_text(location, max_len)
+
+
 def _safe_http(url: str, method: str = "get", **kwargs) -> Optional[requests.Response]:
     try:
         kwargs.setdefault("timeout", REQUEST_TIMEOUT)
@@ -50,8 +84,8 @@ def query_dns_records(domain: str) -> dict:
     Returns dict of record_type -> list of values.
     """
     try:
-        import dns.resolver
         import dns.exception
+        import dns.resolver
     except ImportError:
         logger.error("dnspython not installed")
         return {}
@@ -91,10 +125,10 @@ def attempt_zone_transfer(domain: str) -> dict:
     Returns results per nameserver.
     """
     try:
+        import dns.exception
+        import dns.query
         import dns.resolver
         import dns.zone
-        import dns.query
-        import dns.exception
     except ImportError:
         return {"error": "dnspython not installed"}
 
@@ -161,7 +195,7 @@ def fetch_crtsh(domain: str) -> list[dict]:
     Returns list of subdomains with cert metadata.
     """
     # Use safe_fetch: crt.sh is allowlisted, TLS verified, IP pre-checked.
-    from darkweb_scanner.dashboard.http_client import safe_fetch, SafeFetchError
+    from darkweb_scanner.dashboard.http_client import SafeFetchError, safe_fetch
     try:
         result = safe_fetch(
             f"https://crt.sh/?q=%.{domain}&output=json",
@@ -297,8 +331,8 @@ def analyze_email_security(domain: str, dns_records: dict) -> dict:
 
     # DMARC
     try:
-        import dns.resolver
         import dns.exception
+        import dns.resolver
         resolver = dns.resolver.Resolver()
         resolver.timeout = DNS_TIMEOUT
         answers = resolver.resolve(f"_dmarc.{domain}", "TXT", lifetime=DNS_TIMEOUT)
@@ -318,8 +352,8 @@ def analyze_email_security(domain: str, dns_records: dict) -> dict:
     # DKIM — check common selectors
     common_selectors = ["default", "google", "k1", "k2", "mail", "dkim", "selector1", "selector2", "smtp", "email"]
     try:
-        import dns.resolver
         import dns.exception
+        import dns.resolver
         resolver = dns.resolver.Resolver()
         resolver.timeout = 2
         for sel in common_selectors:
@@ -717,17 +751,29 @@ def enumerate_directories(
     target: str,
     paths: list[str] = None,
     max_workers: int = 20,
-    follow_redirects: bool = False,
 ) -> list[dict]:
     """
     Actively probe HTTP/HTTPS for each path in the wordlist.
     target: hostname or IP (no protocol prefix)
     Returns list of {path, url, status_code, content_length, redirect_to}
     for any path that returns a non-404 response.
+
+    The target is resolved once, every address is checked, and all requests go
+    to a checked address. Redirects are not followed; the Location of a 3xx
+    answer is reported as redirect_to.
     """
-    from darkweb_scanner.dashboard.http_client import resolve_and_check_target, SafeFetchError
+    from darkweb_scanner.dashboard.http_client import (
+        SafeFetchError,
+        fetch_public,
+        resolve_and_check_target,
+    )
+
+    host = _probe_host(target)
+    if not host:
+        logger.warning("enumerate_directories: %r is not a host name or address", target)
+        return []
     try:
-        resolve_and_check_target(target)
+        addresses = resolve_and_check_target(host)
     except SafeFetchError as e:
         logger.warning("enumerate_directories: %r blocked by SSRF guard — %s", target, e)
         return []
@@ -737,6 +783,7 @@ def enumerate_directories(
 
     results = []
     protocols = ["https", "http"]
+    scan_headers = {"User-Agent": "Mozilla/5.0 (compatible; OSINTPH-DirScan/1.0)"}
 
     # First figure out which protocol is reachable.
     # TLS verification is enforced (verify=True). Targets with self-signed
@@ -744,16 +791,18 @@ def enumerate_directories(
     base_url = None
     for proto in protocols:
         try:
-            requests.head(
+            fetch_public(
                 f"{proto}://{target}/",
+                method="HEAD",
+                headers=scan_headers,
                 timeout=HTTP_TIMEOUT,
-                allow_redirects=True,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; OSINTPH-DirScan/1.0)"},
-                verify=True,
+                max_bytes=0,
+                https_only=False,
+                addresses=addresses,
             )
             base_url = f"{proto}://{target}"
             break
-        except Exception:
+        except SafeFetchError:
             continue
 
     if not base_url:
@@ -763,29 +812,31 @@ def enumerate_directories(
     def probe(path: str) -> Optional[dict]:
         url = base_url + path
         try:
-            r = requests.get(
+            r = fetch_public(
                 url,
+                headers=scan_headers,
                 timeout=HTTP_TIMEOUT,
-                allow_redirects=follow_redirects,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; OSINTPH-DirScan/1.0)"},
-                verify=True,
-                stream=True,
+                max_bytes=0,
+                https_only=False,
+                addresses=addresses,
             )
-            # Skip boring 404s and common irrelevant codes
-            if r.status_code in (404, 410):
-                return None
-            content_length = r.headers.get("content-length", "")
-            redirect_to = r.headers.get("location", "") if r.status_code in (301, 302, 307, 308) else ""
-            r.close()
-            return {
-                "path": path,
-                "url": url,
-                "status_code": r.status_code,
-                "content_length": content_length,
-                "redirect_to": redirect_to,
-            }
-        except Exception:
+        except SafeFetchError:
             return None
+        status_code = r["status"]
+        # Skip boring 404s and common irrelevant codes
+        if status_code in (404, 410):
+            return None
+        hdrs = {k.lower(): v for k, v in r["headers"].items()}
+        redirect_to = ""
+        if status_code in (301, 302, 303, 307, 308) and hdrs.get("location"):
+            redirect_to = _redirect_target(url, hdrs["location"], REDIRECT_MAX_LEN)
+        return {
+            "path": path,
+            "url": url,
+            "status_code": status_code,
+            "content_length": _clean_text(hdrs.get("content-length", ""), 20),
+            "redirect_to": redirect_to,
+        }
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {ex.submit(probe, p): p for p in paths}
@@ -835,16 +886,37 @@ def run_port_and_dir_scan(domain: str, ips: list[str]) -> dict:
 
 HTTP_BANNER_TIMEOUT = 5
 HTTP_BANNER_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; OSINTPH-Recon/1.0)"}
+HTTP_BANNER_BYTES = 4096  # enough of the body to find a <title>
+SERVER_MAX_LEN = 120
+TITLE_MAX_LEN = 80
+REDIRECT_MAX_LEN = 300
+
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
 
 def probe_service(fqdn: str) -> Optional[dict]:
     """
     Probe a single hostname over HTTPS then HTTP.
     Returns {host, url, status_code, server, title, tech, redirect_to} or None.
+
+    The name is resolved once, every address is checked, and both requests go
+    to a checked address. Redirects are not followed: a host that answers 3xx
+    is reported with that status and its Location as redirect_to, so a
+    redirect cannot send the probe to an internal address. Header and title
+    text is stored as data, without control characters and capped in length.
     """
-    from darkweb_scanner.dashboard.http_client import resolve_and_check_target, SafeFetchError
+    from darkweb_scanner.dashboard.http_client import (
+        SafeFetchError,
+        fetch_public,
+        resolve_and_check_target,
+    )
+
+    host = _probe_host(fqdn)
+    if not host:
+        logger.warning("probe_service: %r is not a host name or address", fqdn)
+        return None
     try:
-        resolve_and_check_target(fqdn)
+        addresses = resolve_and_check_target(host)
     except SafeFetchError as e:
         logger.warning("probe_service: %r blocked by SSRF guard — %s", fqdn, e)
         return None
@@ -852,60 +924,57 @@ def probe_service(fqdn: str) -> Optional[dict]:
     for proto in ("https", "http"):
         url = f"{proto}://{fqdn}"
         try:
-            resp = requests.get(
+            # TLS enforced; targets with invalid certs fall through to HTTP
+            resp = fetch_public(
                 url,
-                timeout=HTTP_BANNER_TIMEOUT,
                 headers=HTTP_BANNER_HEADERS,
-                verify=True,  # TLS enforced; targets with invalid certs fall through to HTTP
-                allow_redirects=True,
-                stream=True,
+                timeout=HTTP_BANNER_TIMEOUT,
+                max_bytes=HTTP_BANNER_BYTES,
+                https_only=False,
+                addresses=addresses,
             )
-            # Grab first 4KB for title extraction
-            chunk = b""
-            for part in resp.iter_content(4096):
-                chunk += part
-                break
-            resp.close()
+        except SafeFetchError:
+            continue
 
-            server = resp.headers.get("server") or resp.headers.get("x-powered-by") or ""
+        try:
+            status_code = resp["status"]
+            hdrs = {k.lower(): v for k, v in resp["headers"].items()}
+
+            server = _clean_text(hdrs.get("server") or hdrs.get("x-powered-by") or "", SERVER_MAX_LEN)
             # Normalise: strip version noise e.g. "nginx/1.18.0" -> "nginx"
             server_clean = server.split("/")[0].strip().lower() if server else ""
 
             # Extract <title>
             title = ""
-            try:
-                decoded = chunk.decode("utf-8", errors="ignore")
-                import re as _re
-                m = _re.search(r"<title[^>]*>(.*?)</title>", decoded, _re.IGNORECASE | _re.DOTALL)
-                if m:
-                    title = " ".join(m.group(1).strip().split())[:80]
-            except Exception:
-                pass
+            m = _TITLE_RE.search(resp["body"].decode("utf-8", errors="ignore"))
+            if m:
+                title = _clean_text(m.group(1), TITLE_MAX_LEN)
 
             # Detect tech stack from headers
             tech = []
-            h = {k.lower(): v.lower() for k, v in resp.headers.items()}
+            h = {k: v.lower() for k, v in hdrs.items()}
             if "cloudflare" in h.get("server", "") or "cf-ray" in h:
                 tech.append("Cloudflare")
             if "x-powered-by" in h:
-                tech.append(h["x-powered-by"].split("/")[0].title()[:20])
+                tech.append(_clean_text(h["x-powered-by"].split("/")[0].title(), 20))
             if "x-aspnet-version" in h or "x-aspnetmvc-version" in h:
                 tech.append("ASP.NET")
             if "x-wp-total" in h or "x-pingback" in h:
                 tech.append("WordPress")
-            if resp.headers.get("x-amz-cf-id") or resp.headers.get("x-amz-request-id"):
+            if h.get("x-amz-cf-id") or h.get("x-amz-request-id"):
                 tech.append("AWS")
             if "awselb" in server.lower() or "awsalb" in server.lower():
                 tech.append("AWS ELB")
 
-            final_url = resp.url
-            redirect_to = str(final_url) if str(final_url) != url else ""
+            redirect_to = ""
+            if status_code in (301, 302, 303, 307, 308) and hdrs.get("location"):
+                redirect_to = _redirect_target(url, hdrs["location"], REDIRECT_MAX_LEN)
 
             return {
                 "host": fqdn,
                 "url": url,
-                "final_url": final_url,
-                "status_code": resp.status_code,
+                "final_url": url,  # redirects are not followed
+                "status_code": status_code,
                 "server": server_clean or "unknown",
                 "server_raw": server,
                 "title": title,

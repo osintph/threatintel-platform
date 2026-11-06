@@ -89,7 +89,18 @@ services:
       - "8080"
     networks:
       - scanner_net
-    command: ["python", "-m", "darkweb_scanner.dashboard.app"]
+    # gunicorn, not Flask's development server. Exactly one worker process: the crawl,
+    # Quick Scan and Channel Monitor keep their job state in memory. Long requests run
+    # in the 8 threads; --timeout only restarts a worker whose main loop has stopped.
+    command:
+      - gunicorn
+      - --bind=0.0.0.0:8080
+      - --workers=1
+      - --threads=8
+      - --timeout=120
+      - --graceful-timeout=30
+      - --worker-tmp-dir=/dev/shm
+      - "darkweb_scanner.dashboard.app:create_app()"
     healthcheck:
       # /healthz runs SELECT 1, so "healthy" means the app can reach its database.
       test: ["CMD", "curl", "-sf", "http://localhost:8080/healthz"]

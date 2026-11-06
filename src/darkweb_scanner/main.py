@@ -372,6 +372,75 @@ def check_tor():
         sys.exit(1)
 
 
+# ── Accounts (run on the server; see docs/runbook.md) ──────────────────────────
+# For the cases the dashboard cannot solve by itself: the only administrator is
+# locked out or has lost the authenticator. Nothing here shows or sets a password.
+
+
+def _find_user(storage: Storage, username: str):
+    user = storage.get_user_by_username(username)
+    if user is None:
+        click.echo(f"No user named {username!r}. List the accounts with: user-list", err=True)
+        sys.exit(1)
+    return user
+
+
+@cli.command("user-list")
+def user_list():
+    """List accounts and the sign-in locks in force (no secrets)."""
+    storage = Storage()
+    click.echo(f"{'id':>4}  {'user name':<32} {'admin':<6} {'2FA':<5} {'temp. password':<15} last sign-in")
+    for u in storage.list_users():
+        last = u.last_login.strftime("%Y-%m-%d %H:%M") if u.last_login else "never"
+        click.echo(
+            f"{u.id:>4}  {u.username:<32} {'yes' if u.is_admin else 'no':<6} "
+            f"{'on' if u.totp_enabled and u.totp_secret else 'off':<5} "
+            f"{'yes' if u.must_change_password else 'no':<15} {last}"
+        )
+    locks = storage.throttle_locks()
+    click.echo("")
+    if not locks:
+        click.echo("No sign-in locks in force.")
+    for lock in locks:
+        kind, _, value = lock["key"].partition(":")
+        what = {"user": "password, user name", "ip": "address", "totp": "second factor, user id"}.get(kind, kind)
+        click.echo(f"Locked for {(lock['seconds'] + 59) // 60} more min: {what} {value}")
+
+
+@cli.command("user-unlock")
+@click.argument("username")
+@click.option("--address", default=None, help="Also lift the lock on this network address")
+def user_unlock(username: str, address: str):
+    """Lift the sign-in locks on USERNAME (wrong passwords, wrong codes)."""
+    from .auth import account_key, ip_key, totp_key
+
+    storage = Storage()
+    user = _find_user(storage, username)
+    keys = [account_key(user.username), totp_key(user.id)]
+    if address:
+        keys.append(ip_key(address.strip()))
+    for key in keys:
+        storage.throttle_clear(key)
+    storage.add_auth_event("unlock", user.username, user.id, "local", "command line")
+    click.echo(f"Locks lifted for {user.username}" + (f" and address {address.strip()}." if address else "."))
+
+
+@cli.command("user-reset-mfa")
+@click.argument("username")
+@click.confirmation_option(prompt="Remove this user's second factor and end their sessions?")
+def user_reset_mfa(username: str):
+    """Remove USERNAME's second factor; they enrol a new one at the next sign-in."""
+    from .auth import totp_key
+
+    storage = Storage()
+    user = _find_user(storage, username)
+    storage.disable_totp(user.id)
+    storage.bump_session_version(user.id)
+    storage.throttle_clear(totp_key(user.id))
+    storage.add_auth_event("mfa_reset", user.username, user.id, "local", "command line")
+    click.echo(f"Second factor removed for {user.username}. They sign in with their password and enrol again.")
+
+
 def main():
     cli()
 

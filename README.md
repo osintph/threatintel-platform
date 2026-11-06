@@ -2,7 +2,7 @@
 
 A self-hosted, open-source threat intelligence platform built for the Philippine and Southeast Asian security landscape. Crawls .onion networks, monitors Telegram channels, tracks ransomware groups, profiles threat actors, and delivers a daily intelligence digest — all from a single Docker Compose deployment.
 
-**Version: 1.1.1 · License: AGPL-3.0**
+**Version: 1.2.0 · License: AGPL-3.0**
 
 ---
 
@@ -20,24 +20,30 @@ A self-hosted, open-source threat intelligence platform built for the Philippine
 - **WhatsMyName Username Check** — checks a username across 200+ sites concurrently
 - **OSINT Domain Intel** — proxied access to Shodan, Censys, GreyNoise, URLScan, MXToolbox, SecurityTrails, VirusTotal, RDAP/WHOIS, and GitHub/Reddit/Discord/TikTok OSINT profiles
 - **ThreatFox / URLhaus / AbuseIPDB proxies** — backend-proxied API calls to avoid CORS and keep keys server-side
-- **Channel Monitor** — on-demand Telegram channel scraping from the dashboard, auto-translated to English, with media download and ZIP export
+- **Channel Monitor** — on-demand scraping of public Telegram channels from the dashboard (administrators only), translated to English with Google Translate, with media download and ZIP export; archives are deleted after 90 days
 - **Telegram Scraper** — background monitoring of configured public channels for keyword hits
 - **Projects** — scoped monitoring engagements with per-project keywords, target domains, entities, and hit tracking
 - **PDF Report Generation** — ReportLab + Playwright-rendered world map for DNS investigations; digest PDF via Mailgun
 - **Daily Digest** — morning email with CISA KEV, OTX pulses, abuse.ch feeds, and curated RSS
-- **Authentication** — bcrypt passwords, TOTP 2FA, optional Google/GitHub/Microsoft/Apple OAuth, role-based access control (admin / analyst)
+- **Authentication** — local accounts with bcrypt passwords and mandatory TOTP two-factor sign-in, lockouts, a sign-in log, and two roles (administrator / user). In-app **Help & privacy** page lists who can do what and which data leaves the server
 
 ---
 
 ## Security Posture
 
 - **safe\_fetch with host allowlist and IP blocklist** — all outbound proxy calls go through a hardened HTTP client that enforces HTTPS, TLS verification, a per-host allowlist, and an IP blocklist covering loopback, RFC 1918, link-local, and IPv4-mapped IPv6 ranges; redirects are re-validated per hop
-- **DNS rebinding note** — safe\_fetch performs a pre-flight IP check followed by a standard requests connect; a low-TTL rebind between the two resolutions can still reach private IPs on the dns\_crawler recon path (see SECURITY\_REVIEW\_FABLE.md finding 2/3 for details and planned remediation)
+- **Pinned outbound connections** — a host name is resolved once and the connection goes to an address that passed the check, so a second DNS answer (DNS rebinding) cannot move a request to an internal address. This covers the proxy routes, the DNS recon probes and the user-name check; recon probes never follow redirects
+- **Sessions checked on the server** — the cookie carries a user id and a session version; the user, the role and the second factor are read from the database on every request. Sessions end after 12 hours, and at sign-out, password change, second-factor change or user deletion
+- **CSRF protection** — every request that changes something needs the session's token and, when the browser sends one, a matching `Origin`
+- **Sign-in throttling** — 10 wrong passwords per user name or 20 failures per address in 15 minutes lock sign-in for 15 minutes; 5 wrong codes lock the second step; a code works once
+- **Admin-only changes** — global settings, crawl control, deletes, user administration and Channel Monitor require the administrator role, checked on the server
+- **Escaped output** — the dashboard renders API data as text (no data in event handlers, URL schemes checked); PDF exports and the Channel Monitor report escape everything they did not write themselves
+- **No Tor control port** — the Tor container is a SOCKS client only and its configuration is rendered when it starts
 - **Non-root containers** — the app container runs as uid 1000 (appuser); the Tor sidecar runs as debian-tor
 - **TLS verification** — `verify=True` enforced on all safe\_fetch calls; legacy `ssl.CERT_NONE` paths in dns\_crawler are documented as lower-trust
 - **Healthcheck** — the dashboard container's healthcheck calls `GET /healthz`, which runs a query against the database, so "healthy" means the app can reach PostgreSQL
 - **Pinned supply chain** — Python dependencies are installed only from `requirements.lock` with hash checking; base images are pinned by digest
-- **Secret key enforcement** — Flask refuses to start if `DASHBOARD_SECRET_KEY` is absent or set to the placeholder value
+- **Start-up checks** — the dashboard refuses to start if `DASHBOARD_SECRET_KEY` is absent, a placeholder or shorter than 32 characters, or if `DATABASE_URL` is not set
 - **HTML escaping** — all keyword hit context is escaped before inclusion in alert emails
 
 ---
@@ -47,8 +53,8 @@ A self-hosted, open-source threat intelligence platform built for the Philippine
 ```
 docker-compose
   postgres:16-alpine       ← persistent storage (named volume)
-  tor                      ← SOCKS5 proxy + control port; runs as debian-tor
-  dashboard                ← Flask app; runs as appuser (uid 1000)
+  tor                      ← SOCKS5 proxy only (no control port); runs as debian-tor
+  dashboard                ← Flask app under gunicorn (1 worker, 8 threads); runs as appuser (uid 1000)
   nginx                    ← SSL reverse proxy; Let's Encrypt or self-signed
 ```
 
@@ -87,11 +93,11 @@ DOMAIN=intel.yourdomain.com SSL_EMAIL=you@example.com \
   sudo bash /tmp/deploy.sh
 ```
 
-The script installs Docker, clones the repo, generates secrets, configures Tor, and starts all services.
+The script installs Docker, clones the repo, generates secrets (including the one-time setup token), and starts all services.
 
 ### First-time setup after deploy
 
-1. Visit `https://YOUR_SERVER_IP/register` to create your admin account. Registration closes automatically after the first account is created.
+1. Visit `https://YOUR_SERVER_IP/register` and create the administrator account. The page asks for the setup token that `deploy.sh` wrote to `.env` (`grep '^SETUP_TOKEN=' ~/threatintel-platform/.env`), then for a user name and password, and then makes you enrol an authenticator app. It works only while no users exist.
 2. Edit your configuration:
    ```bash
    vi ~/threatintel-platform/.env
@@ -100,7 +106,7 @@ The script installs Docker, clones the repo, generates secrets, configures Tor, 
    ```
 3. Restart to apply changes:
    ```bash
-   cd ~/threatintel-platform && docker compose restart dashboard
+   cd ~/threatintel-platform && docker compose up -d dashboard
    ```
 
 ### Updating
@@ -108,10 +114,12 @@ The script installs Docker, clones the repo, generates secrets, configures Tor, 
 ```bash
 cd ~/threatintel-platform
 sudo ./upgrade.sh            # tip of main
-sudo ./upgrade.sh v1.1.1     # or a release tag
+sudo ./upgrade.sh v1.2.0     # or a release tag
 ```
 
-`upgrade.sh` dumps the database first, checks out the release, fixes known `.env` issues, rebuilds the images from the lock file, recreates the containers one by one and ends by checking that nginx answers 200 for each site. Details and rollback: [docs/runbook.md](docs/runbook.md#upgrading).
+`upgrade.sh` dumps the database first, checks out the release, fixes known `.env` issues (and removes settings that are no longer used, after keeping a copy), rebuilds the images from the lock file, recreates the containers one by one and ends by checking that nginx answers 200 for each site. Details and rollback: [docs/runbook.md](docs/runbook.md#upgrading).
+
+**Upgrading to 1.2.0:** everyone signs in again; every account needs a second factor; Channel Monitor archives older than 90 days are deleted at the first start. See the upgrade notes in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -123,10 +131,10 @@ All configuration lives in `.env`. **Never commit this file.**
 
 | Variable | Description |
 |----------|-------------|
-| `DASHBOARD_SECRET_KEY` | Flask session secret — must be a long random string; the app refuses to start without it |
+| `DASHBOARD_SECRET_KEY` | Session secret — at least 32 random characters; the app refuses to start without it. Changing it signs everyone out |
+| `SETUP_TOKEN` | Needed once, to create the first administrator at `/register` (at least 24 characters) — auto-generated by deploy.sh |
 | `POSTGRES_PASSWORD` | PostgreSQL password — auto-generated by deploy.sh |
-| `DATABASE_URL` | PostgreSQL connection string, `postgresql+psycopg2://…` — auto-set by deploy.sh |
-| `TOR_CONTROL_PASSWORD` | Tor control port password — auto-generated by deploy.sh |
+| `DATABASE_URL` | PostgreSQL connection string, `postgresql+psycopg2://…` — auto-set by deploy.sh; required |
 
 ### Threat intelligence feeds
 
@@ -156,6 +164,7 @@ All configuration lives in `.env`. **Never commit this file.**
 | `TELEGRAM_API_HASH` | From my.telegram.org/apps |
 | `TELEGRAM_PHONE` | Your phone number with country code — required for Channel Monitor |
 | `TELEGRAM_CHANNELS` | Comma-separated channel usernames (no @) — used by background scraper |
+| `CHANNEL_MONITOR_RETENTION_DAYS` | Channel Monitor archives are deleted after this many days (default `90`) |
 
 ### Quick Scan
 
@@ -164,15 +173,6 @@ All configuration lives in `.env`. **Never commit this file.**
 | `QUICK_SCAN_MAX_CONCURRENT` | `4` | Max concurrent source checks per scan session |
 | `QUICK_SCAN_DELAY_MIN` | falls back to `CRAWL_DELAY_MIN` (2s) | Min delay between source requests |
 | `QUICK_SCAN_DELAY_MAX` | falls back to `CRAWL_DELAY_MAX` (8s) | Max delay between source requests |
-
-### OAuth (optional)
-
-| Variable | Description |
-|----------|-------------|
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth — callback: `/oauth/google/callback` |
-| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | GitHub OAuth — callback: `/oauth/github/callback` |
-| `MICROSOFT_CLIENT_ID` / `MICROSOFT_CLIENT_SECRET` / `MICROSOFT_TENANT_ID` | Microsoft OAuth |
-| `APPLE_CLIENT_ID` / `APPLE_CLIENT_SECRET` | Apple Sign In |
 
 See `.env.example` for all variables with descriptions and safe placeholder values.
 
@@ -185,15 +185,24 @@ source .venv/bin/activate
 pytest tests/ -v
 ```
 
-Current count: **135 passed, 2 skipped**. Tests cover:
+Current count: **595 passed, 2 skipped**. Tests cover:
 
-- Scanner keyword matching (hit detection, case insensitivity, context windows, add/remove)
-- Crawler URL normalisation, domain extraction, link extraction, crawl filter logic
-- HTTP client (safe\_fetch allowlist, IP blocklist, TLS enforcement, redirect re-validation, IPv4-mapped IPv6 blocking, SSRF guard)
-- Storage models, session lifecycle, and Storage methods (unit + integration against SQLite)
-- Quick scan target detection, variant normalisation, and deduplication
-- Proxy route wiring (integration, with safe\_fetch mocked)
+- Sign-in, sessions, CSRF, lockouts, the second factor and the setup token, against the real application
+- Authorization: every admin-only route as a non-admin, and deletes scoped to their project
+- Input validation for every route that takes user input
+- Dashboard templates (static rules: no data in event handlers, URLs and colours checked, CSRF token on writes)
+- Channel Monitor report and routes (escaping, public-channel check, ownership, retention)
+- Outbound requests (allowlist, IP blocklist, pinned address, redirects, PDF text escaping)
+- Scanner, crawler, storage, Quick Scan, proxy routes, Tor client
 - Tor connectivity (skipped unless `TOR_INTEGRATION=1`)
+
+Set `TEST_DATABASE_URL` to run the integration tests on PostgreSQL instead of in-memory SQLite (the database is emptied before each test). CI does this, and also runs:
+
+```bash
+python tests/browser/xss_check.py            # dashboard pages in headless Chromium, hostile data in every API answer
+tests/nginx/test_entrypoint.sh <nginx image> # certificates survive restarts, unknown hosts refused
+tests/tor/test_entrypoint.sh <tor image>     # rendered torrc, no control port
+```
 
 ---
 
@@ -210,10 +219,10 @@ make setup          # copies .env.example → .env and example configs
 
 The Docker image and CI install the exact versions in `requirements.lock`. After changing a dependency in `pyproject.toml`, regenerate it with `make lock` (needs [uv](https://docs.astral.sh/uv/)).
 
-Run the dashboard locally (requires a running PostgreSQL and Tor):
+Run the dashboard locally (requires `DATABASE_URL`, a `DASHBOARD_SECRET_KEY` of 32+ characters, and Tor for crawling). `DASHBOARD_ALLOW_HTTP=1` lets the session cookie travel over plain HTTP; use it on your own machine only:
 
 ```bash
-python -m darkweb_scanner.dashboard.app
+DASHBOARD_ALLOW_HTTP=1 gunicorn --bind 127.0.0.1:8080 --workers 1 --threads 8 'darkweb_scanner.dashboard.app:create_app()'
 ```
 
 Or via Docker Compose:
@@ -222,7 +231,7 @@ Or via Docker Compose:
 docker compose up -d
 ```
 
-> Note: the Dockerfile CMD starts Flask's built-in server (`python -m darkweb_scanner.dashboard.app`). Migrating to gunicorn with a proper worker count is a planned follow-up.
+> The dashboard runs under gunicorn with one worker process (see `docker-compose.yml`). Keep it at one: crawl, Quick Scan and Channel Monitor state lives in that process.
 
 ---
 
@@ -249,11 +258,14 @@ src/darkweb_scanner/
   telegram_scraper.py    # background Telegram channel scraper
   channel_monitor.py     # on-demand Telegram channel monitor
   paste_monitor.py       # rentry.co paste polling
-  auth.py                # bcrypt, TOTP, OAuth helpers
+  auth.py                # sessions, CSRF, lockouts, bcrypt, TOTP
+  pdf_text.py            # escaping for text placed in PDF exports
+  templates/             # Channel Monitor report template
   dashboard/
     app.py               # Flask application factory
     http_client.py       # safe_fetch — hardened outbound HTTP client
-    auth_routes.py       # /login, /register, /totp/*, /oauth/*
+    auth_routes.py       # /login, /register, /totp/*, /logout
+    validation.py        # input validation for the API routes
     dashboard_routes.py  # all API and dashboard routes
     ransomware_live_routes.py  # /api/rwlive/* blueprint
     channel_monitor_routes.py  # Channel Monitor API + job runner
@@ -261,9 +273,10 @@ src/darkweb_scanner/
     storage_helper.py    # request-scoped Storage singleton
     templates/
       index.html         # single-page dashboard UI
+      help.html          # Help & privacy page
 docker/
   app/Dockerfile         # app image; non-root (appuser uid 1000)
-  tor/Dockerfile         # Tor sidecar; non-root (debian-tor)
+  tor/                   # Tor sidecar; non-root (debian-tor); torrc rendered at start
   nginx/                 # nginx with auto SSL entrypoint
 ops/cf-origin-lock/      # optional: limit ports 80/443 to Cloudflare (systemd unit + timer)
 requirements.lock        # exact dependency versions with hashes (make lock)
@@ -282,6 +295,7 @@ make scan          # run a crawl (foreground)
 make check-tor     # verify Tor connectivity
 make stats         # show scan statistics
 make hits          # show recent keyword hits
+make users         # list accounts and sign-in locks
 make logs          # tail all container logs
 make stop          # stop all containers
 ```

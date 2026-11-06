@@ -6,12 +6,13 @@ Stores crawl results, keyword hits, and crawl session metadata.
 import json
 import logging
 import os
+import secrets
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import Boolean, Column, DateTime, Index, Integer, String, Text, create_engine, func
-from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,50 @@ class User(Base):
         Index("ix_users_email", "email"),
         Index("ix_users_oauth", "oauth_provider", "oauth_id"),
     )
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+class UserSecurity(Base):
+    """Per-user security state. Its own table so that adding it needs no ALTER on ``users``."""
+
+    __tablename__ = "user_security"
+
+    user_id = Column(Integer, primary_key=True, autoincrement=False)
+    # Stored in the session cookie; a cookie with another value is not a session.
+    session_version = Column(Integer, nullable=False)
+    # Last 30-second step a code was accepted for; a code works once.
+    totp_last_step = Column(Integer, nullable=True)
+    # Secret shown during enrolment, kept here until the first code confirms it.
+    pending_totp_secret = Column(String(64), nullable=True)
+    pending_totp_created = Column(DateTime, nullable=True)
+
+
+class AuthEvent(Base):
+    __tablename__ = "auth_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, nullable=False, default=_utcnow)
+    event = Column(String(40), nullable=False)
+    username = Column(String(100), nullable=True)
+    user_id = Column(Integer, nullable=True)
+    ip = Column(String(45), nullable=True)
+    detail = Column(String(255), nullable=True)
+
+    __table_args__ = (Index("ix_auth_events_ts", "ts"),)
+
+
+class AuthThrottle(Base):
+    """Failed sign-in attempts per key (``user:<name>``, ``ip:<address>``, ``totp:<user id>``)."""
+
+    __tablename__ = "auth_throttle"
+
+    key = Column(String(160), primary_key=True)
+    failures = Column(Integer, nullable=False, default=0)
+    window_start = Column(DateTime, nullable=False, default=_utcnow)
+    locked_until = Column(DateTime, nullable=True)
 
 
 class CrawlSession(Base):
@@ -347,9 +392,14 @@ def normalise_database_url(url: str) -> str:
 
 class Storage:
     def __init__(self, database_url: Optional[str] = None):
-        self.database_url = normalise_database_url(
-            database_url or os.getenv("DATABASE_URL", "sqlite:////app/data/results.db")
-        )
+        database_url = database_url or os.getenv("DATABASE_URL", "")
+        if not database_url:
+            # No fallback: an empty database would reopen first-admin registration.
+            raise RuntimeError(
+                "DATABASE_URL is not set. Set it in .env (see .env.example), "
+                "for example postgresql+psycopg2://scanner:<password>@postgres:5432/darkweb_scanner"
+            )
+        self.database_url = normalise_database_url(database_url)
         connect_args = {}
         if self.database_url.startswith("sqlite"):
             connect_args["check_same_thread"] = False
@@ -379,7 +429,7 @@ class Storage:
         preserving the original per-call behaviour.
         """
         try:
-            from flask import has_request_context, g
+            from flask import g, has_request_context
             if has_request_context():
                 if not hasattr(g, _FLASK_SESSION_KEY):
                     setattr(g, _FLASK_SESSION_KEY, self._SessionFactory())
@@ -571,24 +621,14 @@ class Storage:
         with self.get_session() as session:
             return session.query(User).filter(User.email == email).first()
 
-    def get_user_by_oauth(self, provider: str, oauth_id: str):
-        with self.get_session() as session:
-            return session.query(User).filter(
-                User.oauth_provider == provider,
-                User.oauth_id == oauth_id
-            ).first()
-
-    def create_user(self, username: str, password_hash: str = None,
-                    email: str = None, oauth_provider: str = None,
-                    oauth_id: str = None, is_admin: bool = False,
+    def create_user(self, username: str, password_hash: Optional[str] = None,
+                    email: Optional[str] = None, is_admin: bool = False,
                     must_change_password: bool = False):
         with self.get_session() as session:
             user = User(
                 username=username,
                 email=email,
                 password_hash=password_hash,
-                oauth_provider=oauth_provider,
-                oauth_id=oauth_id,
                 is_admin=is_admin,
                 must_change_password=must_change_password,
             )
@@ -596,7 +636,6 @@ class Storage:
             session.commit()
             session.refresh(user)
             return user.id
-
 
     def set_must_change_password(self, user_id: int, value: bool = False):
         with self.get_session() as session:
@@ -609,15 +648,21 @@ class Storage:
         with self.get_session() as session:
             user = session.get(User, user_id)
             if user:
-                user.last_login = datetime.now(timezone.utc).replace(tzinfo=None)
+                user.last_login = _utcnow()
                 session.commit()
 
-    def enable_totp(self, user_id: int, secret: str):
+    def enable_totp(self, user_id: int, secret: str, step: Optional[int] = None):
+        """Turn the second factor on. ``step`` is the time step of the code that
+        confirmed the secret; recording it stops that code being used again."""
         with self.get_session() as session:
             user = session.get(User, user_id)
             if user:
                 user.totp_secret = secret
                 user.totp_enabled = True
+                sec = self._security_row(session, user_id)
+                sec.totp_last_step = step
+                sec.pending_totp_secret = None
+                sec.pending_totp_created = None
                 session.commit()
 
     def disable_totp(self, user_id: int):
@@ -626,11 +671,19 @@ class Storage:
             if user:
                 user.totp_secret = None
                 user.totp_enabled = False
+                sec = self._security_row(session, user_id)
+                sec.totp_last_step = None
+                sec.pending_totp_secret = None
+                sec.pending_totp_created = None
                 session.commit()
 
     def count_users(self) -> int:
         with self.get_session() as session:
             return session.query(func.count(User.id)).scalar() or 0
+
+    def count_admins(self) -> int:
+        with self.get_session() as session:
+            return session.query(func.count(User.id)).filter(User.is_admin.is_(True)).scalar() or 0
 
     def get_unalerted_hits(self) -> list[KeywordHitRecord]:
         with self.get_session() as session:
@@ -645,7 +698,9 @@ class Storage:
             user = session.get(User, user_id)
             if user:
                 session.delete(user)
-                session.commit()
+            session.query(UserSecurity).filter(UserSecurity.user_id == user_id).delete()
+            session.query(AuthThrottle).filter(AuthThrottle.key == f"totp:{user_id}").delete()
+            session.commit()
 
     def update_user_password(self, user_id: int, password_hash: str):
         with self.get_session() as session:
@@ -654,7 +709,138 @@ class Storage:
                 user.password_hash = password_hash
                 session.commit()
 
+    # --- Sessions, second factor, throttling, auth events ---
 
+    @staticmethod
+    def _security_row(session, user_id: int) -> "UserSecurity":
+        sec = session.get(UserSecurity, user_id)
+        if sec is None:
+            # Random start: a cookie issued to an earlier user with the same id cannot match.
+            sec = UserSecurity(user_id=user_id, session_version=secrets.randbelow(2**30) + 1)
+            session.add(sec)
+            session.flush()
+        return sec
+
+    def get_session_version(self, user_id: int) -> Optional[int]:
+        """The version a session cookie must carry, or None when the user has never signed in."""
+        with self.get_session() as session:
+            sec = session.get(UserSecurity, user_id)
+            return sec.session_version if sec is not None else None
+
+    def ensure_session_version(self, user_id: int) -> int:
+        with self.get_session() as session:
+            sec = self._security_row(session, user_id)
+            session.commit()
+            return sec.session_version
+
+    def bump_session_version(self, user_id: int) -> int:
+        """End every session of the user. Returns the new version."""
+        with self.get_session() as session:
+            sec = self._security_row(session, user_id)
+            sec.session_version = (sec.session_version % (2**30)) + 1
+            session.commit()
+            return sec.session_version
+
+    def accept_totp_step(self, user_id: int, step: int) -> bool:
+        """Record ``step`` as used. False when this or a later step was used before (replay)."""
+        with self.get_session() as session:
+            self._security_row(session, user_id)
+            changed = (
+                session.query(UserSecurity)
+                .filter(
+                    UserSecurity.user_id == user_id,
+                    (UserSecurity.totp_last_step.is_(None)) | (UserSecurity.totp_last_step < step),
+                )
+                .update({UserSecurity.totp_last_step: step}, synchronize_session=False)
+            )
+            session.commit()
+            return changed == 1
+
+    def set_pending_totp_secret(self, user_id: int, secret: Optional[str]):
+        with self.get_session() as session:
+            sec = self._security_row(session, user_id)
+            sec.pending_totp_secret = secret
+            sec.pending_totp_created = _utcnow() if secret else None
+            session.commit()
+
+    def get_pending_totp_secret(self, user_id: int, max_age_seconds: int) -> Optional[str]:
+        with self.get_session() as session:
+            sec = session.get(UserSecurity, user_id)
+            if sec is None or not sec.pending_totp_secret or sec.pending_totp_created is None:
+                return None
+            if _utcnow() - sec.pending_totp_created > timedelta(seconds=max_age_seconds):
+                return None
+            return sec.pending_totp_secret
+
+    def throttle_locked_seconds(self, key: str) -> int:
+        with self.get_session() as session:
+            row = session.get(AuthThrottle, key)
+            if row is None or row.locked_until is None:
+                return 0
+            return max(0, int((row.locked_until - _utcnow()).total_seconds()))
+
+    def throttle_fail(self, key: str, limit: int, window_seconds: int, lock_seconds: int) -> bool:
+        """Count one failure for ``key``. True when the key is locked after it."""
+        now = _utcnow()
+        with self.get_session() as session:
+            row = session.query(AuthThrottle).filter(AuthThrottle.key == key).with_for_update().first()
+            if row is None:
+                row = AuthThrottle(key=key, failures=0, window_start=now)
+                session.add(row)
+            if now - row.window_start > timedelta(seconds=window_seconds):
+                row.failures = 0
+                row.window_start = now
+            row.failures += 1
+            locked = row.failures >= limit
+            if locked:
+                row.locked_until = now + timedelta(seconds=lock_seconds)
+                row.failures = 0
+                row.window_start = now
+            session.commit()
+            return locked
+
+    def throttle_locks(self) -> list[dict]:
+        """The sign-in locks in force now: [{"key": ..., "seconds": ...}]."""
+        now = _utcnow()
+        with self.get_session() as session:
+            rows = session.query(AuthThrottle).filter(AuthThrottle.locked_until > now).order_by(AuthThrottle.key).all()
+            return [{"key": r.key, "seconds": int((r.locked_until - now).total_seconds())} for r in rows]
+
+    def throttle_clear(self, key: str):
+        with self.get_session() as session:
+            session.query(AuthThrottle).filter(AuthThrottle.key == key).delete()
+            session.commit()
+
+    def add_auth_event(self, event: str, username: str = "", user_id: Optional[int] = None,
+                       ip: str = "", detail: str = ""):
+        with self.get_session() as session:
+            session.add(AuthEvent(
+                event=event[:40], username=(username or None), user_id=user_id,
+                ip=(ip or None), detail=(detail or None),
+            ))
+            session.commit()
+
+    def list_auth_events(self, limit: int = 200) -> list[dict]:
+        with self.get_session() as session:
+            rows = session.query(AuthEvent).order_by(AuthEvent.id.desc()).limit(limit).all()
+            return [
+                {
+                    "ts": r.ts.isoformat() + "Z", "event": r.event, "username": r.username,
+                    "user_id": r.user_id, "ip": r.ip, "detail": r.detail,
+                }
+                for r in rows
+            ]
+
+    def prune_auth_state(self, event_days: int = 365):
+        """Drop auth events older than ``event_days`` and throttle rows idle for a day."""
+        now = _utcnow()
+        with self.get_session() as session:
+            session.query(AuthEvent).filter(AuthEvent.ts < now - timedelta(days=event_days)).delete()
+            session.query(AuthThrottle).filter(
+                AuthThrottle.window_start < now - timedelta(days=1),
+                (AuthThrottle.locked_until.is_(None)) | (AuthThrottle.locked_until < now),
+            ).delete(synchronize_session=False)
+            session.commit()
 
     def count_session_hits(self, session_id: int) -> int:
         with self.get_session() as session:
@@ -1138,12 +1324,16 @@ class Storage:
             return [{"id": k.id, "keyword": k.keyword, "category": k.category,
                      "is_regex": k.is_regex} for k in kws]
 
-    def delete_project_keyword(self, keyword_id: int):
+    def delete_project_keyword(self, project_id: int, keyword_id: int) -> bool:
+        """Delete the row only when it belongs to ``project_id``. True when a row was removed."""
         with self.get_session() as session:
-            kw = session.get(ProjectKeyword, keyword_id)
-            if kw:
-                session.delete(kw)
-                session.commit()
+            removed = (
+                session.query(ProjectKeyword)
+                .filter(ProjectKeyword.id == keyword_id, ProjectKeyword.project_id == project_id)
+                .delete(synchronize_session=False)
+            )
+            session.commit()
+            return removed == 1
 
     def add_project_domain(self, project_id: int, domain: str,
                            priority: int = 3, notes: str = None) -> int:
@@ -1162,12 +1352,16 @@ class Storage:
             return [{"id": d.id, "domain": d.domain, "priority": d.priority,
                      "notes": d.notes} for d in domains]
 
-    def delete_project_domain(self, domain_id: int):
+    def delete_project_domain(self, project_id: int, domain_id: int) -> bool:
+        """Delete the row only when it belongs to ``project_id``. True when a row was removed."""
         with self.get_session() as session:
-            d = session.get(ProjectDomain, domain_id)
-            if d:
-                session.delete(d)
-                session.commit()
+            removed = (
+                session.query(ProjectDomain)
+                .filter(ProjectDomain.id == domain_id, ProjectDomain.project_id == project_id)
+                .delete(synchronize_session=False)
+            )
+            session.commit()
+            return removed == 1
 
     def add_project_entity(self, project_id: int, entity_type: str,
                            value: str, notes: str = None) -> int:
@@ -1186,12 +1380,16 @@ class Storage:
             return [{"id": e.id, "entity_type": e.entity_type, "value": e.value,
                      "notes": e.notes} for e in entities]
 
-    def delete_project_entity(self, entity_id: int):
+    def delete_project_entity(self, project_id: int, entity_id: int) -> bool:
+        """Delete the row only when it belongs to ``project_id``. True when a row was removed."""
         with self.get_session() as session:
-            e = session.get(ProjectEntity, entity_id)
-            if e:
-                session.delete(e)
-                session.commit()
+            removed = (
+                session.query(ProjectEntity)
+                .filter(ProjectEntity.id == entity_id, ProjectEntity.project_id == project_id)
+                .delete(synchronize_session=False)
+            )
+            session.commit()
+            return removed == 1
 
     def create_project_hit(self, project_id: int, hit_id: int,
                            matched_on: str, matched_value: str = None):

@@ -89,17 +89,26 @@
     <div class="secret-box">{{ secret }}</div>
 
     <form method="POST">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+      {% if replacing %}
       <div class="form-group">
-        <label for="code">Verification Code</label>
+        <label for="current_code">Code from your current authenticator</label>
+        <input type="text" id="current_code" name="current_code" maxlength="6" placeholder="000000"
+               autocomplete="off" inputmode="numeric" required/>
+      </div>
+      {% endif %}
+      <div class="form-group">
+        <label for="code">{% if replacing %}Code from the new entry you just scanned{% else %}Verification Code{% endif %}</label>
         <input type="text" id="code" name="code" maxlength="6" placeholder="000000"
                autocomplete="one-time-code" inputmode="numeric" required/>
       </div>
       <button type="submit" class="btn btn-primary">Enable 2FA</button>
     </form>
 
-    <div class="skip">
-      <a href="{{ url_for('dashboard.index') }}">Skip for now (not recommended)</a>
-    </div>
+    <form method="POST" action="{{ url_for('auth.logout') }}" class="skip">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+      <button type="submit" style="background:none;border:0;padding:0;color:inherit;font:inherit;cursor:pointer;text-decoration:underline">Sign out</button>
+    </form>
   </div>
 </body>
 </html>

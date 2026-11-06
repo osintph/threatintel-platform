@@ -65,6 +65,46 @@ jobs:
           files: coverage.xml
           fail_ci_if_error: false
 
+  test-postgres:
+    name: Tests on PostgreSQL
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: scanner
+          POSTGRES_PASSWORD: ci-only-not-a-secret
+          POSTGRES_DB: ti_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U scanner -d ti_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install locked dependencies and test tools
+        run: |
+          pip install --upgrade pip
+          pip install --require-hashes -r requirements.lock
+          pip install --no-deps -e .
+          pip install pytest pytest-asyncio
+
+      # The sign-in, session, lockout and authorization tests on the database
+      # production uses (row locks, timestamps and constraints differ from SQLite).
+      - name: Run the integration tests on PostgreSQL 16
+        env:
+          TEST_DATABASE_URL: postgresql+psycopg2://scanner:ci-only-not-a-secret@localhost:5432/ti_test
+        run: pytest tests/integration -q
+
   scripts:
     name: Shell scripts
     runs-on: ubuntu-latest
@@ -72,7 +112,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: shellcheck (deploy, upgrade and ops scripts)
-        run: shellcheck -x upgrade.sh ops/cf-origin-lock/cf-origin-lock ops/cf-origin-lock/install.sh docker/nginx/entrypoint.sh scripts/update-cloudflare-ips.sh tests/nginx/test_entrypoint.sh
+        run: shellcheck -x upgrade.sh ops/cf-origin-lock/cf-origin-lock ops/cf-origin-lock/install.sh docker/nginx/entrypoint.sh docker/tor/entrypoint.sh scripts/update-cloudflare-ips.sh tests/nginx/test_entrypoint.sh tests/tor/test_entrypoint.sh
 
       - name: shellcheck (older scripts, errors only)
         run: shellcheck -S error deploy.sh scripts/configure-ssl.sh
@@ -91,8 +131,25 @@ jobs:
           docker run --rm darkweb-scanner:test python -c "import darkweb_scanner, sqlalchemy, psycopg2; print(darkweb_scanner.__version__, sqlalchemy.__version__)"
           docker run --rm darkweb-scanner:test python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(); print('chromium', b.version); b.close(); p.stop()"
 
+      - name: gunicorn can load the application
+        run: >-
+          docker run --rm
+          -e DASHBOARD_SECRET_KEY=ci-only-0123456789abcdef0123456789abcdef
+          -e DATABASE_URL=sqlite:////tmp/ci-check.db
+          darkweb-scanner:test
+          gunicorn --check-config --workers=1 --threads=8 'darkweb_scanner.dashboard.app:create_app()'
+
+      # Renders the dashboard pages in headless Chromium with hostile values in
+      # every API answer; fails if any of them runs, becomes markup, or if a
+      # write request leaves without the CSRF token.
+      - name: Dashboard pages show hostile data as text (headless browser)
+        run: docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD":/work:ro -w /work darkweb-scanner:test python tests/browser/xss_check.py
+
       - name: Build tor image
         run: docker build -f docker/tor/Dockerfile -t darkweb-scanner-tor:test docker/tor/
+
+      - name: tor image renders its config at start and has no control port
+        run: tests/tor/test_entrypoint.sh darkweb-scanner-tor:test
 
       - name: Build nginx image
         run: docker build -f docker/nginx/Dockerfile -t darkweb-scanner-nginx:test docker/nginx/

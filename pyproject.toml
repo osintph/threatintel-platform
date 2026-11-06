@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "darkweb-scanner"
-version = "1.1.1"
+version = "1.2.0"
 description = "Keyword monitoring tool for .onion sites — for legitimate security research and threat intelligence"
 readme = "README.md"
 # Updated license field
@@ -25,7 +25,6 @@ dependencies = [
     "aiohttp-socks>=0.8",
     "beautifulsoup4>=4.12",
     "lxml>=5.0",
-    "stem>=1.8",
     "sqlalchemy>=2.0",
     "pyyaml>=6.0",
     "click>=8.1",

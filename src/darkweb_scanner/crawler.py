@@ -143,7 +143,6 @@ class Crawler:
             if self._pages_crawled % self.config.rotate_circuit_every == 0:
                 logger.info("Rotating Tor circuit...")
                 await self.tor.rotate_circuit_async()
-                await asyncio.sleep(5)  # wait for new circuit to establish
 
             return result
 

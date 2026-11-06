@@ -42,24 +42,6 @@
     }
     .btn-primary { background: var(--accent); color: #0d1117; }
     .btn-primary:hover { opacity: 0.88; }
-    .btn-oauth {
-      background: var(--surface2); color: var(--text);
-      border: 1px solid var(--border); margin-bottom: 10px;
-      display: flex; align-items: center; justify-content: center; gap: 10px;
-    }
-    .btn-oauth:hover { border-color: var(--accent); }
-    .divider {
-      display: flex; align-items: center; gap: 12px;
-      color: var(--muted); font-size: 0.8rem; margin: 20px 0;
-    }
-    .divider::before, .divider::after {
-      content: ''; flex: 1; height: 1px; background: var(--border);
-    }
-    .oauth-icon {
-      width: 20px; height: 20px; border-radius: 50%;
-      background: var(--border); display: flex; align-items: center;
-      justify-content: center; font-size: 0.65rem; font-weight: 700;
-    }
   </style>
 </head>
 <body>
@@ -75,19 +57,8 @@
       {% endfor %}
     {% endwith %}
 
-    {% if oauth_providers %}
-      {% for key, provider in oauth_providers.items() %}
-        <a href="{{ url_for('auth.oauth_redirect', provider=key) }}" style="text-decoration:none">
-          <button class="btn btn-oauth">
-            <span class="oauth-icon">{{ provider.icon }}</span>
-            Continue with {{ provider.name }}
-          </button>
-        </a>
-      {% endfor %}
-      <div class="divider">or sign in with password</div>
-    {% endif %}
-
     <form method="POST">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
       <div class="form-group">
         <label for="username">Username</label>
         <input type="text" id="username" name="username" autocomplete="username" required/>

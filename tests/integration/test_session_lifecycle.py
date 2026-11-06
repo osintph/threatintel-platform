@@ -9,8 +9,8 @@ Test 3 — close_db() teardown closes the session even when the request handler 
 import pytest
 from flask import Flask, g
 
-from darkweb_scanner.storage import Storage, _FLASK_SESSION_KEY
 from darkweb_scanner.dashboard.storage_helper import close_db
+from darkweb_scanner.storage import _FLASK_SESSION_KEY, Storage
 
 _TEST_DB_URL = "sqlite:///:memory:"
 

@@ -1,11 +1,15 @@
 """
 Channel Monitor blueprint — Telegram channel scraping tab.
 Integrates channel_monitor.py into the threat intelligence dashboard.
+
+Every route is admin-only. Only public channels are accepted, each job belongs
+to the user who started it, and archives are deleted after RETENTION_DAYS.
 """
 
 import asyncio
-import json
+import logging
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -14,24 +18,48 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Blueprint, after_this_request, jsonify, request, send_file, session
+from flask import Blueprint, after_this_request, jsonify, request, send_file
 
-from ..auth import require_login
-from .storage_helper import get_storage
+from ..auth import current_user, require_admin
+
+logger = logging.getLogger(__name__)
 
 channel_monitor_bp = Blueprint("channel_monitor", __name__)
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 CHANNEL_MONITOR_DIR = DATA_DIR / "channel_monitor"
 
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, default)))
+    except ValueError:
+        return default
+
+
+# Job folders and leftover download ZIPs are deleted once they are this old.
+RETENTION_DAYS = _env_int("CHANNEL_MONITOR_RETENTION_DAYS", 90, minimum=1)
+_PURGE_INTERVAL_SECONDS = 3600
+
+# Limits for the values a job is started with; numbers outside are clamped.
+MAX_LIMIT = 100_000
+MAX_DAYS = 3650
+MAX_VIDEO_MB = 2000
+MIN_SPACE_GB = 1.0
+MAX_SPACE_GB = 1000.0
+
 # Cap on total source bytes zipped for a single download. Building to a temp
 # file (rather than streaming) is bounded by disk, not memory, but we still
 # want a clear failure instead of silently filling the data volume.
 MAX_DOWNLOAD_SOURCE_BYTES = int(os.getenv("CHANNEL_MONITOR_MAX_DOWNLOAD_GB", "5")) * (1024 ** 3)
 
-# In-memory job store  { job_id: { status, log, output_dir, started_at, config } }
+# In-memory job store  { job_id: { status, log, output_dir, started_at, config, owner_id, owner } }
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
+
+_JOB_ID_RE = re.compile(r"[0-9a-f]{12}")
+_last_purge: float | None = None
+_purge_lock = threading.Lock()
 
 
 def _ensure_dirs():
@@ -41,6 +69,98 @@ def _ensure_dirs():
 def _new_job_id() -> str:
     import uuid
     return uuid.uuid4().hex[:12]
+
+
+def _monitor():
+    """channel_monitor pulls in telethon and the translator; load it on first use."""
+    from .. import channel_monitor
+    return channel_monitor
+
+
+# ── Ownership ─────────────────────────────────────────────────────────────────
+
+def _can_access(job: dict, user) -> bool:
+    """A job belongs to the user who started it; admins see every job."""
+    return user is not None and (bool(user.is_admin) or job.get("owner_id") == user.id)
+
+
+def _get_job(job_id: str):
+    """The job, if the id is well formed and the current user may see it; else None."""
+    if not _JOB_ID_RE.fullmatch(job_id or ""):
+        return None
+    user = current_user()
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+    if j is None or not _can_access(j, user):
+        return None
+    return j
+
+
+# ── Retention ─────────────────────────────────────────────────────────────────
+
+def _older_than(path: Path, cutoff: float) -> bool:
+    """True when neither ``path`` nor anything under it changed since ``cutoff``."""
+    if path.stat().st_mtime >= cutoff:
+        return False
+    return not any(p.lstat().st_mtime >= cutoff for p in path.rglob("*"))
+
+
+def purge_expired_archives(now: float | None = None) -> list[str]:
+    """Delete job folders and leftover download ZIPs older than RETENTION_DAYS.
+
+    Only names this module creates are touched (12-hex job folders and
+    cm_download_*.zip), so the Telegram session file next to them stays. A
+    running job is never removed. Returns the names that were deleted.
+    """
+    if not CHANNEL_MONITOR_DIR.is_dir():
+        return []
+    cutoff = (time.time() if now is None else now) - RETENTION_DAYS * 86400
+    with _jobs_lock:
+        running = {jid for jid, j in _jobs.items() if j["status"] == "running"}
+
+    removed = []
+    for entry in sorted(CHANNEL_MONITOR_DIR.iterdir()):
+        try:
+            if entry.is_symlink():
+                continue
+            if entry.is_dir() and _JOB_ID_RE.fullmatch(entry.name):
+                if entry.name in running or not _older_than(entry, cutoff):
+                    continue
+                shutil.rmtree(entry)
+            elif entry.is_file() and entry.name.startswith("cm_download_") and entry.suffix == ".zip":
+                if entry.stat().st_mtime >= cutoff:
+                    continue
+                entry.unlink()
+            else:
+                continue
+        except OSError as exc:
+            logger.warning("Channel Monitor retention: could not remove %s: %s", entry.name, exc)
+            continue
+        removed.append(entry.name)
+
+    if removed:
+        with _jobs_lock:
+            for name in removed:
+                _jobs.pop(name, None)
+        logger.info(
+            "Channel Monitor retention: removed %d archive(s) older than %d days: %s",
+            len(removed), RETENTION_DAYS, ", ".join(removed),
+        )
+    return removed
+
+
+def _purge_if_due() -> None:
+    """Run the retention sweep at most once per _PURGE_INTERVAL_SECONDS."""
+    global _last_purge
+    with _purge_lock:
+        now = time.monotonic()
+        if _last_purge is not None and now - _last_purge < _PURGE_INTERVAL_SECONDS:
+            return
+        _last_purge = now
+    try:
+        purge_expired_archives()
+    except Exception:
+        logger.exception("Channel Monitor retention sweep failed")
 
 
 def _get_telegram_creds() -> dict:
@@ -55,9 +175,9 @@ def _get_telegram_creds() -> dict:
 # ── Status / Credential check ─────────────────────────────────────────────────
 
 @channel_monitor_bp.route("/api/channel-monitor/credentials", methods=["GET"])
-@require_login
+@require_admin
 def api_cm_credentials():
-    """Return whether Telegram credentials are configured."""
+    """Return whether Telegram credentials are configured, and the policy the UI states."""
     creds = _get_telegram_creds()
     configured = bool(creds["api_id"] and creds["api_hash"] and creds["phone"])
     return jsonify({
@@ -65,21 +185,29 @@ def api_cm_credentials():
         "has_api_id":   bool(creds["api_id"]),
         "has_api_hash": bool(creds["api_hash"]),
         "has_phone":    bool(creds["phone"]),
+        "public_channels_only": True,
+        "translation":    "google",
+        "retention_days": RETENTION_DAYS,
     })
 
 
 # ── Job management ────────────────────────────────────────────────────────────
 
 @channel_monitor_bp.route("/api/channel-monitor/jobs", methods=["GET"])
-@require_login
+@require_admin
 def api_cm_jobs_list():
+    _purge_if_due()
+    user = current_user()
     with _jobs_lock:
         jobs = []
         for jid, j in _jobs.items():
+            if not _can_access(j, user):
+                continue
             jobs.append({
                 "id":         jid,
                 "status":     j["status"],
                 "channel":    j["config"].get("channel", ""),
+                "owner":      j.get("owner"),
                 "started_at": j["started_at"],
                 "ended_at":   j.get("ended_at"),
                 "log_lines":  len(j["log"]),
@@ -90,16 +218,16 @@ def api_cm_jobs_list():
 
 
 @channel_monitor_bp.route("/api/channel-monitor/jobs/<job_id>", methods=["GET"])
-@require_login
+@require_admin
 def api_cm_job_get(job_id: str):
-    with _jobs_lock:
-        j = _jobs.get(job_id)
+    j = _get_job(job_id)
     if not j:
         return jsonify({"error": "Job not found"}), 404
     return jsonify({
         "id":         job_id,
         "status":     j["status"],
         "channel":    j["config"].get("channel", ""),
+        "owner":      j.get("owner"),
         "config":     j["config"],
         "started_at": j["started_at"],
         "ended_at":   j.get("ended_at"),
@@ -109,12 +237,11 @@ def api_cm_job_get(job_id: str):
 
 
 @channel_monitor_bp.route("/api/channel-monitor/jobs/<job_id>/log", methods=["GET"])
-@require_login
+@require_admin
 def api_cm_job_log(job_id: str):
     """Return only the log lines (optionally since a given index)."""
-    since = int(request.args.get("since", 0))
-    with _jobs_lock:
-        j = _jobs.get(job_id)
+    since = max(0, request.args.get("since", 0, type=int))
+    j = _get_job(job_id)
     if not j:
         return jsonify({"error": "Job not found"}), 404
     return jsonify({
@@ -125,7 +252,7 @@ def api_cm_job_log(job_id: str):
 
 
 @channel_monitor_bp.route("/api/channel-monitor/jobs/<job_id>/download", methods=["GET"])
-@require_login
+@require_admin
 def api_cm_job_download(job_id: str):
     """Build a ZIP of the job output directory to a temp file, then serve
     that file with a real Content-Length.
@@ -138,8 +265,7 @@ def api_cm_job_download(job_id: str):
     complete on disk lets Flask's normal conditional/Range handling work
     correctly instead.
     """
-    with _jobs_lock:
-        j = _jobs.get(job_id)
+    j = _get_job(job_id)
     if not j:
         return jsonify({"error": "Job not found"}), 404
     if j["status"] not in ("completed", "error"):
@@ -209,9 +335,15 @@ def api_cm_job_download(job_id: str):
 
 
 @channel_monitor_bp.route("/api/channel-monitor/jobs/<job_id>", methods=["DELETE"])
-@require_login
+@require_admin
 def api_cm_job_delete(job_id: str):
+    if not _get_job(job_id):
+        return jsonify({"error": "Job not found"}), 404
     with _jobs_lock:
+        j = _jobs.get(job_id)
+        if j is not None and j["status"] == "running":
+            # Its worker is still writing into the folder.
+            return jsonify({"error": "Job is still running"}), 409
         j = _jobs.pop(job_id, None)
     if not j:
         return jsonify({"error": "Job not found"}), 404
@@ -226,47 +358,65 @@ def api_cm_job_delete(job_id: str):
 
 # ── Start a scan ──────────────────────────────────────────────────────────────
 
-@channel_monitor_bp.route("/api/channel-monitor/start", methods=["POST"])
-@require_login
-def api_cm_start():
-    body = request.get_json() or {}
+class _BadRequest(ValueError):
+    """A value in the start request has the wrong type."""
 
-    channel = (body.get("channel") or "").strip().lstrip("@")
-    if not channel:
-        return jsonify({"error": "channel is required"}), 400
 
-    creds = _get_telegram_creds()
-    if not (creds["api_id"] and creds["api_hash"] and creds["phone"]):
-        return jsonify({"error": "Telegram credentials not configured. Add TELEGRAM_API_ID, TELEGRAM_API_HASH and TELEGRAM_PHONE to your .env"}), 400
+def _int_field(body: dict, name: str, default, low: int, high: int):
+    value = body.get(name)
+    if value is None or value == "":
+        return default
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _BadRequest(f"{name} must be a whole number")
+    return max(low, min(high, value))
 
-    config = {
-        "channel":      channel,
-        "limit":        int(body.get("limit", 200)),
-        "days":         int(body.get("days")) if body.get("days") else None,
-        "lang":         (body.get("lang") or "").strip() or None,
-        "max_video_mb": int(body.get("max_video_mb", 50)),
-        "min_space_gb": float(body.get("min_space_gb", 1.0)),
-        "skip_english": bool(body.get("skip_english", False)),
+
+def _float_field(body: dict, name: str, default: float, low: float, high: float) -> float:
+    value = body.get(name)
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        raise _BadRequest(f"{name} must be a number")
+    return max(low, min(high, float(value)))
+
+
+def _bool_field(body: dict, name: str, default: bool) -> bool:
+    value = body.get(name)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise _BadRequest(f"{name} must be true or false")
+    return value
+
+
+def _job_config(body, monitor) -> dict:
+    """Validate a start request. Raises _BadRequest or monitor.ChannelNotAllowed."""
+    if not isinstance(body, dict):
+        raise _BadRequest("Send a JSON object")
+
+    lang = body.get("lang")
+    if lang is None or lang == "":
+        lang = None
+    elif not isinstance(lang, str) or lang.strip().lower() not in monitor.SUPPORTED_LANGUAGES:
+        raise _BadRequest("lang must be one of: " + ", ".join(monitor.SUPPORTED_LANGUAGES))
+    else:
+        lang = lang.strip().lower()
+
+    return {
+        "channel":      monitor.parse_public_channel(body.get("channel")),
+        "limit":        _int_field(body, "limit", 200, 0, MAX_LIMIT),
+        "days":         _int_field(body, "days", None, 0, MAX_DAYS) or None,
+        "lang":         lang,
+        "max_video_mb": _int_field(body, "max_video_mb", 50, 0, MAX_VIDEO_MB),
+        "min_space_gb": _float_field(body, "min_space_gb", MIN_SPACE_GB, MIN_SPACE_GB, MAX_SPACE_GB),
+        "skip_english": _bool_field(body, "skip_english", False),
+        "translate":    _bool_field(body, "translate", True),
     }
 
-    job_id = _new_job_id()
-    _ensure_dirs()
-    output_dir = CHANNEL_MONITOR_DIR / job_id
-    output_dir.mkdir(parents=True, exist_ok=True)
 
-    job = {
-        "status":     "running",
-        "config":     config,
-        "output_dir": str(output_dir),
-        "started_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
-        "ended_at":   None,
-        "log":        [],
-        "error":      None,
-    }
-
-    with _jobs_lock:
-        _jobs[job_id] = job
-
+def _start_worker(job_id: str, config: dict, output_dir: Path, creds: dict) -> None:
     def run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -288,6 +438,50 @@ def api_cm_start():
     t = threading.Thread(target=run, daemon=True, name=f"cm_{job_id}")
     t.start()
 
+
+@channel_monitor_bp.route("/api/channel-monitor/start", methods=["POST"])
+@require_admin
+def api_cm_start():
+    try:
+        monitor = _monitor()
+    except ImportError:
+        logger.exception("Channel Monitor dependencies are missing")
+        return jsonify({"error": "Channel Monitor is not available: telethon, deep-translator and langdetect must be installed"}), 503
+
+    try:
+        config = _job_config(request.get_json(silent=True), monitor)
+    except (_BadRequest, monitor.ChannelNotAllowed) as e:
+        return jsonify({"error": str(e)}), 400
+
+    creds = _get_telegram_creds()
+    if not (creds["api_id"] and creds["api_hash"] and creds["phone"]):
+        return jsonify({"error": "Telegram credentials not configured. Add TELEGRAM_API_ID, TELEGRAM_API_HASH and TELEGRAM_PHONE to your .env"}), 400
+
+    _purge_if_due()
+    user = current_user()
+
+    job_id = _new_job_id()
+    _ensure_dirs()
+    output_dir = CHANNEL_MONITOR_DIR / job_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    job = {
+        "status":     "running",
+        "config":     config,
+        "owner_id":   user.id,
+        "owner":      user.username,
+        "output_dir": str(output_dir),
+        "started_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        "ended_at":   None,
+        "log":        [],
+        "error":      None,
+    }
+
+    with _jobs_lock:
+        _jobs[job_id] = job
+
+    _start_worker(job_id, config, output_dir, creds)
+
     return jsonify({"ok": True, "job_id": job_id})
 
 
@@ -302,17 +496,13 @@ async def _run_channel_monitor(job_id: str, config: dict, output_dir: Path, cred
                 _jobs[job_id]["log"].append(msg)
 
     log(f"[+] Starting channel monitor for: @{config['channel']}")
-    log(f"[i] Settings: limit={config['limit']}, days={config['days']}, lang={config['lang']}, max_video={config['max_video_mb']}MB, skip_english={config['skip_english']}")
-
-    # Import here to avoid circular import issues at module load time
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+    log(f"[i] Settings: limit={config['limit']}, days={config['days']}, lang={config['lang']}, max_video={config['max_video_mb']}MB, min_free={config['min_space_gb']}GB, skip_english={config['skip_english']}, translate={config['translate']}")
+    if config["translate"]:
+        log("[i] Message text that is not English is sent to Google Translate (translate.google.com)")
 
     try:
         from telethon import TelegramClient
-        from ..channel_monitor import (
-            process_channel,
-        )
+        monitor = _monitor()
     except ImportError as e:
         log(f"[✗] Import error: {e}")
         log("[i] Make sure telethon, deep-translator and langdetect are installed")
@@ -353,7 +543,7 @@ async def _run_channel_monitor(job_id: str, config: dict, output_dir: Path, cred
 
         builtins.print = _log_print
 
-        await process_channel(
+        await monitor.process_channel(
             client=client,
             channel_id=config["channel"],
             limit=config["limit"],
@@ -363,7 +553,14 @@ async def _run_channel_monitor(job_id: str, config: dict, output_dir: Path, cred
             max_video_mb=config["max_video_mb"],
             forced_lang=config["lang"],
             skip_english=config["skip_english"],
+            translate=config["translate"],
         )
+    except (monitor.ChannelNotAllowed, monitor.ChannelAccessError) as e:
+        # Refused before any message was read: not a public channel, or not found.
+        log(f"[✗] {e}")
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["error"] = str(e)
     except Exception as e:
         import traceback
         log(f"[✗] Error during scan: {e}")

@@ -1,10 +1,11 @@
 """Unit tests for main.run_scan orchestration."""
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from darkweb_scanner.main import run_scan
+import pytest
+
 from darkweb_scanner.crawler import CrawlConfig
+from darkweb_scanner.main import run_scan
 from darkweb_scanner.scanner import KeywordConfig
 
 
@@ -37,9 +38,10 @@ async def test_successful_scan_marks_completed():
     """COR-01: a scan that finishes without error must be marked 'completed'."""
     storage, alerter, kc, cc, mock_tor = _make_mocks()
 
-    with patch("darkweb_scanner.main.create_tor_client", return_value=mock_tor), \
-         patch("darkweb_scanner.main.Crawler") as mock_crawler_cls:
-
+    with (
+        patch("darkweb_scanner.main.create_tor_client", return_value=mock_tor),
+        patch("darkweb_scanner.main.Crawler") as mock_crawler_cls,
+    ):
         mock_crawler_cls.return_value.crawl.return_value = _empty_crawl([])
 
         result = await run_scan(
@@ -59,9 +61,10 @@ async def test_failed_scan_marks_failed_not_completed():
     """COR-01: when the crawler raises, the session must end as 'failed', not 'completed'."""
     storage, alerter, kc, cc, mock_tor = _make_mocks()
 
-    with patch("darkweb_scanner.main.create_tor_client", return_value=mock_tor), \
-         patch("darkweb_scanner.main.Crawler") as mock_crawler_cls:
-
+    with (
+        patch("darkweb_scanner.main.create_tor_client", return_value=mock_tor),
+        patch("darkweb_scanner.main.Crawler") as mock_crawler_cls,
+    ):
         mock_crawler_cls.return_value.crawl.return_value = _raising_crawl([])
 
         with pytest.raises(RuntimeError, match="network error"):
