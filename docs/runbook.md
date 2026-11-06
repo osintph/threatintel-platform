@@ -18,7 +18,7 @@ Files, all installed from `ops/cf-origin-lock/`:
 | `/etc/systemd/system/cf-origin-lock.service` | oneshot at boot, after Docker and the CrowdSec firewall bouncer; `ExecStop` removes the lock |
 | `/etc/systemd/system/cf-origin-lock-refresh.service` and `cf-origin-lock.timer` | weekly refresh of Cloudflare's ranges |
 | `/etc/cf-origin-lock/ips-v4`, `ips-v6` | last good copy of Cloudflare's lists; used when a download fails |
-| `/etc/default/cf-origin-lock` | optional settings: `IFACE` (default: the interface of the default route), `PORTS` (default `80 443`) |
+| `/etc/default/cf-origin-lock` | settings: `IFACE` (written at install time from the default route) and `PORTS` (default `80 443`) |
 
 ### What it does
 

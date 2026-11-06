@@ -17,6 +17,17 @@ install -o root -g root -m 644 "$HERE/cf-origin-lock.service" /etc/systemd/syste
 install -o root -g root -m 644 "$HERE/cf-origin-lock-refresh.service" /etc/systemd/system/cf-origin-lock-refresh.service
 install -o root -g root -m 644 "$HERE/cf-origin-lock.timer" /etc/systemd/system/cf-origin-lock.timer
 install -d -o root -g root -m 755 /etc/cf-origin-lock
+
+# Pin the public interface at install time, so a boot never depends on the
+# default route being up when the unit starts. Edit the file to change it.
+if [ ! -e /etc/default/cf-origin-lock ]; then
+  iface="$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')"
+  [ -n "$iface" ] || { echo "cf-origin-lock install: cannot find the public interface; create /etc/default/cf-origin-lock with IFACE=<name>" >&2; exit 1; }
+  printf '# Settings for /usr/local/sbin/cf-origin-lock. See docs/runbook.md.\nIFACE=%s\nPORTS="80 443"\n' "$iface" > /etc/default/cf-origin-lock
+  chmod 644 /etc/default/cf-origin-lock
+  echo "cf-origin-lock: public interface pinned to $iface in /etc/default/cf-origin-lock"
+fi
+
 systemctl daemon-reload
 echo "cf-origin-lock: files installed"
 
