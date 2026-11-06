@@ -73,11 +73,11 @@ The rules, as the application enforces them on every request (they are also show
 grep '^SETUP_TOKEN=' .env          # run this on the server, in your own terminal
 ```
 
-Further users are created by an administrator in the dashboard (Settings → Users).
+Further users are created by an administrator on the dashboard's **Users** tab.
 
 ### Locked out, or a lost authenticator
 
-An administrator can reset another user's second factor in the dashboard. For the administrator's own account, or when nobody can sign in, use the commands on the server. They need no password and show no secrets:
+An administrator can reset another user's second factor on the **Users** tab ("Reset 2FA"). For the administrator's own account, or when nobody can sign in, use the commands on the server. They need no password and show no secrets:
 
 ```bash
 docker compose exec dashboard python -m darkweb_scanner.main user-list
@@ -93,7 +93,7 @@ Both changes are written to the sign-in log.
 
 ### Sign-in log
 
-Sign-ins, failures, lockouts, sign-outs, password and second-factor changes and user administration are stored in the `auth_events` table for 365 days, with the time, user name and address. Administrators read it in the dashboard (Settings → Sign-in log) or with:
+Sign-ins, failures, lockouts, sign-outs, password and second-factor changes and user administration are stored in the `auth_events` table for 365 days, with the time, user name and address. Administrators read it on the dashboard's **Users** tab (Sign-in log) or with:
 
 ```bash
 docker compose logs dashboard | grep 'auth event='

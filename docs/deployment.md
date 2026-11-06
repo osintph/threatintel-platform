@@ -223,7 +223,7 @@ docker compose up -d dashboard
 
 **"Too many failed attempts":** the account or the address is locked for 15 minutes after repeated failures. To lift it sooner: `docker compose exec dashboard python -m darkweb_scanner.main user-unlock NAME` (see the [runbook](runbook.md#accounts-and-sign-in)).
 
-**Lost authenticator:** another administrator resets it under Settings → Users, or on the server: `docker compose exec dashboard python -m darkweb_scanner.main user-reset-mfa NAME`.
+**Lost authenticator:** another administrator resets it on the **Users** tab ("Reset 2FA"), or on the server: `docker compose exec dashboard python -m darkweb_scanner.main user-reset-mfa NAME`.
 
 **Dashboard restarts in a loop after an upgrade:** `docker compose logs dashboard` names the cause. From 1.2.0 it needs `DATABASE_URL` and a `DASHBOARD_SECRET_KEY` of at least 32 characters.
 
