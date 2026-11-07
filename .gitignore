@@ -60,3 +60,9 @@ docker/nginx.bak*/
 www/
 www-threatbrief/
 www-threatwatch/
+
+# Audit and fix-pass reports are kept outside the repository, never committed
+fix-report.md
+fix-report.html
+fix/
+release-notes-*.md
