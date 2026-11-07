@@ -2,6 +2,8 @@
 
 The Telegram scraper monitors public channels for keyword hits using the same keyword engine as the dark web crawler.
 
+This page covers the background scraper. The **Channel Monitor** tab (on-demand export of one public channel, with its own session, limits and job states) is described in [TELEGRAM.md](../TELEGRAM.md).
+
 ## Prerequisites
 
 1. **Get API credentials** at [https://my.telegram.org/apps](https://my.telegram.org/apps)
@@ -28,7 +30,6 @@ The Telegram scraper monitors public channels for keyword hits using the same ke
 # Scan all channels configured in TELEGRAM_CHANNELS
 docker compose exec dashboard python -m darkweb_scanner.main telegram-scan
 
-# Or trigger from the dashboard — use the Seeds tab > Telegram section
 ```
 
 ## How It Works

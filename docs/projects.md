@@ -22,7 +22,7 @@ Once a project is created, open it to configure what to monitor:
 ### Keywords
 Project-specific keywords on top of global keyword config. Each keyword can be:
 - **Plain text** — substring match against crawled content
-- **Regex** — full regex pattern match (enable the Regex checkbox)
+- **Regex** — a regular expression (enable the Regex checkbox), run case-insensitively against the 1,000 characters around each keyword hit. It is checked when it is saved: a pattern that can backtrack catastrophically (`(a+)+`, `(a|aa)+`, back-references, repeats inside look-arounds) or is longer than 200 characters is refused with `The pattern is not accepted: <reason>`. The crawl checks stored patterns again; one saved before 1.3.0 that fails is skipped, with a warning naming the project and the pattern in the log of the process that ran the crawl (`docker compose logs dashboard` for a crawl started from the dashboard, `scanner` for `make scan`)
 - **Category** — label for grouping (e.g. `credential`, `brand`, `person`)
 
 ### Domains
@@ -46,7 +46,7 @@ All keyword hits from the global crawl that matched this project's keywords, dom
 
 After every page is crawled and a keyword hit is recorded, the platform automatically checks all active projects:
 
-1. **Keyword match** — hit's keyword matches a project keyword (exact or regex)
+1. **Keyword match** — a plain project keyword is contained in the hit's keyword, or a regex project keyword matches the hit's context (clipped to 1,000 characters)
 2. **Domain match** — hit's source URL contains a project target domain
 3. **Entity match** — hit's context snippet contains a project entity value
 

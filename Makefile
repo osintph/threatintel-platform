@@ -79,6 +79,9 @@ hits:  ## Show recent keyword hits
 users:  ## List accounts and sign-in locks (unlock: see docs/runbook.md)
 	docker compose exec dashboard python -m darkweb_scanner.main user-list
 
+db-status:  ## Show the revision of the database schema
+	docker compose exec dashboard python -m darkweb_scanner.main db-status
+
 # ── Maintenance ───────────────────────────────────────────────────────────────
 check-seeds:  ## Show currently configured seed URLs
 	docker compose exec dashboard python -c "from pathlib import Path; f=Path('/app/data/seeds.txt'); print(f.read_text() if f.exists() else 'No seeds in /app/data/seeds.txt — add via dashboard Seeds tab')"
@@ -90,10 +93,13 @@ telegram-auth:  ## Authenticate with Telegram (run once before telegram-scan)
 telegram-scan:  ## Scrape configured Telegram channels for keyword hits
 	docker compose exec dashboard python -m darkweb_scanner.main telegram-scan
 
+channel-monitor-auth:  ## Sign the Channel Monitor session in to Telegram (run once)
+	docker compose exec dashboard python -m darkweb_scanner.main channel-monitor-auth
+
 clean:  ## Remove build artifacts and cache
 	rm -rf dist/ build/ *.egg-info htmlcov/ .coverage .mypy_cache .ruff_cache
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
-clean-data:  ## ⚠️  Delete all scan data (irreversible)
-	@read -p "Delete all scan data? [y/N] " confirm; \
+clean-data:  ## ⚠️  Delete the data volume: Telegram sessions, Channel Monitor archives, keyword and seed files (irreversible; the database is not touched)
+	@read -p "Delete the data volume (Telegram sessions, Channel Monitor archives, keyword and seed files)? [y/N] " confirm; \
 	[ "$$confirm" = "y" ] && docker volume rm darkweb-scanner_app_data || echo "Aborted."

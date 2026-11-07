@@ -3,31 +3,39 @@ Main entry point — orchestrates crawling, scanning, storage, and alerting.
 """
 
 import asyncio
+import functools
 import logging
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 import click
 
+from . import regex_safety
 from .alerting import Alerter
-from .crawler import CrawlConfig, Crawler
+from .crawler import (
+    HEARTBEAT_SECONDS,
+    STALE_SECONDS,
+    CrawlAlreadyRunning,
+    CrawlConfig,
+    Crawler,
+    claim_local_crawl,
+    crawl_owner,
+    release_local_crawl,
+)
 from .scanner import KeywordConfig, Scanner
 from .storage import Storage
-from .tor_client import create_tor_client
+from .tor_client import TOR_CHECK_TIMEOUT, TorNotReachable, create_tor_client
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# To the container log only (rotated by Docker). There is no log file in the data volume.
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("/app/data/scanner.log")
-        if os.path.exists("/app/data")
-        else logging.NullHandler(),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 
@@ -37,9 +45,40 @@ logger = logging.getLogger(__name__)
 
 
 
+@functools.lru_cache(maxsize=1024)
+def _pattern_refusal(pattern: str):
+    """Why regex_safety refuses ``pattern``, or None when it may run."""
+    try:
+        regex_safety.check_pattern(pattern)
+    except regex_safety.UnsafePattern as exc:
+        return str(exc)
+    return None
+
+
+_skipped_patterns: set = set()
+
+
+def _project_pattern_matches(project: dict, pattern: str, context: str) -> bool:
+    """A stored project pattern, checked again and run on clipped text only.
+
+    A pattern saved before 1.3.0 may fail the check: it is skipped, with one
+    warning per project and pattern, and the crawl carries on.
+    """
+    reason = _pattern_refusal(pattern)
+    if reason is not None:
+        key = (project.get("id"), pattern)
+        if key not in _skipped_patterns:
+            _skipped_patterns.add(key)
+            logger.warning(
+                "Project %r: skipping keyword pattern %r: %s",
+                project.get("name"), pattern[:80], reason,
+            )
+        return False
+    return regex_safety.search(pattern, context)
+
+
 def match_hit_to_projects(hit_id: int, url: str, keyword: str, context: str, storage):
     """Match a newly saved hit against all active projects."""
-    import re as _re
     try:
         projects = storage.get_active_projects_with_config()
         for project in projects:
@@ -51,12 +90,9 @@ def match_hit_to_projects(hit_id: int, url: str, keyword: str, context: str, sto
                 kw_val = kw.keyword if hasattr(kw, 'keyword') else kw.get("keyword", "")
                 is_regex = kw.is_regex if hasattr(kw, 'is_regex') else kw.get("is_regex", False)
                 if is_regex:
-                    try:
-                        if _re.search(kw_val, (context or ""), _re.IGNORECASE):
-                            matched_on = "keyword"
-                            matched_value = kw_val
-                    except Exception:
-                        pass
+                    if _project_pattern_matches(project, kw_val, context or ""):
+                        matched_on = "keyword"
+                        matched_value = kw_val
                 else:
                     if kw_val.lower() in (keyword or "").lower():
                         matched_on = "keyword"
@@ -83,6 +119,27 @@ def match_hit_to_projects(hit_id: int, url: str, keyword: str, context: str, sto
     except Exception as e:
         logger.warning(f"Project hit matching error: {e}")
 
+TOR_DOWN_MESSAGE = "Tor is not reachable. Is the tor container running? (make check-tor)"
+CRAWL_FAILED_MESSAGE = "The crawl stopped with an unexpected error; the details are in the server log."
+
+
+async def _heartbeat(storage: Storage, session_id: int, crawler: Crawler, counts: dict) -> None:
+    """Keep the session's heartbeat fresh while the crawl runs, slow pages included.
+
+    When the session is no longer running (someone ended it as interrupted),
+    the crawl stops at the next page.
+    """
+    while True:
+        await asyncio.sleep(HEARTBEAT_SECONDS)
+        try:
+            if not storage.heartbeat_crawl_session(session_id, counts["pages"], counts["hits"]):
+                logger.warning("Crawl session %s was ended elsewhere; stopping", session_id)
+                crawler.halt()
+                return
+        except Exception:
+            logger.exception("Crawl session %s: heartbeat not written", session_id)
+
+
 async def run_scan(
     seeds: list[str],
     keyword_config: KeywordConfig,
@@ -91,9 +148,17 @@ async def run_scan(
     alerter: Alerter,
     check_tor: bool = True,
     stop_flag=None,
+    session_id: Optional[int] = None,
 ):
+    """Crawl ``seeds`` and record pages and hits.
+
+    ``session_id``: a session the caller has claimed with
+    Storage.begin_crawl_session (the dashboard). Without it the session is
+    claimed here, and CrawlAlreadyRunning is raised when a crawl is running.
+    Raises TorNotReachable when the Tor check fails; the process is never exited.
+    """
     tor = create_tor_client()
-    crawler = Crawler(tor, crawl_config)
+    crawler = Crawler(tor, crawl_config, stop_flag=stop_flag)
     scanner = Scanner(keyword_config)
 
     logger.info(
@@ -102,19 +167,40 @@ async def run_scan(
 
     if check_tor:
         logger.info("Checking Tor connectivity...")
-        if not await tor.check_connectivity():
+        try:
+            reachable = await asyncio.wait_for(tor.check_connectivity(), TOR_CHECK_TIMEOUT)
+        except asyncio.TimeoutError:
+            reachable = False
+        if not reachable:
             logger.error("Tor connectivity check failed. Is the Tor daemon running?")
-            sys.exit(1)
+            await tor.close()
+            if session_id is not None:
+                storage.update_crawl_session(session_id, 0, 0, status="failed", error=TOR_DOWN_MESSAGE)
+            raise TorNotReachable(TOR_DOWN_MESSAGE)
         logger.info("Tor connectivity confirmed.")
 
-    session_id = storage.create_crawl_session(seeds)
-    pages_crawled = 0
-    hits_found = 0
+    claimed_here = session_id is None
+    if claimed_here:
+        claim_local_crawl()
+        try:
+            session_id = storage.begin_crawl_session(seeds, crawl_owner(), STALE_SECONDS)
+        except Exception:
+            release_local_crawl()
+            await tor.close()
+            raise
+        if session_id is None:
+            release_local_crawl()
+            await tor.close()
+            raise CrawlAlreadyRunning("A crawl is already running")
+
+    counts = {"pages": 0, "hits": 0}
     _final_status = "failed"
+    _error = None
+    beat = asyncio.ensure_future(_heartbeat(storage, session_id, crawler, counts))
 
     try:
         async for page in crawler.crawl(seeds):
-            pages_crawled += 1
+            counts["pages"] += 1
 
             storage.save_page(
                 url=page.url,
@@ -139,26 +225,33 @@ async def run_scan(
                     depth=hit.depth,
                     session_id=session_id,
                 )
-                hits_found += 1
+                counts["hits"] += 1
                 match_hit_to_projects(hit_id, hit.url, hit.keyword, hit.context, storage)
                 if alerter.alert(hit):
                     storage.mark_alerted(hit_id)
 
-            if pages_crawled % 10 == 0:
-                logger.info(f"Progress: {pages_crawled} pages crawled, {hits_found} hits found")
+            if counts["pages"] % 10 == 0:
+                logger.info(f"Progress: {counts['pages']} pages crawled, {counts['hits']} hits found")
 
-        _final_status = "completed"
+        _final_status = "stopped" if crawler.stop_requested else "completed"
     except KeyboardInterrupt:
         logger.info("Scan interrupted by user")
+        _final_status = "stopped"
     except Exception as e:
         logger.error(f"Scan error: {e}", exc_info=True)
+        _error = CRAWL_FAILED_MESSAGE
         raise
     finally:
-        storage.update_crawl_session(session_id, pages_crawled, hits_found, status=_final_status)
+        beat.cancel()
+        storage.update_crawl_session(
+            session_id, counts["pages"], counts["hits"], status=_final_status, error=_error
+        )
+        if claimed_here:
+            release_local_crawl()
         await tor.close()
 
-    logger.info(f"Scan complete. Pages: {pages_crawled} | Hits: {hits_found}")
-    return {"pages_crawled": pages_crawled, "hits_found": hits_found}
+    logger.info(f"Scan complete. Pages: {counts['pages']} | Hits: {counts['hits']}")
+    return {"pages_crawled": counts["pages"], "hits_found": counts["hits"]}
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -321,6 +414,24 @@ def telegram_auth():
     asyncio.run(interactive_auth(config))
 
 
+@cli.command("channel-monitor-auth")
+def channel_monitor_auth():
+    """Sign in the Telegram session of the Channel Monitor tab (interactive, run once)."""
+    from .channel_monitor import interactive_auth
+
+    api_id = os.getenv("TELEGRAM_API_ID", "").strip()
+    api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
+    if not api_id.isdigit() or not api_hash:
+        click.echo(
+            "ERROR: TELEGRAM_API_ID (a number) and TELEGRAM_API_HASH must be set in .env\n"
+            "Get them at: https://my.telegram.org",
+            err=True,
+        )
+        sys.exit(1)
+    # With TELEGRAM_PHONE unset, Telethon asks for the number.
+    asyncio.run(interactive_auth(int(api_id), api_hash, os.getenv("TELEGRAM_PHONE", "").strip() or None))
+
+
 @cli.command()
 def stats():
     """Print database statistics."""
@@ -439,6 +550,41 @@ def user_reset_mfa(username: str):
     storage.throttle_clear(totp_key(user.id))
     storage.add_auth_event("mfa_reset", user.username, user.id, "local", "command line")
     click.echo(f"Second factor removed for {user.username}. They sign in with their password and enrol again.")
+
+
+# ── Database schema (see docs/runbook.md, "Database schema") ───────────────────
+# Upgrades need no command: the schema is brought up to date whenever the
+# application or one of these commands starts.
+
+
+@cli.command("db-status")
+@click.option("--quiet", is_flag=True, default=False, help="Print the revision only")
+def db_status(quiet: bool):
+    """Show the revision of the database schema."""
+    from . import migrations
+
+    storage = Storage()
+    revision = migrations.current(storage.engine)
+    if quiet:
+        click.echo(revision or "")
+        return
+    click.echo(f"Database schema revision: {revision} (newest in this release: {migrations.head()})")
+
+
+@cli.command("db-downgrade")
+@click.argument("revision")
+@click.confirmation_option(prompt="Take the database schema back? Data in dropped tables and columns is lost.")
+def db_downgrade(revision: str):
+    """Take the schema back to REVISION, before running an older release.
+
+    Stop the dashboard first: any start of this release upgrades the schema again.
+    """
+    from . import migrations
+
+    storage = Storage()
+    before = migrations.current(storage.engine)
+    migrations.downgrade(storage.engine, revision)
+    click.echo(f"Database schema taken back from revision {before} to {migrations.current(storage.engine)}.")
 
 
 def main():

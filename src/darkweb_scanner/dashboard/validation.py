@@ -23,7 +23,6 @@ _DOMAIN = re.compile(rf"^(?:{_HOST_LABEL}\.)+[A-Za-z][A-Za-z0-9-]{{1,62}}$")
 _EMAIL = re.compile(rf"^[A-Za-z0-9._%+-]{{1,64}}@(?:{_HOST_LABEL}\.)+[A-Za-z]{{2,63}}$")
 _USERNAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$")
 _CATEGORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.&/+-]{0,63}$")
-_TELEGRAM_CHANNEL = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
 _COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
@@ -172,16 +171,6 @@ def username(value: Any) -> str:
     assert value is not None
     if not _USERNAME.match(value):
         raise Invalid("username may contain letters, digits and . _ - (3 to 64 characters)")
-    return value
-
-
-def telegram_channel(value: Any) -> str:
-    """A public channel user name, with or without @ or a t.me link in front."""
-    value = text(value, "channel", 100)
-    assert value is not None
-    value = re.sub(r"^(?:https?://)?t\.me/(?:s/)?", "", value, flags=re.IGNORECASE).lstrip("@").rstrip("/")
-    if not _TELEGRAM_CHANNEL.match(value):
-        raise Invalid("channel must be a public channel user name (letters, digits, underscore; 4 to 32 characters)")
     return value
 
 

@@ -19,15 +19,8 @@ ADMIN_ONLY = [
     ("POST", "/api/keywords/import", None),
     ("POST", "/api/seeds", {"url": "http://abcdefghijklmnop.onion/"}),
     ("DELETE", "/api/seeds", {"url": "http://abcdefghijklmnop.onion/"}),
-    ("POST", "/api/seeds/clearnet", {"url": "https://example.com/"}),
-    ("DELETE", "/api/seeds/clearnet", {"url": "https://example.com/"}),
-    ("POST", "/api/seeds/paste", {"url": "https://example.com/"}),
-    ("DELETE", "/api/seeds/paste", {"url": "https://example.com/"}),
     ("POST", "/api/crawl/start", None),
     ("POST", "/api/crawl/stop", None),
-    ("POST", "/api/paste/scan", None),
-    ("POST", "/api/telegram/channels", {"channel": "durov"}),
-    ("DELETE", "/api/telegram/channels", {"channel": "durov"}),
     ("DELETE", "/api/investigations/1", None),
     ("DELETE", "/api/ip-investigations/1", None),
     ("DELETE", "/api/dns/investigations/1", None),
@@ -59,7 +52,6 @@ def test_admin_only_routes_refuse_a_normal_user(client, db, data_dir, method, pa
         "/api/stats",
         "/api/keywords",
         "/api/seeds",
-        "/api/telegram/channels",
         "/api/investigations",
         "/api/dns/investigations",
         "/api/crawl/status",
@@ -167,7 +159,6 @@ def test_is_admin_must_be_a_real_boolean(client, db):
 def test_bad_limit_is_not_a_server_error(client, db, query):
     sign_in(client, db, make_user(db))
     assert client.get(f"/api/hits?{query}").status_code == 200
-    assert client.get(f"/api/paste/hits?{query}").status_code == 200
 
 
 @pytest.mark.parametrize("payload", ["not json", "[1, 2]", '"text"', "null"])
@@ -177,7 +168,6 @@ def test_a_body_that_is_not_a_json_object_is_a_400_not_a_500(client, db, data_di
         "/api/keywords",
         "/api/seeds",
         "/api/users",
-        "/api/telegram/channels",
         "/api/dns/investigate",
     ):
         resp = client.post(path, data=payload, content_type="application/json", headers=headers)
@@ -212,13 +202,9 @@ def test_admin_can_reset_a_lost_second_factor(full_app, client, db):
 HOSTILE = [
     ("/api/seeds", {"url": "javascript:alert(1)"}),
     ("/api/seeds", {"urls": ["http://ok.onion/", 'http://x.onion/"onmouseover="y']}),
-    ("/api/seeds/clearnet", {"url": "not a url"}),
-    ("/api/seeds/paste", {"url": "http://example.com/<script>"}),
     ("/api/keywords", {"keyword": "two\nlines"}),
     ("/api/keywords", {"keyword": "ok", "category": "x' onclick='y"}),
     ("/api/keywords/bulk", {"keywords": [{"keyword": "ok", "category": "<b>"}]}),
-    ("/api/telegram/channels", {"channel": "x' onclick='y"}),
-    ("/api/telegram/channels", {"channel": "+79990000000"}),
     ("/api/digest/subscribers", {"email": "x' data-audit-sub='1"}),
     ("/api/digest/subscribers", {"email": "a@example.com\nb@example.com"}),
     ("/api/dns/investigate", {"domain": '"><img src=x onerror=1>.example'}),
@@ -245,24 +231,38 @@ def test_hostile_values_are_refused(client, db, data_dir, path, body):
     assert db.list_projects() == []
 
 
-def test_public_subscribe_validates_the_address(client, db, data_dir):
-    """AZ-5 / XSS-1: the unauthenticated endpoint stored a quote and a line break as given."""
-    for bad in ("x' data-audit-sub='1", "a@example.com\nb@example.com", 'a"b@example.com', "nope"):
-        resp = client.post("/api/digest/subscribe", json={"email": bad})
-        assert resp.status_code == 400, bad
-    assert not (data_dir / "digest_subscribers.txt").exists()
+REMOVED_IN_1_3_0 = [
+    ("POST", "/api/digest/subscribe"),  # D-9, AZ-5: the public subscribe form
+    ("POST", "/api/send-brief"),  # D-9: was never registered
+    ("GET", "/api/paste/hits"),  # D-10: paste monitor
+    ("GET", "/api/paste/stats"),
+    ("POST", "/api/paste/scan"),
+    ("GET", "/api/seeds/paste"),  # REL-9: lists that nothing read
+    ("POST", "/api/seeds/paste"),
+    ("GET", "/api/seeds/clearnet"),
+    ("POST", "/api/seeds/clearnet"),
+    ("GET", "/api/telegram/channels"),
+    ("POST", "/api/telegram/channels"),
+]
 
-    assert (
-        client.post(
-            "/api/digest/subscribe", json={"email": "Reader@Example.com", "name": "<b>x</b>"}
-        ).status_code
-        == 400
-    )
-    ok = client.post(
-        "/api/digest/subscribe", json={"email": "Reader@Example.com", "name": "A Reader"}
-    )
-    assert ok.status_code == 200
-    assert (data_dir / "digest_subscribers.txt").read_text() == "reader@example.com\n"
+
+@pytest.mark.parametrize("method,path", REMOVED_IN_1_3_0, ids=[f"{m} {p}" for m, p in REMOVED_IN_1_3_0])
+def test_removed_routes_are_gone(client, db, data_dir, method, path):
+    headers = sign_in(client, db, make_user(db, "boss", admin=True))
+    resp = client.open(path, method=method, json={"email": "a@example.com"}, headers=headers)
+    assert resp.status_code == 404, resp.get_data(as_text=True)
+    assert list(data_dir.iterdir()) == []
+
+
+def test_nothing_is_exempt_from_the_csrf_check(full_app):
+    """AZ-5: the one exemption was the public subscribe form, which is gone."""
+    from darkweb_scanner.dashboard import app as app_module
+
+    assert not hasattr(app_module, "CSRF_EXEMPT_ENDPOINTS")
+    client = full_app.test_client()
+    for path in ("/api/digest/subscribe", "/api/digest/subscribers", "/api/keywords"):
+        resp = client.post(path, json={"email": "a@example.com"})
+        assert resp.status_code == 403 and resp.get_json()["error"] == "csrf", path
 
 
 def test_project_fields_are_stored_validated(client, db):

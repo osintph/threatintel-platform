@@ -20,6 +20,11 @@ fetch_public() applies 3, 4 and 6 without the allowlist and never follows a
 redirect. It is for targets that cannot be listed in advance: the hosts found
 by DNS recon and the sites of the WhatsMyName corpus.
 
+fetch_public_redirects() is fetch_public() for a public file that may have
+moved (an RSS feed): it follows up to three redirects, every hop checked the
+same way, and sends the caller's headers to the first host only. It is for
+requests without a key. A request that carries a key uses safe_fetch().
+
 The Tor SOCKS5 crawler path (crawler.py, tor_client.py) is intentionally
 excluded — it contacts .onion addresses through a local Tor daemon, where
 the allowlist and IP-blocklist models do not apply. Neither function here
@@ -52,6 +57,13 @@ ALLOWED_EXTERNAL_HOSTS: frozenset = frozenset({
     "urlscan.io",
     "api.urlscan.io",
     "api.securitytrails.com",
+    # Ransomware.live (PRO API with the key, public v2 API without)
+    "api-pro.ransomware.live",
+    "api.ransomware.live",
+    # CISA Known Exploited Vulnerabilities feed (digest)
+    "www.cisa.gov",
+    # IP geolocation for DNS recon: HTTPS, no key
+    "ipwho.is",
     # OSINT / certificate transparency / DNS
     "crt.sh",
     "api.hackertarget.com",
@@ -339,10 +351,11 @@ def _result(resp, body: bytes, url: str) -> dict:
     }
 
 
-def _validate_url(url: str) -> list:
-    """Enforce HTTPS, allowlist membership, and IP blocklist. Raises SafeFetchError.
+def check_url_policy(url: str) -> str:
+    """Enforce HTTPS, allowlist membership and no credentials. Raises SafeFetchError.
 
-    Returns the checked addresses of the host, for the connection to use.
+    Returns the host. Does not resolve it: a fetch through Tor is resolved by
+    the exit, not here.
     """
     parsed = urlparse(url)
     if parsed.scheme != "https":
@@ -356,7 +369,15 @@ def _validate_url(url: str) -> list:
         )
     if parsed.username is not None or parsed.password is not None:
         raise SafeFetchError("Blocked: credentials in the URL are not permitted")
-    return _resolve_and_check(host)
+    return host
+
+
+def _validate_url(url: str) -> list:
+    """check_url_policy(), then the IP blocklist. Raises SafeFetchError.
+
+    Returns the checked addresses of the host, for the connection to use.
+    """
+    return _resolve_and_check(check_url_policy(url))
 
 
 def safe_fetch(
@@ -498,6 +519,41 @@ def fetch_public(
 
     resp, body = _send(method, url, addresses, headers=_hdrs, timeout=timeout, max_bytes=max_bytes)
     return _result(resp, body, url)
+
+
+def fetch_public_redirects(
+    url: str,
+    *,
+    headers: Optional[dict] = None,
+    timeout: int = 10,
+    max_bytes: Optional[int] = None,
+    max_redirects: int = 3,
+) -> dict:
+    """GET a public file that may have moved (an RSS feed), following up to max_redirects.
+
+    Every hop is a fetch_public() call: HTTPS only, the host resolved once,
+    every address checked, the connection made to a checked address. ``headers``
+    go to the first host only. This is for requests that carry no key; a
+    request with a key header uses safe_fetch(), which does not follow.
+
+    Returns the answer of the last hop. Raises SafeFetchError as fetch_public
+    does, and when the chain is longer than max_redirects.
+    """
+    current = url
+    hop_headers = headers
+    for _ in range(max_redirects + 1):
+        result = fetch_public(current, headers=hop_headers, timeout=timeout, max_bytes=max_bytes)
+        if result["status"] not in _REDIRECT_CODES:
+            return result
+        location = next((v for k, v in result["headers"].items() if k.lower() == "location"), "")
+        if not location:
+            raise SafeFetchError("Blocked: redirect response has no Location header")
+        current = urljoin(current, location)
+        if _origin(current) != _origin(url):
+            hop_headers = None
+    raise SafeFetchError(
+        f"Blocked: redirect chain exceeded {max_redirects} hops starting at {url!r}"
+    )
 
 
 def safe_fetch_json(url: str, **kwargs) -> tuple:

@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from darkweb_scanner import main
 from darkweb_scanner.crawler import CrawlConfig
 from darkweb_scanner.main import run_scan
 from darkweb_scanner.scanner import KeywordConfig
@@ -23,7 +24,8 @@ async def _raising_crawl(seeds):
 
 def _make_mocks():
     storage = MagicMock()
-    storage.create_crawl_session.return_value = 99
+    # run_scan claims its own session when it is not given one.
+    storage.begin_crawl_session.return_value = 99
     alerter = MagicMock()
     keyword_config = KeywordConfig.from_list(["test"])
     crawl_config = CrawlConfig()
@@ -43,6 +45,7 @@ async def test_successful_scan_marks_completed():
         patch("darkweb_scanner.main.Crawler") as mock_crawler_cls,
     ):
         mock_crawler_cls.return_value.crawl.return_value = _empty_crawl([])
+        mock_crawler_cls.return_value.stop_requested = False
 
         result = await run_scan(
             seeds=["http://test.onion"],
@@ -53,7 +56,7 @@ async def test_successful_scan_marks_completed():
             check_tor=False,
         )
 
-    storage.update_crawl_session.assert_called_once_with(99, 0, 0, status="completed")
+    storage.update_crawl_session.assert_called_once_with(99, 0, 0, status="completed", error=None)
     assert result["pages_crawled"] == 0
 
 
@@ -66,6 +69,7 @@ async def test_failed_scan_marks_failed_not_completed():
         patch("darkweb_scanner.main.Crawler") as mock_crawler_cls,
     ):
         mock_crawler_cls.return_value.crawl.return_value = _raising_crawl([])
+        mock_crawler_cls.return_value.stop_requested = False
 
         with pytest.raises(RuntimeError, match="network error"):
             await run_scan(
@@ -77,4 +81,6 @@ async def test_failed_scan_marks_failed_not_completed():
                 check_tor=False,
             )
 
-    storage.update_crawl_session.assert_called_once_with(99, 0, 0, status="failed")
+    storage.update_crawl_session.assert_called_once_with(
+        99, 0, 0, status="failed", error=main.CRAWL_FAILED_MESSAGE
+    )

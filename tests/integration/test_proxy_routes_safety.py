@@ -11,11 +11,13 @@ Tests confirm that:
 """
 
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from flask import Flask
 
 from darkweb_scanner.dashboard.storage_helper import close_db
+from darkweb_scanner.dashboard.upstream_cache import clear_all
 from tests.helpers import login_as
 
 _TEST_DB_URL = "sqlite:///:memory:"
@@ -36,6 +38,14 @@ def app():
 
     flask_app.register_blueprint(dashboard_bp)
     return flask_app
+
+
+@pytest.fixture(autouse=True)
+def _empty_caches():
+    # The relays cache answers and failures; one test's must not reach the next.
+    clear_all()
+    yield
+    clear_all()
 
 
 def _authed_client(app):
@@ -90,6 +100,35 @@ def test_feodo_proxy_calls_safe_fetch(app):
     assert "feodotracker.abuse.ch" in mock_fetch.call_args[0][0]
 
 
+def test_feodo_proxy_cache_hit_does_not_call_safe_fetch(app):
+    body = b'[{"ip": "1.2.3.4"}]'
+    url = "https://feodotracker.abuse.ch/downloads/ipblocklist.json"
+    with patch(
+        "darkweb_scanner.dashboard.dashboard_routes.safe_fetch", return_value=_ok(url, body=body)
+    ) as mock_fetch:
+        client = _authed_client(app)
+        first = client.get("/api/proxy/feodo")  # miss: fetched
+        second = client.get("/api/proxy/feodo")  # hit: served from the cache
+
+    assert first.status_code == second.status_code == 200
+    assert second.data == body
+    mock_fetch.assert_called_once()
+
+
+def test_feodo_proxy_cached_failure_is_not_a_cache_bypass(app):
+    # After a refused fetch the route answers 502 for a minute; it never serves
+    # anything that did not come through safe_fetch.
+    from darkweb_scanner.dashboard.http_client import SafeFetchError
+
+    with patch(
+        "darkweb_scanner.dashboard.dashboard_routes.safe_fetch", side_effect=SafeFetchError("Blocked")
+    ) as mock_fetch:
+        client = _authed_client(app)
+        assert client.get("/api/proxy/feodo").status_code == 502
+        assert client.get("/api/proxy/feodo").status_code == 502
+    mock_fetch.assert_called_once()
+
+
 def test_dns_certs_calls_safe_fetch(app):
     cert_body = (
         b'[{"id":1,"issuer_name":"C=US, O=Test CA","common_name":"example.com",'
@@ -125,5 +164,6 @@ def test_dns_crawler_fetch_crtsh_calls_safe_fetch():
     mock_fetch.assert_called_once()
     call_url = mock_fetch.call_args[0][0]
     assert "crt.sh" in call_url
-    assert "%.example.com" in call_url
+    # The query is percent-encoded: q=%25.example.com, which crt.sh reads as %.example.com.
+    assert parse_qs(urlparse(call_url).query)["q"] == ["%.example.com"]
     assert isinstance(result, list)

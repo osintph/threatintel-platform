@@ -381,7 +381,7 @@ def test_session_cookie_flags(client, db):
 
 
 @pytest.mark.parametrize(
-    "path", ["/api/crawl/stop", "/api/paste/scan", "/api/keywords/import", "/api/proxy/urlhaus"]
+    "path", ["/api/crawl/stop", "/api/digest/send", "/api/keywords/import", "/api/proxy/urlhaus"]
 )
 def test_state_changing_requests_need_the_token(client, db, path):
     sign_in(client, db, make_user(db, admin=True))

@@ -112,10 +112,19 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: shellcheck (deploy, upgrade and ops scripts)
-        run: shellcheck -x upgrade.sh ops/cf-origin-lock/cf-origin-lock ops/cf-origin-lock/install.sh docker/nginx/entrypoint.sh docker/tor/entrypoint.sh scripts/update-cloudflare-ips.sh tests/nginx/test_entrypoint.sh tests/tor/test_entrypoint.sh
+        run: shellcheck -x upgrade.sh ops/cf-origin-lock/cf-origin-lock ops/cf-origin-lock/install.sh docker/nginx/entrypoint.sh docker/tor/entrypoint.sh scripts/update-cloudflare-ips.sh tests/nginx/test_entrypoint.sh tests/tor/test_entrypoint.sh tests/deploy/test_env_secrets.sh tests/upgrade/test_upgrade_steps.sh scripts/restore-test.sh tests/scripts/test_restore_test.sh
 
       - name: shellcheck (older scripts, errors only)
         run: shellcheck -S error deploy.sh scripts/configure-ssl.sh
+
+      - name: deploy.sh generates each secret once and keeps it on a second run
+        run: tests/deploy/test_env_secrets.sh
+
+      - name: upgrade.sh removes the paste monitor cron job and takes the schema back before a rollback
+        run: tests/upgrade/test_upgrade_steps.sh
+
+      - name: restore-test.sh restores a dump into a throwaway PostgreSQL and rejects a damaged one
+        run: tests/scripts/test_restore_test.sh
 
   docker:
     name: Docker Build Check

@@ -14,7 +14,6 @@ PUBLIC = {
     "/totp/verify",  # second step of sign-in; redirects without a pending sign-in
     "/healthz",  # container healthcheck, 404 through nginx
     "/api/health",
-    "/api/digest/subscribe",  # public subscribe form (removed in 1.3.0)
     "/static/<path:filename>",
 }
 

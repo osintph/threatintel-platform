@@ -3,6 +3,8 @@
 Day-to-day operations for a production install. Commands are run as root from the install directory unless stated otherwise.
 
 - [Upgrading](#upgrading)
+- [Database schema](#database-schema)
+- [Backups and restore test](#backups-and-restore-test)
 - [Accounts and sign-in](#accounts-and-sign-in)
 - [Dependencies and base images](#dependencies-and-base-images)
 - [Health and logs](#health-and-logs)
@@ -19,20 +21,21 @@ Day-to-day operations for a production install. Commands are run as root from th
 ```bash
 cd /path/to/install
 sudo ./upgrade.sh            # tip of main
-sudo ./upgrade.sh v1.2.0     # a release tag, branch or commit
+sudo ./upgrade.sh v1.3.0     # a release tag, branch or commit
 ```
 
 What it does, in order:
 
 1. **Pre-flight.** Stops if a git operation is unfinished (cherry-pick, merge, rebase) or tracked files have local changes. Untracked files, `.env`, `config/` and a `docker-compose.override.yml` are left alone.
 2. **Database dump** to `backups/pre-upgrade-<UTC time>.dump` (`pg_dump -Fc`), read back with `pg_restore --list`. The five newest are kept. `SKIP_BACKUP=1` skips it.
-3. **Checkout.** A branch is fast-forwarded; a tag or commit is checked out detached. The commit you came from is written to `.upgrade-previous-commit`. The `www` submodule is not moved unless you pass `UPDATE_WWW=1`, because the website is deployed on its own schedule.
+3. **Checkout.** A branch is fast-forwarded; a tag or commit is checked out detached. The commit you came from is written to `.upgrade-previous-commit`. The `www` submodule is not moved unless you pass `UPDATE_WWW=1`, because the website is deployed on its own schedule. When the release you are moving to has an older database schema than the one installed, the schema is taken back first (see [Roll back](#roll-back)).
 4. **`.env` fixes and checks.** `DATABASE_URL` gets the `postgresql+psycopg2://` driver name; the file is set to mode 600. Settings that no release reads any more (`TOR_CONTROL_PORT`, `TOR_CONTROL_PASSWORD`, `FLASK_DEBUG`, `DASHBOARD_PORT` and the OAuth client settings) are removed, after the old file is copied to `backups/env-before-<UTC time>` (mode 600); their names are printed, values never. The script stops here, before anything is rebuilt, if `DASHBOARD_SECRET_KEY` is shorter than 32 characters. Settings that `.env.example` has and your `.env` lacks are listed by name.
-5. **Origin lock.** Updated in place when it is installed (see below).
-6. **Build and start.** The image each service runs is kept as `<image>:previous`. Images are rebuilt from `requirements.lock` and the pinned base images, then PostgreSQL, Tor, the dashboard and nginx are recreated in that order, each waited for. nginx is reloaded at the end. A full run (no `SERVICES`) also removes containers of services that are no longer in `docker-compose.yml`.
-7. **Checks.** Version and container states, then every URL in `SITE_URLS` (default: `https://DOMAIN/login` and `https://WWW_DOMAIN/`) is requested from this server's own nginx on loopback, under its host name, and must answer 200; the script exits non-zero otherwise. The same URLs are then tried the public way. A server error (5xx) there also fails the run. Any other answer is only reported: Cloudflare, for one, answers requests from the server's own address with a challenge page (403), which says nothing about the site, so open the URL from another machine.
+5. **Leftovers of removed features.** The paste monitor's job is removed from root's crontab, after the crontab is copied to `backups/root-crontab-before-<UTC time>`. Every other line stays.
+6. **Origin lock.** Updated in place when it is installed (see below).
+7. **Build and start.** The image each service runs is kept as `<image>:previous`. Images are rebuilt from `requirements.lock` and the pinned base images, then PostgreSQL, Tor, the dashboard and nginx are recreated in that order, each waited for. nginx is reloaded at the end. A full run (no `SERVICES`) also removes containers of services that are no longer in `docker-compose.yml`. The dashboard brings the database schema up to date when it starts (see [Database schema](#database-schema)); its healthcheck passes only after that.
+8. **Checks.** Version and container states, then every URL in `SITE_URLS` (default: `https://DOMAIN/login` and `https://WWW_DOMAIN/`) is requested from this server's own nginx on loopback, under its host name, and must answer 200; the script exits non-zero otherwise. The same URLs are then tried the public way. A server error (5xx) there also fails the run. Any other answer is only reported: Cloudflare, for one, answers requests from the server's own address with a challenge page (403), which says nothing about the site, so open the URL from another machine.
 
-`SERVICES="tor dashboard" sudo ./upgrade.sh` limits steps 6 and 7 to those services.
+`SERVICES="tor dashboard" sudo ./upgrade.sh` limits steps 7 and 8 to those services.
 
 ### Roll back
 
@@ -40,9 +43,13 @@ What it does, in order:
 sudo ./upgrade.sh "$(cat .upgrade-previous-commit)"
 ```
 
-That rebuilds the previous commit. If the build itself is the problem, start the kept image instead:
+That rebuilds the previous commit. When that release has an older database schema (1.3.0 back to 1.2.0, for example), the script does three things before the checkout: it dumps the database as on every run, stops the dashboard, and takes the schema back with the installed release (`db-downgrade`). What the newer revisions added is dropped, and what they removed comes back empty; the dump holds the state from before. It refuses to do this with `SKIP_BACKUP=1`.
+
+If the build itself is the problem, start the kept image instead. Take the schema back by hand first when the two releases differ in schema revision (compare `db-status` with the table in [Database schema](#database-schema)):
 
 ```bash
+docker compose stop dashboard
+docker compose run --rm --no-deps dashboard python -m darkweb_scanner.main db-downgrade 0001 --yes   # only if the schema changed
 docker tag darkweb-scanner-dashboard:previous darkweb-scanner-dashboard:latest
 docker compose up -d --no-deps --no-build dashboard
 ```
@@ -54,6 +61,56 @@ docker compose stop dashboard
 docker compose exec -T postgres pg_restore -U scanner -d darkweb_scanner --clean --if-exists < backups/pre-upgrade-<time>.dump
 docker compose up -d dashboard
 ```
+
+A restored dump carries its own schema revision, and the dashboard upgrades it again when it starts.
+
+## Database schema
+
+The schema is versioned with Alembic. The revisions are in `src/darkweb_scanner/migrations/versions/`, and the table `alembic_version` holds the one the database is at.
+
+| Revision | Release | What it does |
+|---|---|---|
+| `0001` | 1.2.0 | The baseline: every table and index of 1.2.0. It creates only what is missing, so it is safe on a database that already has them. |
+| `0002` | 1.3.0 | `crawl_sessions` gets `heartbeat_at`, `owner` and `error`; the tables `seen_pastes` and `paste_hits` and the columns `users.oauth_provider` and `users.oauth_id` are dropped. |
+
+- **Nothing to run by hand.** The dashboard, and every `python -m darkweb_scanner.main` command, brings the schema to the newest revision of its release before it does anything else. On PostgreSQL this happens in one transaction under an advisory lock: all revisions apply or none, and two processes starting together do not collide.
+- **A new, empty database** gets the current tables directly and is marked as being at the newest revision.
+- **A database from 1.2.0 or older** has no `alembic_version` table. It is treated as being before `0001`: the baseline adds whatever is missing, then the later revisions apply. Rows are kept.
+- **Check:** `docker compose exec dashboard python -m darkweb_scanner.main db-status` prints the revision of the database and the newest one the release knows. If a revision fails, the dashboard does not start and the reason is in `docker compose logs dashboard`; the database is left as it was.
+- **Going back** to an older release needs the older schema first, because old code does not know the new one. `upgrade.sh` does it (see [Roll back](#roll-back)). By hand: stop the dashboard, then `docker compose run --rm --no-deps dashboard python -m darkweb_scanner.main db-downgrade <revision> --yes` with the release that is installed, then switch releases. Do not start the newer dashboard in between; it would upgrade the schema again.
+- **Changing the schema** (developers): change the model in `storage.py` and add `versions/000N_<what>.py` whose `down_revision` is the newest existing one, with an `upgrade()` and a `downgrade()`. `tests/integration/test_migrations.py` fails until the revisions alone produce the same schema as the models, on SQLite and on PostgreSQL.
+
+## Backups and restore test
+
+`upgrade.sh` dumps the database before every upgrade, but those dumps stay on the same disk. A backup that survives the loss of the server needs a copy somewhere else (restic, borg or a snapshot service), taken on a schedule, of these:
+
+| What | Where | Why |
+|---|---|---|
+| Database | a nightly `docker compose exec -T postgres pg_dump -U scanner -Fc darkweb_scanner > <file>` | Everything the dashboard shows. Back up the dump file, not the `pg_data` volume of a running server. |
+| `.env` | the install directory | Every secret and setting. Without `DASHBOARD_SECRET_KEY` all sessions end; without `POSTGRES_PASSWORD` a restored volume cannot be opened. |
+| `config/` | the install directory | Keywords, seeds, digest subscribers. |
+| Data volume | `/var/lib/docker/volumes/darkweb-scanner_app_data/_data` | The Telegram session files (without them: authorise again) and the Channel Monitor archives. |
+| Certificates | `/var/lib/docker/volumes/darkweb-scanner_letsencrypt/_data` | Saves a new issuance, which Let's Encrypt limits per week. |
+| Files you added | `docker-compose.override.yml` and anything else untracked in the install directory (`git status --short --ignored`) | Not in git, so not restorable from the repository. |
+| Server set-up | `/usr/local/sbin/cf-origin-lock`, `/etc/systemd/system/cf-origin-lock.service`, your backup scripts and their configuration | Small, and tedious to redo. |
+
+Not needed: the `tor_data` volume (Tor rebuilds it) and the images (rebuilt from the repository).
+
+The dump runs over the socket inside the PostgreSQL container, so no password is needed and none appears in a process list.
+
+### Restore test
+
+A backup counts once a restore from it has worked. `scripts/restore-test.sh` restores a dump into a throwaway PostgreSQL container that has no network and keeps its data in memory, prints the row count of every table, and removes the container. The live database is not touched, and no row content is printed.
+
+```bash
+scripts/restore-test.sh backups/pre-upgrade-<time>.dump          # a pg_dump -Fc file, plain or gzipped
+COMPARE=1 scripts/restore-test.sh /path/to/nightly.dump.gz       # with the live row counts next to it
+ssh server 'sudo cat /path/to/nightly.dump.gz' | scripts/restore-test.sh -     # on another machine; nothing is written to its disk
+```
+
+It ends with `restore-test: PASSED — <n> tables, <n> rows restored without an error` and exit status 0, or with `FAILED` and status 1. With `COMPARE=1`, tables whose count differs from the live database are marked; tables that receive rows all the time (sign-in log, crawl results) differ by what was added since the dump.
+
+Do this **after every change to the backup set-up and once a quarter**, with a file taken from the off-site copy, not from the server's own disk. Once a year, do the full exercise on a spare machine: restore the files from the table above, run `deploy.sh`, restore the dump with the `pg_restore` command under [Roll back](#roll-back), and sign in.
 
 ## Accounts and sign-in
 
@@ -109,7 +166,7 @@ docker compose logs dashboard | grep 'auth event='
 
 - `GET /healthz` on the dashboard runs `SELECT 1` and answers 200 or 503. The container healthcheck uses it, so `docker compose ps` shows `unhealthy` when the app cannot reach PostgreSQL. It needs no login and returns no data.
 - Every service logs through `json-file` with at most 5 files of 20 MB. Read them with `docker compose logs --tail 200 <service>`.
-- The dashboard is served by gunicorn with **one worker process and 8 threads**. Keep it at one worker: crawl state and the Quick Scan and Channel Monitor jobs live in that process's memory, and a second worker would not see them. There is no debug mode.
+- The dashboard is served by gunicorn with **one worker process and 8 threads**. Keep it at one worker: the job limits, the upstream cache and the Quick Scan and Channel Monitor jobs live in that process's memory, and a second worker would not see them. A crawl records its owner (`host:pid`) and a heartbeat in `crawl_sessions`; a running session whose heartbeat is older than `CRAWL_STALE_SECONDS` is ended as `interrupted`, so a dead crawl no longer blocks the next one. There is no debug mode.
 - The dashboard does not start without `DATABASE_URL`, or with a `DASHBOARD_SECRET_KEY` shorter than 32 characters; the reason is in `docker compose logs dashboard`.
 - A change in `.env` takes effect after `docker compose up -d dashboard` (`restart` does not re-read the file).
 
@@ -126,6 +183,13 @@ docker compose logs dashboard | grep 'auth event='
 - **Translation uses Google Translate.** The text of each message that is not English is sent from the server to `translate.google.com` (no key, no account; media, sender and channel name are not sent). Do not run a job on content that must not be disclosed to Google.
 - **Retention.** A job folder and its archive are deleted `CHANNEL_MONITOR_RETENTION_DAYS` days (default 90) after their last change. The sweep runs when the dashboard starts and at most once an hour while Channel Monitor is in use. It never touches a running job or the Telegram session file. **The first start of 1.2.0 deletes every job folder older than the limit**, so download what you want to keep before upgrading.
 - Jobs record the administrator who started them. A running job cannot be deleted.
+- **One job at a time.** A second start answers 409 and names the running job.
+- **Job state is on disk.** Each job folder under `/app/data/channel_monitor/` holds `job.json` (state) and `job.log`. After a restart the list is read from the folders: a job that was running shows as **Interrupted**, and an export from before 1.3.0 (no `job.json`) shows as **Archived**; both can be downloaded and deleted.
+- **Sign-in.** A job never asks Telegram for a login code. Sign the session in once with `docker compose exec dashboard python -m darkweb_scanner.main channel-monitor-auth` (it asks for the code Telegram sends, and for the phone number if `TELEGRAM_PHONE` is empty). Run it when no job is running. The session file `channel_monitor.session` is kept at mode 600. A job that finds no signed-in session ends with an error that names the command.
+- **Limits** are set in `.env`, never by the request: `CHANNEL_MONITOR_MAX_MESSAGES` (5000), `CHANNEL_MONITOR_MAX_FILE_MB` (50, photos and image files), `CHANNEL_MONITOR_MAX_VIDEO_MB` (200), `CHANNEL_MONITOR_MAX_JOB_GB` (2, media of one job), `CHANNEL_MONITOR_MIN_FREE_GB` (5), `CHANNEL_MONITOR_MAX_DOWNLOAD_GB` (5). Below the free-space minimum no job starts and a running job stops, keeps what it has read and ends with an error. Keep the job limit at or below the download limit.
+- **One ZIP per job**, built on the first download and reused, so a downloaded job takes about twice its size until it is deleted or expires. `job.log` is in the ZIP; `job.json` is not.
+- **Errors.** The job log and the API show a plain sentence and an 8-character error id; the traceback is in `docker compose logs dashboard` under `[error_id=...]`.
+- **A stuck job** (a translation request that never returns, for example) holds the only slot. `docker compose up -d --force-recreate dashboard` ends it as Interrupted; what it saved can be downloaded.
 - The report (`messages.html` in the archive) shows channel content as text only and carries a policy that blocks scripts and remote content.
 
 ## nginx
@@ -134,7 +198,7 @@ The virtual hosts are generated by `docker/nginx/entrypoint.sh` when the contain
 
 - **Unknown host names** are refused: port 80 closes the connection (444), port 443 rejects the TLS handshake. Only `DOMAIN`, `WWW_DOMAIN` (with `www.`) and `THREATWATCH_DOMAIN` are served. Without `DOMAIN` the dashboard answers on any name, for installs reached by IP address.
 - **Visitor address.** `docker/nginx/cloudflare-realip.conf` lists Cloudflare's ranges; for connections from them, `CF-Connecting-IP` becomes `$remote_addr` (logs, rate limits, `X-Real-IP`). From any other peer the header is ignored. `X-Forwarded-For` and `X-Forwarded-Host` are set by nginx and never passed through from the client. When Cloudflare changes its ranges, run `scripts/update-cloudflare-ips.sh`, commit, and rebuild nginx.
-- **Rate limits** (HTTP 429): `/login`, `/register`, `/totp/setup`, `/totp/verify` and the public `/api/digest/subscribe` and `/api/send-brief` share 10 requests a minute per visitor with a burst of 10. The three relays on the threat-watch site (`/api/nvd/`, `/api/threatfox`, `/api/urlhaus`) allow 30 a minute with a burst of 20, one method each, same-origin only.
+- **Rate limits** (HTTP 429): `/login`, `/register`, `/totp/setup` and `/totp/verify` share 10 requests a minute per visitor with a burst of 10. The three relays on the threat-watch site (`/api/nvd/`, `/api/threatfox`, `/api/urlhaus`) allow 30 a minute with a burst of 20, one method each, same-origin only.
 - **The dashboard is looked up at request time** (Docker's DNS, cached for 10 seconds). Rebuilding or recreating the dashboard needs no nginx restart, and nginx starts even when the dashboard is down (it answers 502 until it is back).
 - **`/healthz`** is for the container healthcheck and answers 404 through nginx.
 - **Reload without a restart:** `docker compose exec nginx nginx -s reload`.

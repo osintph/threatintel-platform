@@ -5,6 +5,61 @@ The format follows **Keep a Changelog**. This project adheres to **Semantic Vers
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-07
+
+Reliability and clean-up release, from the November 2026 audit: long work runs as limited background jobs, user patterns cannot freeze the process, the crawl's state is in the database, Channel Monitor runs one job at a time within server-side limits, the dashboard has a content security policy, the schema is versioned with Alembic, and unused features are removed.
+
+### Upgrade notes
+
+- Upgrade with `sudo ./upgrade.sh v1.3.0`. It dumps the database first, as on every run.
+- **The database schema is upgraded when the dashboard first starts** (revision `0002`): `crawl_sessions` gets `heartbeat_at`, `owner` and `error`; the paste monitor tables (`seen_pastes`, `paste_hits`) and the columns `users.oauth_provider` and `users.oauth_id` are dropped. Nothing to run by hand; check with `make db-status`. Going back to 1.2.0 with `upgrade.sh` takes the schema back first (see `docs/runbook.md`).
+- **Removed:** the paste monitor (its tab, routes, tables and cron job; `upgrade.sh` removes the job from root's crontab after keeping a copy), the public `/api/digest/subscribe` and `/api/send-brief` endpoints, and the clearnet seed, paste source and Telegram channel lists in the dashboard, which nothing read. The background Telegram scraper still reads `TELEGRAM_CHANNELS` from `.env`.
+- **Channel Monitor** runs one job at a time and never asks Telegram for a login code. If its session is not signed in, a job ends with an error that names `make channel-monitor-auth`; run it once. Exports made before 1.3.0 show as **Archived**.
+- **Project keyword patterns** that could backtrack catastrophically are refused when saved. A pattern saved earlier that fails the check is skipped by the crawl, with a warning in the log.
+- **Scripts that call the API** may get `429` with `Retry-After` when a user already runs two heavy operations (four in total), and error answers now carry an `error_id` in place of exception text.
+- **New optional settings** (limits and timeouts) are listed in `.env.example`; the defaults apply when they are unset.
+
+### Fixed
+
+- **Long work no longer pins the request threads (REL-2).** DNS recon, Quick Scan, breach checks and IP lookups run as background jobs, at most `HEAVY_JOBS_MAX` (4) at once and `HEAVY_JOBS_PER_USER` (2) per user; over the limit the answer is 429 at once. Calls that fan out share one pool of `FANOUT_WORKERS` threads with a time limit, and VirusTotal's rate limit is waited out off the request thread. Answers from abuse.ch, crt.sh, WhiteIntel and DNSDumpster are cached for `UPSTREAM_CACHE_SECONDS` (300), and the last good answer is served while the service fails.
+- **User patterns cannot freeze the process (REL-3).** A project keyword marked Regex is checked when it is saved and again before the crawl runs it: back-references, repeats inside look-arounds, a repeat followed by something it can also match (`(a+)+`), overlapping repeated alternatives (`(a|aa)+`) and patterns over 200 characters are refused with `The pattern is not accepted: <reason>`. A pattern only sees the 1,000 characters around a hit. A stored pattern that fails the check is skipped with one warning naming the project and the pattern.
+- **Crawl state is in the database (REL-4).** A crawl claims its session with an owner (`host:pid`) and keeps a heartbeat every `CRAWL_HEARTBEAT_SECONDS` (15). A session whose heartbeat is older than `CRAWL_STALE_SECONDS` (120), or whose process restarted, is ended as **interrupted** with the reason; `/api/crawl/status` used to mark every running session completed when it found no thread. A crawl started with `make scan` counts as running in the dashboard too. The stop flag is cleared only once a new crawl owns its session, so a start while a crawl runs no longer cancels that crawl's stop request. When Tor is down the start answers 503 with a plain message; the crawl thread no longer calls `sys.exit`. The dashboard shows how the last crawl ended when it failed or was interrupted. A stopped crawl ends as `stopped`.
+- **Error answers leak nothing (REL-8).** An unexpected failure is logged with its traceback under an 8-character error id; the API answers with a plain message and the id. Job logs show the same. DNS recon accepts public domain names only (no single-label names such as `postgres`).
+- **Features that did not work are finished or removed (REL-9).** The port and directory scan buttons, which called routes that do not exist, are gone; port and directory results still come with a DNS recon. The keyword project list reads the API's answer, and a successful crawl start no longer reports "Network error". Keyword and seed files are updated under a lock and keep their `settings:` block.
+- **Alert e-mail (REL-10)** is sent from a queue on its own thread, not from the crawl loop, with a timeout on every SMTP step (`SMTP_TIMEOUT`, 15 s) and certificate checking (STARTTLS required unless port 465). `ALERT_QUEUE_SIZE` and `ALERT_FLUSH_SECONDS` set the queue.
+- **Schema migrations and connection checks (REL-7).** Alembic, with a baseline of 1.2.0 that is safe on an existing database; the dashboard and every command upgrade the schema at start, on PostgreSQL in one transaction under an advisory lock. `db-status` and `db-downgrade` commands. Connections are checked before use (`pool_pre_ping`).
+
+### Channel Monitor
+
+- **Job state is kept (REL-1).** Each job folder holds `job.json` and `job.log`, so the list survives a restart: a job that was running shows as Interrupted. The panel's heading, badge and button come from one state, and any answer other than 200 ends polling, so it no longer says "Running" for ever.
+- **Limits set on the server (REL-5):** messages per job (`CHANNEL_MONITOR_MAX_MESSAGES`, 5000), photo and image size (`_MAX_FILE_MB`, 50), highest video size a job may ask for (`_MAX_VIDEO_MB`, 200), media per job (`_MAX_JOB_GB`, 2), free disk (`_MIN_FREE_GB`, 5; below it no job starts and a running one stops), download size (`_MAX_DOWNLOAD_GB`, 5). One ZIP per job, built once.
+- **One job at a time, one session (REL-6).** A second start answers 409 and names the running job. Jobs connect with the saved session and never start Telegram's interactive login; `channel-monitor-auth` signs the session in. The session file is mode 600.
+- **Translate can be turned off per job**: then nothing is sent to Google.
+
+### Security
+
+- **Content security policy on the dashboard (XSS-5).** Scripts load from the application's own `/static/` only: the inline script and the 180 inline event handlers are gone, and the world-map library is served by the application instead of jsDelivr. `frame-ancestors 'none'`, `object-src 'none'`, `form-action 'self'`. Static files are cached for a year under a versioned URL.
+- **Bodies are capped and Quick Scan goes through Tor (NET-5).** The crawler and Quick Scan read at most `MAX_PAGE_BYTES` (2 MiB) of a page. The crawler fetches `.onion` addresses only, and a redirect is followed only to another `.onion` address. Quick Scan's clearnet sources are fetched through Tor, after the same URL checks as `safe_fetch()` (HTTPS, host in `ALLOWED_EXTERNAL_HOSTS`, no credentials in the URL; the shared `check_url_policy()`), with the certificate checked and no redirect followed.
+- **API clients go through `safe_fetch()` (NET-4):** ransomware.live, AbuseIPDB, VirusTotal and the feeds use HTTPS to listed hosts with no redirect carrying their key; path and query values are encoded; geolocation uses ipwho.is over HTTPS in place of ip-api.com over HTTP.
+- **`deploy.sh` keeps secrets on a second run (OPS-8)**: `DASHBOARD_SECRET_KEY`, `POSTGRES_PASSWORD` and `SETUP_TOKEN` are generated only while empty or a placeholder, and it stops with an explanation when the database volume exists but `.env` has no password. It prints the line it stopped at.
+- **`SECURITY.md`** with the private reporting route (OPS-19).
+- **No log file in the data volume:** `scanner.log` is no longer written; logs go to the container log only.
+
+### Removed
+
+- Paste monitor (D-10), the public subscribe and send-brief endpoints (D-9), the OAuth columns (D-5; the sign-in code went in 1.2.0), dashboard lists nothing read, `docs/paste_monitor.md`.
+
+### Added
+
+- **Backups and restore test (OPS-7):** `docs/runbook.md` lists what a backup needs besides the database; `scripts/restore-test.sh` restores a dump into a throwaway PostgreSQL container without network and prints row counts (`COMPARE=1` puts the live counts next to them).
+- `make db-status`, `make channel-monitor-auth`; help page sections on project patterns and on what Channel Monitor sends.
+- **Tests:** 801 passed, 2 skipped (from 595): Channel Monitor job states and limits, the content security policy in headless Chromium, migrations on SQLite and PostgreSQL, pattern checks, crawl ownership and heartbeat, `deploy.sh`, `upgrade.sh` and the restore test in CI.
+
+### Dependencies
+
+- Added `alembic` 1.20.1 (and `mako`), hash-pinned in `requirements.lock`.
+- `deep-translator` 1.11.4 is kept. osv reports PYSEC-2022-252 for it with no fixed version: the advisory is about a malicious 1.8.5 published from a phished maintainer account, and lists every later release. 1.8.5 is no longer on PyPI; 1.11.4 is installed only by hash, and both hashes match the files PyPI publishes. Not exploitable here.
+
 ## [1.2.0] - 2026-11-06
 
 Security release for the application, from the November 2026 audit: sign-in and sessions are checked on the server, every change needs a CSRF token and the right role, the dashboard and its exports show data as text, outbound requests cannot be redirected to internal addresses, and Channel Monitor is limited to administrators and public channels.

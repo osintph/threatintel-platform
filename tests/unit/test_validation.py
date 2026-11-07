@@ -91,27 +91,6 @@ def test_email_optional():
     assert v.email("", required=False) is None
 
 
-@pytest.mark.parametrize(
-    "value,expected",
-    [
-        ("@durov", "durov"),
-        ("https://t.me/durov", "durov"),
-        ("t.me/s/some_channel/", "some_channel"),
-    ],
-)
-def test_telegram_channel_accepts(value, expected):
-    assert v.telegram_channel(value) == expected
-
-
-@pytest.mark.parametrize(
-    "value",
-    ["me", "+79990000000", "https://t.me/+AbCdEf", "joinchat/abc", "a b", "x" * 40, "ch'an"],
-)
-def test_telegram_channel_rejects(value):
-    with pytest.raises(v.Invalid):
-        v.telegram_channel(value)
-
-
 def test_keyword_allows_regex_and_quotes_but_not_line_breaks():
     assert v.keyword(r'pass(word)?\s*[:=]\s*"') == r'pass(word)?\s*[:=]\s*"'
     for bad in ("a\nb", "a\x00b", "", "x" * 201, None, ["a"]):

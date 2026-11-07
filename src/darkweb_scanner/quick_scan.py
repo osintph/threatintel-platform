@@ -23,6 +23,9 @@ from urllib.parse import urljoin, urlparse
 import aiohttp
 from bs4 import BeautifulSoup
 
+from . import tor_client as _tor
+from .tor_client import fetch_page, is_onion_url
+
 logger = logging.getLogger(__name__)
 
 # Target types
@@ -47,6 +50,11 @@ MAX_URLS_PER_SCAN = 100       # hard cap on URLs attempted per scan
 PER_SOURCE_TIMEOUT = 30       # seconds per individual fetch
 TOTAL_TIMEOUT = 600           # 10-minute hard cap on the whole scan
 MAX_CONCURRENT = int(os.getenv("QUICK_SCAN_MAX_CONCURRENT", "4"))
+MAX_PAGE_BYTES = _tor.MAX_PAGE_BYTES  # most bytes read from one response body
+
+# No email address is longer. The pattern below is quadratic on input like
+# "x@a.a.a.a...@", so it is only run on input that could be an address.
+MAX_EMAIL_LENGTH = 254
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # label.tld, one or more labels, ascii TLD >= 2 chars. No scheme, no path.
@@ -66,7 +74,7 @@ def detect_target_type(raw: str) -> str:
       4. otherwise                                         -> company_name
     """
     value = (raw or "").strip()
-    if "@" in value and _EMAIL_RE.match(value):
+    if "@" in value and len(value) <= MAX_EMAIL_LENGTH and _EMAIL_RE.match(value):
         return TYPE_EMAIL
     lowered = value.lower()
     if lowered.startswith("http://") or lowered.startswith("https://"):
@@ -194,7 +202,7 @@ def _is_cancelled(storage, session_id: int) -> bool:
 
 
 def _is_onion(url: str) -> bool:
-    return (urlparse(url).hostname or "").endswith(".onion")
+    return is_onion_url(url)
 
 
 def _normalize_url(url: str) -> str:
@@ -222,50 +230,54 @@ def _extract_page_text(html: str) -> str:
 
 
 def _extract_links(html: str, base_url: str) -> list:
+    """The .onion links on a page. Links to anything else are not followed."""
     soup = BeautifulSoup(html, "lxml")
     links = []
     for tag in soup.find_all("a", href=True):
         href = tag["href"].strip()
         if not href or href.startswith(("#", "mailto:", "javascript:")):
             continue
-        absolute = urljoin(base_url, href)
-        parsed = urlparse(absolute)
-        if parsed.scheme in ("http", "https"):
+        try:
+            absolute = urljoin(base_url, href)
+        except ValueError:
+            continue
+        if _is_onion(absolute):
             links.append(_normalize_url(absolute))
     return links
 
 
 async def _fetch_onion(url: str, tor_client) -> tuple:
+    """Fetch an onion page: body capped, redirects followed to .onion addresses only."""
     session = await tor_client.get_session()
     timeout = aiohttp.ClientTimeout(total=PER_SOURCE_TIMEOUT)
-    async with session.get(url, ssl=False, allow_redirects=True, timeout=timeout) as resp:
-        html = await resp.text(errors="replace")
-        return resp.status, html
+    page = await fetch_page(session, url, max_bytes=MAX_PAGE_BYTES, timeout=timeout)
+    return page.status, page.text
 
 
-async def _fetch_clearnet(url: str) -> tuple:
-    """Fetch a clearnet URL through safe_fetch (HTTPS-only, allowlisted, IP-blocked).
+async def _fetch_clearnet(url: str, tor_client) -> tuple:
+    """Fetch the query URL of a clearnet source, through Tor.
 
-    Imported lazily and run in a thread since safe_fetch is synchronous.
+    Nothing is requested from the server's own address during a scan. The URL
+    passes safe_fetch's checks first (https, host in ALLOWED_EXTERNAL_HOSTS, no
+    credentials; SafeFetchError otherwise), the certificate is checked, the
+    body is capped and no redirect is followed.
     """
-    from .dashboard.http_client import safe_fetch
+    from .dashboard.http_client import check_url_policy
 
-    def _do():
-        result = safe_fetch(url, timeout=PER_SOURCE_TIMEOUT, allow_redirects=True)
-        body = result.get("body") or b""
-        if isinstance(body, bytes):
-            body = body.decode("utf-8", "replace")
-        return result.get("status", 0), body
-
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _do)
+    check_url_policy(url)
+    session = await tor_client.get_session()
+    timeout = aiohttp.ClientTimeout(total=PER_SOURCE_TIMEOUT)
+    page = await fetch_page(
+        session, url, max_bytes=MAX_PAGE_BYTES, timeout=timeout, onion_only=False
+    )
+    return page.status, page.text
 
 
 async def _fetch(url: str, tor_client) -> tuple:
-    """Return (status_code, html). Onion via Tor, clearnet via safe_fetch."""
+    """Return (status_code, html). Everything goes through Tor."""
     if _is_onion(url):
         return await _fetch_onion(url, tor_client)
-    return await _fetch_clearnet(url)
+    return await _fetch_clearnet(url, tor_client)
 
 
 async def run_quick_scan(session_id: int, storage, tor_client) -> None:

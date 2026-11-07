@@ -1,7 +1,7 @@
 """
 Integration tests for the Quick Scan orchestrator (run_quick_scan).
 
-Tor and safe_fetch are mocked to return canned HTML so the crawl logic — findings
+Tor is mocked to return canned HTML so the crawl logic — findings
 persistence, URL cap, depth cap, and total-timeout handling — is exercised without
 any network access.
 """
@@ -140,16 +140,77 @@ def test_total_timeout_marks_session_completed_with_warning(storage):
     assert sess.urls_visited == 0
 
 
-def test_clearnet_path_uses_safe_fetch(storage):
-    # _fetch must route non-onion URLs through safe_fetch.
-    captured = {}
+class _FakeResp:
+    def __init__(self, status=200, body=b"", headers=None):
+        self.status = status
+        self.headers = {"Content-Type": "text/html", **(headers or {})}
+        self.charset = "utf-8"
+        self.content = self
+        self._body = body
 
-    def _fake_safe_fetch(url, **kwargs):
-        captured["url"] = url
-        return {"status": 200, "headers": {}, "body": b"acme.com leaked", "url": url}
+    async def iter_chunked(self, _size):
+        yield self._body
 
-    with patch("darkweb_scanner.dashboard.http_client.safe_fetch", _fake_safe_fetch):
-        status, html = asyncio.run(qs._fetch("https://dpaste.org/x", _FakeTor()))
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    """Records the requests made through the (fake) Tor session."""
+
+    def __init__(self, resp):
+        self.resp = resp
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return self.resp
+
+
+class _SessionTor(_FakeTor):
+    def __init__(self, session):
+        self.session = session
+
+    async def get_session(self):
+        return self.session
+
+
+def test_clearnet_path_goes_through_tor(storage):
+    # NET-5: a clearnet source is fetched through Tor, not from the server's own address.
+    session = _FakeSession(_FakeResp(body=b"acme.com leaked"))
+    with patch("darkweb_scanner.dashboard.http_client.safe_fetch") as direct:
+        status, html = asyncio.run(qs._fetch("https://dpaste.org/x", _SessionTor(session)))
     assert status == 200
-    assert captured["url"] == "https://dpaste.org/x"
     assert "acme.com" in html
+    direct.assert_not_called()
+    assert [url for url, _ in session.calls] == ["https://dpaste.org/x"]
+    kwargs = session.calls[0][1]
+    assert kwargs["allow_redirects"] is False
+    assert "ssl" not in kwargs  # the certificate is checked
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://dpaste.org/x",  # not https
+        "https://not-allowlisted.example/x",
+        "https://user:pw@dpaste.org/x",  # credentials in the URL
+    ],
+)
+def test_clearnet_path_applies_safe_fetch_policy_before_tor(storage, url):
+    from darkweb_scanner.dashboard.http_client import SafeFetchError
+
+    session = _FakeSession(_FakeResp())
+    with pytest.raises(SafeFetchError):
+        asyncio.run(qs._fetch(url, _SessionTor(session)))
+    assert session.calls == []
+
+
+def test_clearnet_path_does_not_follow_redirects(storage):
+    session = _FakeSession(_FakeResp(status=302, headers={"Location": "https://dpaste.org/y"}))
+    status, _html = asyncio.run(qs._fetch("https://dpaste.org/x", _SessionTor(session)))
+    assert status == 302
+    assert len(session.calls) == 1

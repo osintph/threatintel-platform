@@ -4,14 +4,17 @@ Separate from the crawl intelligence report (api/report/pdf).
 API keys loaded from environment only — never hardcoded.
 """
 
+import html
 import logging
 import os
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
+
+from .pdf_text import pdf_plain
 
 logger = logging.getLogger(__name__)
 
@@ -302,23 +305,72 @@ def build_digest_pdf(feed_data: dict, scanner_summary: dict = None, date: dateti
     return buf.read()
 
 
+def _esc(value, max_len: int = 2000) -> str:
+    """A feed value as HTML text: cleaned, cut to max_len characters, then escaped."""
+    return html.escape(pdf_plain(value, max_len), quote=True)
+
+
+def _http_url(value) -> str:
+    """The URL when it is a plain http(s) address, else an empty string (no link is made)."""
+    url = pdf_plain(value, 2000).strip()
+    if not url or any(ch.isspace() for ch in url):
+        return ""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return ""
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+        return ""
+    return url
+
+
+def _one_line(value) -> str:
+    """A mail header value: no line breaks or other control characters."""
+    return " ".join(pdf_plain(value, 300).split())
+
+
+def digest_subject(date_str: str) -> str:
+    # The date only: nothing from a feed is ever placed in a header.
+    return _one_line(f"Daily Threat Intelligence - {date_str} | OSINT PH")
+
+
+def digest_text(date_str: str) -> str:
+    """The plain-text part. It names the date and nothing from a feed."""
+    return f"Daily Threat Intelligence powered by OSINT PH\n{_one_line(date_str)}\nFull report attached.\nosintph.info"
+
+
+def _valid_recipient(address) -> bool:
+    """One address, with nothing that could add a second recipient or a header."""
+    if not isinstance(address, str) or not 3 <= len(address) <= 254 or address.count("@") != 1:
+        return False
+    return not any(ch.isspace() or ord(ch) < 32 or ch in ",;<>\"'" for ch in address)
+
+
 def build_email_html(feed_data: dict, date_str: str, stats: dict) -> str:  # noqa: ARG001
-    kev = feed_data.get("cisa_kev", [])
-    sea_items = ([p for p in feed_data.get("otx_pulses", []) if p.get("sea_relevant")] +
-                 [r for r in feed_data.get("rss", []) if r.get("sea_relevant")])[:6]
-    global_items = [r for r in feed_data.get("rss", []) if not r.get("sea_relevant")][:5]
+    """The HTML part of the digest mail.
+
+    Feed titles, descriptions, sources and URLs are written by third parties
+    (OTX pulses by anyone with an account). Every value is escaped, and only
+    http and https URLs become links; with any other URL the text is kept and
+    the link is dropped.
+    """
+    kev = feed_data.get("cisa_kev") or []
+    sea_items = ([p for p in feed_data.get("otx_pulses") or [] if p.get("sea_relevant")] +
+                 [r for r in feed_data.get("rss") or [] if r.get("sea_relevant")])[:6]
+    global_items = [r for r in feed_data.get("rss") or [] if not r.get("sea_relevant")][:5]
 
     # Build KEV rows — no nested f-strings (Python 3.11 compat)
     kev_row_parts = []
     for i, v in enumerate(kev[:8]):
         row_bg = "#fff8f8" if i % 2 == 0 else "#ffffff"
-        cve_url = f"https://nvd.nist.gov/vuln/detail/{v['cve']}"
+        cve = pdf_plain(v.get("cve"), 40).strip()
+        cve_url = html.escape(f"https://nvd.nist.gov/vuln/detail/{quote(cve, safe='')}", quote=True)
         kev_row_parts.append(
             f'<tr style="background:{row_bg}">'
             f'<td style="padding:6px 10px;font-size:11px;font-family:monospace;border-bottom:1px solid #d0d7de">'
-            f'<a href="{cve_url}" style="color:#f85149;text-decoration:none">{v["cve"]}</a></td>'
-            f'<td style="padding:6px 10px;font-size:11px;border-bottom:1px solid #d0d7de">{v["title"][:60]}</td>'
-            f'<td style="padding:6px 10px;font-size:11px;color:#57606a;border-bottom:1px solid #d0d7de">{v["vendor"]}</td>'
+            f'<a href="{cve_url}" style="color:#f85149;text-decoration:none">{_esc(cve)}</a></td>'
+            f'<td style="padding:6px 10px;font-size:11px;border-bottom:1px solid #d0d7de">{_esc(v.get("title"), 60)}</td>'
+            f'<td style="padding:6px 10px;font-size:11px;color:#57606a;border-bottom:1px solid #d0d7de">{_esc(v.get("vendor"), 80)}</td>'
             f'</tr>'
         )
     kev_rows = "".join(kev_row_parts)
@@ -327,12 +379,12 @@ def build_email_html(feed_data: dict, date_str: str, stats: dict) -> str:  # noq
         rows = ""
         for item in items:
             bg = "#fff8f8" if highlight else "#ffffff"
-            title = item.get("title", "")[:100]
-            desc = (item.get("description", "") or "")[:200]
-            source = item.get("source", "")
-            url = item.get("url", "")
+            title = _esc(item.get("title"), 100)
+            desc = _esc(item.get("description"), 200)
+            source = _esc(item.get("source"), 80)
+            url = html.escape(_http_url(item.get("url")), quote=True)
             read_more = (
-                f' \u00b7 <a href="{url}" style="color:#58a6ff;text-decoration:none">Read more \u2192</a>'
+                f' · <a href="{url}" style="color:#58a6ff;text-decoration:none">Read more →</a>'
                 if url else ""
             )
             title_html = (
@@ -381,12 +433,12 @@ def build_email_html(feed_data: dict, date_str: str, stats: dict) -> str:  # noq
         f'<div style="background:#0d1117;padding:24px 28px;border-bottom:4px solid #f85149">'
         f'<div style="font-size:22px;font-weight:800;color:white;margin-bottom:2px">Daily Threat Intelligence</div>'
         f'<div style="font-size:12px;color:#f85149;font-weight:700;margin-bottom:6px">powered by OSINT PH</div>'
-        f'<div style="font-size:11px;color:#8b949e">{date_str} \u00b7 Full report attached as PDF</div>'
+        f'<div style="font-size:11px;color:#8b949e">{_esc(date_str, 60)} · Full report attached as PDF</div>'
         f'</div>'
         f'{kev_section}{sea_section}{global_section}'
         f'<div style="padding:14px 20px 16px;background:#0d1117;margin-top:10px">'
-        f'<p style="color:#8b949e;font-size:11px;margin:0">CONFIDENTIAL \u00b7 '
-        f'<a href="https://osintph.info" style="color:#f85149">osintph.info</a> \u00b7 '
+        f'<p style="color:#8b949e;font-size:11px;margin:0">CONFIDENTIAL · '
+        f'<a href="https://osintph.info" style="color:#f85149">osintph.info</a> · '
         f'Reply UNSUBSCRIBE to opt out</p>'
         f'</div>'
         f'</div>'
@@ -424,17 +476,20 @@ def send_digest(storage, recipients: list = None, date: datetime = None) -> dict
 
     try:
         pdf_bytes = build_digest_pdf(feed_data, scanner_summary=scanner_summary, date=date)
-    except Exception as e:
+    except Exception:
         logger.exception("PDF build failed")
-        return {"ok": False, "error": f"PDF build failed: {e}"}
+        return {"ok": False, "error": "PDF build failed. Details are in the server log."}
 
     filename = f"osintph-threat-digest-{date_label}.pdf"
-    subject = f"Daily Threat Intelligence - {date_str} | OSINT PH"
+    subject = digest_subject(date_str)
     html_body = build_email_html(feed_data, date_str, stats)
-    text_body = f"Daily Threat Intelligence powered by OSINT PH\n{date_str}\nFull report attached.\nosintph.info"
+    text_body = digest_text(date_str)
 
     errors, sent = [], 0
     for recipient in recipients:
+        if not _valid_recipient(recipient):
+            errors.append(f"{_one_line(recipient)[:80]}: not a single email address, skipped")
+            continue
         try:
             resp = requests.post(
                 f"https://api.mailgun.net/v3/{MAILGUN_DOMAIN}/messages",
@@ -449,7 +504,8 @@ def send_digest(storage, recipients: list = None, date: datetime = None) -> dict
                 logger.info(f"Digest sent to {recipient}")
             else:
                 errors.append(f"{recipient}: HTTP {resp.status_code}")
-        except Exception as e:
-            errors.append(f"{recipient}: {e}")
+        except Exception:
+            logger.exception("Digest could not be sent to %s", recipient)
+            errors.append(f"{recipient}: could not be sent")
 
     return {"ok": sent > 0, "sent": sent, "total": len(recipients), "errors": errors}

@@ -7,9 +7,8 @@ import threading
 from ..storage import _FLASK_SESSION_KEY, Storage
 
 _storage = None
-# Guards first-time construction: Storage.__init__ runs create_all, and two
-# concurrent requests racing it can collide in Postgres (pg_type_typname_nsp_index
-# UniqueViolation) despite checkfirst.
+# Guards first-time construction: Storage.__init__ brings the schema up to date,
+# and two requests should not both start that.
 _storage_lock = threading.Lock()
 
 

@@ -146,7 +146,7 @@
         {% endfor %}
       </div>
       <div style="margin-top:18px">
-        <button class="btn btn-primary" id="qs-start" onclick="startScan()">▶ Start Scan</button>
+        <button class="btn btn-primary" id="qs-start" data-act="startScan">▶ Start Scan</button>
       </div>
     </div>
   </div>
@@ -160,7 +160,7 @@
         <div class="stat"><span class="n" id="qs-urls">0</span><span class="l">URLs visited</span></div>
         <div class="stat"><span class="n" id="qs-findings">0</span><span class="l">Findings</span></div>
         <div class="stat"><span class="n" id="qs-target-label" style="font-size:.95rem">—</span><span class="l">Target</span></div>
-        <button class="btn btn-danger" id="qs-cancel" style="display:none" onclick="cancelScan()">✖ Cancel</button>
+        <button class="btn btn-danger" id="qs-cancel" style="display:none" data-act="cancelScan">✖ Cancel</button>
       </div>
       <div class="warn" id="qs-warn" style="display:none"></div>
     </div>
@@ -170,7 +170,7 @@
   <div class="panel" id="qs-findings-panel" style="display:none">
     <div class="panel-head" style="display:flex;justify-content:space-between;align-items:center">
       <span>Findings</span>
-      <label class="filter-row"><input type="checkbox" id="qs-hi-only" onchange="reloadFindings()"/> Show high-signal only</label>
+      <label class="filter-row"><input type="checkbox" id="qs-hi-only" data-act-change="reloadFindings"/> Show high-signal only</label>
     </div>
     <div class="panel-body" style="padding:0">
       <table>
@@ -187,7 +187,7 @@
   <div class="panel">
     <div class="panel-head" style="display:flex;justify-content:space-between;align-items:center">
       <span>Previous Sessions</span>
-      <button class="btn" style="background:var(--surface2);color:var(--text)" onclick="loadSessions()">↻ Refresh</button>
+      <button class="btn" style="background:var(--surface2);color:var(--text)" data-act="loadSessions">↻ Refresh</button>
     </div>
     <div class="panel-body" style="padding:0">
       <table>
@@ -203,235 +203,6 @@
 
 <div class="toast" id="toast"></div>
 
-<script>
-  let currentSession = null;
-  let pollTimer = null;
-
-  // ── CSRF and session handling for every API call ───────────────────────────
-  // Same-origin requests other than GET and HEAD carry the session's token.
-  // 401 from the API means the session has ended: go to the sign-in page.
-  (function () {
-    const meta = document.querySelector('meta[name="csrf-token"]');
-    const csrfToken = meta ? meta.content : '';
-    const nativeFetch = window.fetch.bind(window);
-    window.fetch = async function (input, init) {
-      const req = (typeof Request !== 'undefined' && input instanceof Request) ? input : null;
-      let url;
-      try { url = new URL(req ? req.url : String(input), window.location.href); } catch (e) { return nativeFetch(input, init); }
-      const sameOrigin = url.origin === window.location.origin;
-      const method = String((init && init.method) || (req && req.method) || 'GET').toUpperCase();
-      if (sameOrigin && method !== 'GET' && method !== 'HEAD') {
-        const headers = new Headers((init && init.headers) || (req && req.headers) || {});
-        headers.set('X-CSRF-Token', csrfToken);
-        init = Object.assign({}, init, { headers });
-      }
-      const res = await nativeFetch(input, init);
-      if (!sameOrigin || !url.pathname.startsWith('/api/')) return res;
-      if (res.status === 401) {
-        window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname);
-        return res;
-      }
-      if (res.status === 403) {
-        let error = '';
-        try { error = (await res.clone().json()).error || ''; } catch (e) {}
-        if (error === 'password_change_required' || error === 'mfa_setup_required') {
-          window.location.href = '/';
-        } else if (error === 'admin required') {
-          if (typeof toast === 'function') toast('Admin only', 'error');
-          return new Response(JSON.stringify({ ok: false, error: 'Admin only' }),
-            { status: 403, headers: { 'Content-Type': 'application/json' } });
-        }
-      }
-      return res;
-    };
-  })();
-
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
-      ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  }
-  // http(s) links only; anything else (javascript:, data:, …) becomes '#'.
-  function safeUrl(u) {
-    const s = String(u == null ? '' : u).trim();
-    if (!s) return '#';
-    try {
-      const proto = new URL(s, window.location.origin).protocol;
-      return (proto === 'http:' || proto === 'https:') ? s : '#';
-    } catch (e) { return '#'; }
-  }
-  function toast(msg, kind) {
-    const t = document.getElementById('toast');
-    t.textContent = msg;
-    t.className = 'toast show' + (kind === 'error' ? ' error' : '');
-    setTimeout(() => { t.className = 'toast'; }, 3200);
-  }
-  function isOnion(url) { return /\.onion(\/|$|:)/i.test(url || ''); }
-  function fmtTime(iso) {
-    if (!iso) return '—';
-    const d = new Date(iso + 'Z');
-    return isNaN(d) ? String(iso) : d.toLocaleString();
-  }
-
-  async function startScan() {
-    const target = document.getElementById('qs-target').value.trim();
-    if (!target) { toast('Enter a target first', 'error'); return; }
-    const typeSel = document.getElementById('qs-type').value;
-    const sources = Array.from(
-      document.querySelectorAll('#qs-sources input[type=checkbox]:checked')
-    ).map(cb => cb.value);
-    if (!sources.length) { toast('Select at least one source', 'error'); return; }
-
-    const btn = document.getElementById('qs-start');
-    btn.disabled = true;
-    try {
-      const resp = await fetch('/api/quick-scan/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          target: target,
-          target_type: typeSel === 'auto' ? null : typeSel,
-          sources: sources,
-        }),
-      });
-      const data = await resp.json();
-      if (resp.status === 409) { toast('A quick scan is already running', 'error'); btn.disabled = false; return; }
-      if (!resp.ok) { toast(data.error || 'Failed to start', 'error'); btn.disabled = false; return; }
-      currentSession = data.session_id;
-      document.getElementById('qs-activity-panel').style.display = '';
-      document.getElementById('qs-findings-panel').style.display = '';
-      document.getElementById('qs-target-label').textContent = target;
-      document.getElementById('qs-warn').style.display = 'none';
-      toast('Scan started (#' + currentSession + ')');
-      startPolling();
-    } catch (e) {
-      toast('Network error', 'error');
-      btn.disabled = false;
-    }
-  }
-
-  function startPolling() {
-    if (pollTimer) clearInterval(pollTimer);
-    pollStatus();
-    pollTimer = setInterval(pollStatus, 2000);
-  }
-
-  async function pollStatus() {
-    if (!currentSession) return;
-    try {
-      const resp = await fetch('/api/quick-scan/status/' + encodeURIComponent(currentSession));
-      if (!resp.ok) return;
-      const s = await resp.json();
-      document.getElementById('qs-status').textContent = s.status;
-      document.getElementById('qs-dot').className = 'dot ' + s.status;
-      document.getElementById('qs-urls').textContent = s.urls_visited;
-      document.getElementById('qs-findings').textContent = s.findings_count;
-      document.getElementById('qs-cancel').style.display =
-        (s.status === 'running' || s.status === 'pending') ? '' : 'none';
-      if (s.error_message) {
-        const w = document.getElementById('qs-warn');
-        w.style.display = ''; w.textContent = '⚠ ' + s.error_message;
-      }
-      if (s.status === 'completed' || s.status === 'failed' || s.status === 'cancelled') {
-        clearInterval(pollTimer); pollTimer = null;
-        document.getElementById('qs-start').disabled = false;
-        reloadFindings();
-        loadSessions();
-      } else {
-        reloadFindings();
-      }
-    } catch (e) { /* transient; keep polling */ }
-  }
-
-  async function cancelScan() {
-    if (!currentSession) return;
-    const btn = document.getElementById('qs-cancel');
-    btn.disabled = true;
-    try {
-      const resp = await fetch('/api/quick-scan/cancel/' + encodeURIComponent(currentSession), { method: 'POST' });
-      const data = await resp.json();
-      if (!resp.ok) { toast(data.error || 'Failed to cancel', 'error'); return; }
-      toast('Scan cancelled');
-      pollStatus();
-      loadSessions();
-    } catch (e) {
-      toast('Network error', 'error');
-    } finally {
-      btn.disabled = false;
-    }
-  }
-
-  function reloadFindings() {
-    if (!currentSession) return;
-    const hiOnly = document.getElementById('qs-hi-only').checked ? '?high_signal_only=1' : '';
-    fetch('/api/quick-scan/findings/' + encodeURIComponent(currentSession) + hiOnly)
-      .then(r => r.ok ? r.json() : [])
-      .then(renderFindings);
-  }
-
-  function renderFindings(rows) {
-    const body = document.getElementById('qs-findings-body');
-    const empty = document.getElementById('qs-findings-empty');
-    body.innerHTML = '';
-    if (!rows.length) { empty.style.display = 'block'; return; }
-    empty.style.display = 'none';
-    for (const f of rows) {
-      const ctx = String(f.context || '');
-      const short = ctx.length > 100 ? ctx.slice(0, 100) + '…' : ctx;
-      const urlCell = isOnion(f.url)
-        ? '<span class="onion">' + esc(f.url) + '</span>'
-        : '<a href="' + esc(safeUrl(f.url)) + '" target="_blank" rel="noopener noreferrer">' + esc(f.url) + '</a>';
-      const badge = f.high_signal
-        ? '<span class="badge badge-hi">HIGH</span>'
-        : '<span class="badge badge-lo">—</span>';
-      const tr = document.createElement('tr');
-      tr.innerHTML =
-        '<td>' + esc(f.source_name) + '</td>' +
-        '<td class="url">' + urlCell + '</td>' +
-        '<td>' + esc(f.matched_variant) + '</td>' +
-        '<td class="ctx" title="' + esc(ctx) + '">' + esc(short) + '</td>' +
-        '<td>' + badge + '</td>' +
-        '<td>' + esc(fmtTime(f.found_at)) + '</td>';
-      body.appendChild(tr);
-    }
-  }
-
-  async function loadSessions() {
-    try {
-      const resp = await fetch('/api/quick-scan/sessions');
-      if (!resp.ok) return;
-      const rows = await resp.json();
-      const body = document.getElementById('qs-sessions-body');
-      const empty = document.getElementById('qs-sessions-empty');
-      body.innerHTML = '';
-      if (!rows.length) { empty.style.display = 'block'; return; }
-      empty.style.display = 'none';
-      for (const s of rows) {
-        const tr = document.createElement('tr');
-        tr.className = 'sess-row';
-        tr.onclick = () => openSession(s.id, s.target_value);
-        tr.innerHTML =
-          '<td>' + esc(s.target_value) + '</td>' +
-          '<td>' + esc(s.target_type) + '</td>' +
-          '<td><span class="dot ' + esc(s.status) + '"></span>' + esc(s.status) + '</td>' +
-          '<td>' + esc(s.urls_visited) + '</td>' +
-          '<td>' + esc(s.findings_count) + '</td>' +
-          '<td>' + esc(fmtTime(s.started_at)) + '</td>';
-        body.appendChild(tr);
-      }
-    } catch (e) { /* ignore */ }
-  }
-
-  function openSession(id, target) {
-    currentSession = id;
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-    document.getElementById('qs-activity-panel').style.display = '';
-    document.getElementById('qs-findings-panel').style.display = '';
-    document.getElementById('qs-target-label').textContent = target;
-    pollStatus();
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  }
-
-  loadSessions();
-</script>
+<script src="{{ asset_url('js/quick_scan.js') }}"></script>
 </body>
 </html>

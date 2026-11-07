@@ -5,11 +5,15 @@ Dashboard blueprint — all protected routes.
 import json
 import logging
 import os
+import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote, urlencode
 
 from flask import Blueprint, Response, jsonify, render_template, request, session
 
+from .. import regex_safety
 from ..auth import (
     check_password,
     clear_failures,
@@ -26,9 +30,12 @@ from ..auth import (
     validate_password_strength,
 )
 from ..pdf_text import pdf_plain, pdf_text
+from . import file_store, jobs
 from . import validation as v
+from .errors import api_error, log_error
 from .http_client import SafeFetchError, fetch_public, safe_fetch
 from .storage_helper import get_storage
+from .upstream_cache import TTLCache, default_ttl
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +45,90 @@ dashboard_bp = Blueprint("dashboard", __name__)
 @dashboard_bp.errorhandler(v.Invalid)
 def _invalid_input(err):
     return jsonify({"error": str(err)}), 400
+
+
+@dashboard_bp.errorhandler(jobs.Busy)
+def _busy(err):
+    """Too many heavy operations at once: 429 with Retry-After (see jobs.py)."""
+    return jobs.busy_answer(err)
+
+
+# Answers of the third-party services the pages ask for again and again (the
+# abuse.ch relays on every home page load, crt.sh, WhiteIntel, DNSDumpster).
+_upstream = TTLCache("dashboard relays", ttl=default_ttl(), max_entries=128)
+# The WhatsMyName site list changes rarely and is about 1 MB.
+_wmn_cache = TTLCache("WhatsMyName list", ttl=6 * 3600, max_entries=2, copy_values=False)
+
+
+class _UpstreamFailed(Exception):
+    """An upstream answer that must not be cached; the cache serves the last good one instead."""
+
+
+def _cached_fetch(key, url: str, *, good=(200,), **kwargs):
+    """safe_fetch() through the cache. The answer dict, or None when there is none to serve.
+
+    Only an answer with a status in ``good`` is kept. Raises SafeFetchError
+    as safe_fetch does when the request is refused or fails and nothing is
+    cached, so callers keep their own handling of it.
+    """
+    failure: dict = {}
+
+    def fetch():
+        try:
+            result = safe_fetch(url, **kwargs)
+        except SafeFetchError as exc:
+            failure["blocked"] = exc
+            raise
+        if result["status"] not in good:
+            failure["answer"] = result
+            raise _UpstreamFailed(f"HTTP {result['status']} for {url}")
+        return {"status": result["status"], "body": result["body"]}
+
+    answer = _upstream.get(key, fetch)
+    if answer is None and "blocked" in failure:
+        raise failure["blocked"]
+    return answer if answer is not None else failure.get("answer")
+
+
+def _path_segment(value, field: str = "name", max_len: int = 100) -> str:
+    """``value`` percent-encoded for use as ONE segment of an upstream URL's path.
+
+    Nothing in it can add a segment, a query or a fragment. Empty values and
+    "." / ".." (which would change the path) are refused with v.Invalid.
+    """
+    value = v.text(value, field, max_len)
+    if value is None or value.strip(".") == "":
+        raise v.Invalid(f"{field} is not valid")
+    return quote(value, safe="")
+
+
+def _close_stale_jobs(_state=None) -> None:
+    """Background jobs live in this process. What the database still shows as
+    running when the process starts was cut off by a restart and will never
+    finish: say so, once, instead of leaving it "running" for ever."""
+    try:
+        storage = get_storage()
+        closed = {
+            "DNS recon": storage.fail_running_dns_investigations(
+                "Interrupted by a restart of the dashboard. Run it again."
+            ),
+            "breach investigation": storage.fail_running_investigations(),
+            "IP lookup": storage.close_running_ip_investigations(
+                "Not fetched: the dashboard was restarted before the extra data arrived."
+            ),
+            "Quick Scan": storage.fail_running_quick_scans(
+                "Interrupted by a restart of the dashboard. Run it again."
+            ),
+        }
+        for kind, count in closed.items():
+            if count:
+                logger.warning("%d %s job(s) were running at the last stop; marked as interrupted", count, kind)
+    except Exception:
+        logger.exception("could not close jobs left running by the last stop")
+
+
+# Runs when the blueprint is registered, that is once per process, in create_app().
+dashboard_bp.record_once(_close_stale_jobs)
 
 # Config is read-only at /app/config — write user edits to /app/data instead
 CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/app/config"))
@@ -50,8 +141,6 @@ SEEDS_FILE = DATA_DIR / "seeds.txt"
 SEEDS_DEFAULT = CONFIG_DIR / "seeds.txt"
 CRAWL_FLAG = DATA_DIR / "crawl.start"
 STOP_FLAG  = DATA_DIR / "crawl.stop"
-CLEARNET_SEEDS_FILE = DATA_DIR / "clearnet_seeds.txt"
-PASTE_SOURCES_FILE  = DATA_DIR / "paste_sources.txt"
 
 
 def _ensure_data_dir():
@@ -79,6 +168,35 @@ def _load_keywords() -> dict:
         return {}
     data = yaml.safe_load(src.read_text()) or {}
     return data.get("keywords", {})
+
+
+def _update_keywords(change):
+    """Change the keyword categories on disk: one writer at a time, written in
+    one step, and the rest of the file (``settings:``) kept. See file_store.py."""
+    _ensure_data_dir()
+    return file_store.update_keywords(KEYWORDS_FILE, KEYWORDS_DEFAULT, change)
+
+
+def _add_keywords(pairs) -> int:
+    """Add (keyword, category) pairs to the keyword file. Returns how many were new."""
+
+    def add(cats: dict) -> int:
+        added = 0
+        for keyword, category in pairs:
+            if not isinstance(cats.get(category), list):
+                cats[category] = []
+            if keyword not in cats[category]:
+                cats[category].append(keyword)
+                added += 1
+        return added
+
+    return _update_keywords(add)
+
+
+def _update_seeds(add=(), remove=()) -> int:
+    """Add and remove seed URLs on disk, the same way. Returns how many were added."""
+    _ensure_data_dir()
+    return file_store.update_seeds(SEEDS_FILE, SEEDS_DEFAULT, add=add, remove=remove)
 
 
 # ── Pages ──────────────────────────────────────────────────────────────────────
@@ -147,8 +265,8 @@ def api_hits():
 def api_keywords_get():
     try:
         return jsonify({"categories": _load_keywords()})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return api_error("The keyword file could not be read.")
 
 
 @dashboard_bp.route("/api/keywords", methods=["POST"])
@@ -158,19 +276,10 @@ def api_keywords_add():
     keyword = v.keyword(body.get("keyword"))
     category = v.category(body.get("category"))
     try:
-        import yaml
-
-        _ensure_data_dir()
-        cats = _load_keywords()
-        cats.setdefault(category, [])
-        if keyword not in cats[category]:
-            cats[category].append(keyword)
-            KEYWORDS_FILE.write_text(
-                yaml.dump({"keywords": cats}, default_flow_style=False, allow_unicode=True)
-            )
+        _add_keywords([(keyword, category)])
         return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return api_error("The keyword could not be saved.")
 
 
 @dashboard_bp.route("/api/keywords", methods=["DELETE"])
@@ -182,19 +291,15 @@ def api_keywords_delete():
     category = str(body.get("category") or "").strip()
     if not keyword or not category:
         return jsonify({"error": "keyword and category required"}), 400
-    try:
-        import yaml
-
-        _ensure_data_dir()
-        cats = _load_keywords()
-        if keyword in cats.get(category, []):
+    def remove(cats: dict) -> None:
+        if keyword in (cats.get(category) or []):
             cats[category].remove(keyword)
-            KEYWORDS_FILE.write_text(
-                yaml.dump({"keywords": cats}, default_flow_style=False, allow_unicode=True)
-            )
+
+    try:
+        _update_keywords(remove)
         return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return api_error("The keyword could not be removed.")
 
 
 # ── Seeds API ──────────────────────────────────────────────────────────────────
@@ -205,8 +310,8 @@ def api_keywords_delete():
 def api_seeds_get():
     try:
         return jsonify({"seeds": _load_seeds()})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return api_error("The seed list could not be read.")
 
 
 def _urls_from_body(body: dict) -> list[str]:
@@ -225,17 +330,10 @@ def api_seeds_add():
     # Support both single url and bulk urls array
     urls = _urls_from_body(v.json_body())
     try:
-        _ensure_data_dir()
-        existing = _load_seeds()
-        added = 0
-        for url in urls:
-            if url not in existing:
-                existing.append(url)
-                added += 1
-        SEEDS_FILE.write_text("\n".join(existing) + "\n")
+        added = _update_seeds(add=urls)
         return jsonify({"ok": True, "added": added})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return api_error("The seed list could not be saved.")
 
 
 @dashboard_bp.route("/api/seeds", methods=["DELETE"])
@@ -245,100 +343,10 @@ def api_seeds_delete():
     if not url:
         return jsonify({"error": "url required"}), 400
     try:
-        _ensure_data_dir()
-        seeds = [s for s in _load_seeds() if s != url]
-        SEEDS_FILE.write_text("\n".join(seeds) + "\n")
+        _update_seeds(remove=[url])
         return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ── Clearnet Seeds API ─────────────────────────────────────────────────────────
-
-def _load_clearnet_seeds() -> list[str]:
-    if not CLEARNET_SEEDS_FILE.exists():
-        return []
-    return [line.strip() for line in CLEARNET_SEEDS_FILE.read_text().splitlines()
-            if line.strip() and not line.strip().startswith("#")]
-
-def _save_clearnet_seeds(seeds: list[str]):
-    _ensure_data_dir()
-    CLEARNET_SEEDS_FILE.write_text("\n".join(seeds) + "\n")
-
-def _load_paste_sources() -> list[str]:
-    if not PASTE_SOURCES_FILE.exists():
-        return []
-    return [line.strip() for line in PASTE_SOURCES_FILE.read_text().splitlines()
-            if line.strip() and not line.strip().startswith("#")]
-
-def _save_paste_sources(sources: list[str]):
-    _ensure_data_dir()
-    PASTE_SOURCES_FILE.write_text("\n".join(sources) + "\n")
-
-
-@dashboard_bp.route("/api/seeds/clearnet", methods=["GET"])
-@require_login
-def api_clearnet_seeds_get():
-    return jsonify({"seeds": _load_clearnet_seeds()})
-
-
-@dashboard_bp.route("/api/seeds/clearnet", methods=["POST"])
-@require_admin
-def api_clearnet_seeds_add():
-    urls = _urls_from_body(v.json_body())
-    existing = _load_clearnet_seeds()
-    added = 0
-    for url in urls:
-        if url not in existing:
-            existing.append(url)
-            added += 1
-    _save_clearnet_seeds(existing)
-    return jsonify({"ok": True, "added": added})
-
-
-@dashboard_bp.route("/api/seeds/clearnet", methods=["DELETE"])
-@require_admin
-def api_clearnet_seeds_delete():
-    url = str(v.json_body().get("url") or "").strip()
-    if not url:
-        return jsonify({"error": "url required"}), 400
-    seeds = [s for s in _load_clearnet_seeds() if s != url]
-    _save_clearnet_seeds(seeds)
-    return jsonify({"ok": True})
-
-
-# ── Paste Sources API ──────────────────────────────────────────────────────────
-
-
-@dashboard_bp.route("/api/seeds/paste", methods=["GET"])
-@require_login
-def api_paste_sources_get():
-    return jsonify({"sources": _load_paste_sources()})
-
-
-@dashboard_bp.route("/api/seeds/paste", methods=["POST"])
-@require_admin
-def api_paste_sources_add():
-    urls = _urls_from_body(v.json_body())
-    existing = _load_paste_sources()
-    added = 0
-    for url in urls:
-        if url not in existing:
-            existing.append(url)
-            added += 1
-    _save_paste_sources(existing)
-    return jsonify({"ok": True, "added": added})
-
-
-@dashboard_bp.route("/api/seeds/paste", methods=["DELETE"])
-@require_admin
-def api_paste_sources_delete():
-    url = str(v.json_body().get("url") or "").strip()
-    if not url:
-        return jsonify({"error": "url required"}), 400
-    sources = [s for s in _load_paste_sources() if s != url]
-    _save_paste_sources(sources)
-    return jsonify({"ok": True})
+    except Exception:
+        return api_error("The seed list could not be saved.")
 
 
 # ── Keyword bulk import/export ─────────────────────────────────────────────────
@@ -348,7 +356,6 @@ def api_paste_sources_delete():
 @require_admin
 def api_keywords_bulk_add():
     """Add multiple keywords in a single atomic write."""
-    import yaml
     body = v.json_body()
     items = body.get("keywords", [])  # [{keyword, category}, ...]
     if not isinstance(items, list) or not items:
@@ -360,17 +367,7 @@ def api_keywords_bulk_add():
         if not isinstance(item, dict) or not str(item.get("keyword") or "").strip():
             continue
         pairs.append((v.keyword(item.get("keyword")), v.category(item.get("category"))))
-    _ensure_data_dir()
-    cats = _load_keywords()
-    added = 0
-    for kw, cat in pairs:
-        cats.setdefault(cat, [])
-        if kw not in cats[cat]:
-            cats[cat].append(kw)
-            added += 1
-    KEYWORDS_FILE.write_text(
-        yaml.dump({"keywords": cats}, default_flow_style=False, allow_unicode=True)
-    )
+    added = _add_keywords(pairs)
     return jsonify({"ok": True, "added": added})
 
 
@@ -400,7 +397,6 @@ def api_keywords_import():
     import csv
     import io
 
-    import yaml
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
     f = request.files["file"]
@@ -408,9 +404,7 @@ def api_keywords_import():
     if len(content) > 1_000_000:
         return jsonify({"error": "File too large (max 1 MB)"}), 400
     reader = csv.DictReader(io.StringIO(content))
-    _ensure_data_dir()
-    cats = _load_keywords()
-    added = 0
+    pairs = []
     skipped = 0
     for i, row in enumerate(reader, 1):
         try:
@@ -422,13 +416,8 @@ def api_keywords_import():
         except v.Invalid:
             skipped += 1
             continue
-        cats.setdefault(cat, [])
-        if kw not in cats[cat]:
-            cats[cat].append(kw)
-            added += 1
-    KEYWORDS_FILE.write_text(
-        yaml.dump({"keywords": cats}, default_flow_style=False, allow_unicode=True)
-    )
+        pairs.append((kw, cat))
+    added = _add_keywords(pairs)
     return jsonify({"ok": True, "added": added, "skipped": skipped})
 
 
@@ -550,30 +539,50 @@ def api_keywords_generate():
 
 
 # ── Crawl control API ──────────────────────────────────────────────────────────
+# Which crawl is running is in the database (crawl_sessions: owner and
+# heartbeat, see Storage.begin_crawl_session), so a crawl started by
+# "make scan" in another container counts too, and a crawl whose process died
+# is ended as interrupted, not reported as completed.
 
-_active_scan_thread = None  # track running scan thread
+TOR_DOWN_MESSAGE = "Tor is not reachable, so the crawl was not started. Check the tor container (make check-tor)."
+
+
+def _end_stale_crawls() -> None:
+    """End the running sessions whose process is gone. While this process runs
+    no crawl, a session under its own name is from before a restart."""
+    from ..crawler import STALE_SECONDS, crawl_owner, local_crawl_running
+
+    get_storage().interrupt_stale_crawl_sessions(
+        STALE_SECONDS, idle_owner=None if local_crawl_running() else crawl_owner()
+    )
 
 
 @dashboard_bp.route("/api/crawl/start", methods=["POST"])
 @require_admin
 def api_crawl_start():
-    # Clear any stale stop flag before starting
-    STOP_FLAG.unlink(missing_ok=True)
     import asyncio
     import threading
     from pathlib import Path as _Path
 
     from ..alerting import Alerter
-    from ..crawler import CrawlConfig
+    from ..crawler import (
+        STALE_SECONDS,
+        CrawlConfig,
+        claim_local_crawl,
+        crawl_owner,
+        local_crawl_running,
+        release_local_crawl,
+    )
     from ..main import run_scan
     from ..scanner import KeywordConfig
-
-    global _active_scan_thread
+    from ..tor_client import tor_reachable
 
     _ensure_data_dir()
+    storage = get_storage()
 
-    # Prevent double-start
-    if _active_scan_thread and _active_scan_thread.is_alive():
+    # Prevent double-start, in this process or another one.
+    _end_stale_crawls()
+    if local_crawl_running() or storage.get_active_session() is not None:
         return jsonify({"error": "A crawl is already running"}), 409
 
     # Resolve seeds and keywords files
@@ -597,11 +606,22 @@ def api_crawl_start():
     if not seed_urls:
         return jsonify({"error": "Seeds file is empty. Add at least one .onion URL."}), 400
 
-    # Clear any stale stop flag
-    if STOP_FLAG.exists():
-        STOP_FLAG.unlink()
+    if not tor_reachable():
+        logger.error("Crawl not started: Tor is not reachable")
+        return jsonify({"error": TOR_DOWN_MESSAGE}), 503
 
-    storage = get_storage()
+    claim_local_crawl()
+    try:
+        session_id = storage.begin_crawl_session(seed_urls, crawl_owner(), STALE_SECONDS)
+    except Exception:
+        release_local_crawl()
+        return api_error("The crawl could not be started.")
+    if session_id is None:
+        release_local_crawl()
+        return jsonify({"error": "A crawl is already running"}), 409
+
+    # The session is ours: a stop flag left from an earlier crawl is stale.
+    STOP_FLAG.unlink(missing_ok=True)
 
     def run():
         loop = asyncio.new_event_loop()
@@ -617,21 +637,22 @@ def api_crawl_start():
                     crawl_config=crawl_config,
                     storage=storage,
                     alerter=alerter,
-                    check_tor=True,
+                    check_tor=False,  # checked above
                     stop_flag=STOP_FLAG,
+                    session_id=session_id,
                 )
             )
-        except Exception as e:
-            print(f"Scan thread error: {e}", flush=True)
+        except Exception:
+            # run_scan has logged it and written the end of the session.
+            logger.warning("Crawl session %s ended with an error", session_id)
         finally:
             loop.close()
-            if STOP_FLAG.exists():
-                STOP_FLAG.unlink()
+            release_local_crawl()
+            STOP_FLAG.unlink(missing_ok=True)
 
-    _active_scan_thread = threading.Thread(target=run, daemon=True, name="crawl_thread")
-    _active_scan_thread.start()
+    threading.Thread(target=run, daemon=True, name="crawl_thread").start()
 
-    return jsonify({"ok": True, "message": "Crawl started."})
+    return jsonify({"ok": True, "message": "Crawl started.", "session_id": session_id})
 
 
 @dashboard_bp.route("/api/crawl/stop", methods=["POST"])
@@ -641,33 +662,15 @@ def api_crawl_stop():
         _ensure_data_dir()
         STOP_FLAG.write_text(datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
         return jsonify({"ok": True, "message": "Stop signal sent — crawl will halt after current page."})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return api_error("The stop signal could not be written.")
 
 @dashboard_bp.route("/api/crawl/status", methods=["GET"])
 @require_login
 def api_crawl_status():
     try:
         storage = get_storage()
-        # If DB shows running but no thread is alive, mark it completed
-        active = storage.get_active_session()
-        if active and active.get("status") == "running":
-            thread_alive = any(t.name == "crawl_thread" and t.is_alive()
-                               for t in __import__("threading").enumerate())
-            if not thread_alive:
-                from datetime import datetime as _dt
-
-                from sqlalchemy import text as _text
-                with storage.get_session() as sess:
-                    sess.execute(
-                        _text(
-                            "UPDATE crawl_sessions"
-                            " SET status='completed', ended_at=:now"
-                            " WHERE status='running'"
-                        ),
-                        {"now": _dt.now(timezone.utc).replace(tzinfo=None)},
-                    )
-                    sess.commit()
+        _end_stale_crawls()
         stats = storage.get_stats()
         active = storage.get_active_session()
 
@@ -691,10 +694,11 @@ def api_crawl_status():
         return jsonify({
             "active": active is not None,
             "session": session_data,
+            "last_session": None if active else storage.get_last_finished_session(),
             "stats": stats,
         })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return api_error("Crawl status could not be read.")
 
 
 # ── User management API (admin only) ──────────────────────────────────────────
@@ -713,7 +717,6 @@ def api_users_list():
                 "email": u.email,
                 "is_admin": u.is_admin,
                 "totp_enabled": u.totp_enabled,
-                "oauth_provider": u.oauth_provider,
                 "created_at": u.created_at.isoformat() if u.created_at else None,
                 "last_login": u.last_login.isoformat() if u.last_login else None,
             }
@@ -868,68 +871,11 @@ def api_profile():
             "email": user.email,
             "is_admin": user.is_admin,
             "totp_enabled": user.totp_enabled,
-            "oauth_provider": user.oauth_provider,
             "created_at": user.created_at.isoformat() if user.created_at else None,
             "last_login": user.last_login.isoformat() if user.last_login else None,
         }
     )
 
-
-
-# ── Telegram Channels API ──────────────────────────────────────────────────────
-
-TELEGRAM_CHANNELS_FILE = DATA_DIR / "telegram_channels.txt"
-
-
-def _load_channels() -> list[str]:
-    if not TELEGRAM_CHANNELS_FILE.exists():
-        # Fall back to env var
-        raw = os.getenv("TELEGRAM_CHANNELS", "")
-        return [c.strip().lstrip("@") for c in raw.split(",") if c.strip()]
-    return [
-        line.strip().lstrip("@")
-        for line in TELEGRAM_CHANNELS_FILE.read_text().splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
-
-
-@dashboard_bp.route("/api/telegram/channels", methods=["GET"])
-@require_login
-def api_telegram_channels_get():
-    try:
-        return jsonify({"channels": _load_channels()})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@dashboard_bp.route("/api/telegram/channels", methods=["POST"])
-@require_admin
-def api_telegram_channels_add():
-    channel = v.telegram_channel(v.json_body().get("channel"))
-    try:
-        _ensure_data_dir()
-        existing = _load_channels()
-        if channel not in existing:
-            existing.append(channel)
-            TELEGRAM_CHANNELS_FILE.write_text("\n".join(existing) + "\n")
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@dashboard_bp.route("/api/telegram/channels", methods=["DELETE"])
-@require_admin
-def api_telegram_channels_delete():
-    channel = str(v.json_body().get("channel") or "").strip().lstrip("@")
-    if not channel:
-        return jsonify({"error": "channel required"}), 400
-    try:
-        _ensure_data_dir()
-        channels = [c for c in _load_channels() if c != channel]
-        TELEGRAM_CHANNELS_FILE.write_text("\n".join(channels) + "\n")
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 
 # ── Sessions API ───────────────────────────────────────────────────────────────
@@ -1204,11 +1150,7 @@ def api_report_pdf():
         )
 
     except Exception:
-        import traceback
-        import uuid
-        error_id = uuid.uuid4().hex
-        logger.error("api_report_pdf error [%s]: %s", error_id, traceback.format_exc())
-        return jsonify({"error": "PDF generation failed. Please try again later.", "error_id": error_id}), 500
+        return api_error("PDF generation failed. Please try again later.")
 
 
 # ── Investigations API ─────────────────────────────────────────────────────────
@@ -1224,9 +1166,7 @@ def api_investigations_list():
 @dashboard_bp.route("/api/investigations", methods=["POST"])
 @require_login
 def api_investigations_create():
-    import asyncio
-
-    from ..investigations import run_investigation
+    from ..investigations import needs_hibp, run_investigation_targets
 
     body = v.json_body()
     name = v.text(body.get("name"), "Investigation name", 200)
@@ -1254,16 +1194,40 @@ def api_investigations_create():
     storage = get_storage()
     api_key = os.getenv("HIBP_API_KEY", "")
 
+    slot = jobs.acquire_slot()  # Busy (429) when too many long requests are running
     try:
-        inv_id = asyncio.run(run_investigation(
-            name=name,
-            targets=valid,
-            storage=storage,
-            api_key=api_key,
-        ))
-        return jsonify({"ok": True, "id": inv_id})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        inv_id = storage.create_investigation(name=name, targets=valid)
+    except Exception:
+        slot.release()
+        return api_error("The investigation could not be created.")
+
+    def mark_failed():
+        try:
+            storage.fail_investigation(inv_id)
+        except Exception:
+            logger.exception("investigation %s could not be marked as failed", inv_id)
+
+    def run_in_background():
+        try:
+            run_investigation_targets(inv_id, valid, storage, api_key)
+        except Exception:
+            log_error(f"investigation {inv_id} failed")
+            mark_failed()
+
+    if needs_hibp(valid, api_key):
+        # HIBP wants 1.5 s between two requests, so email targets take time. They
+        # are checked outside the request; the row stays "running" until then.
+        jobs.start_background(run_in_background, slot, name="breach_investigation")
+        return jsonify({"ok": True, "id": inv_id, "status": "running"})
+
+    with slot:
+        try:
+            run_investigation_targets(inv_id, valid, storage, api_key)
+        except Exception:
+            answer = api_error("The investigation failed.", what=f"investigation {inv_id} failed")
+            mark_failed()
+            return answer
+    return jsonify({"ok": True, "id": inv_id, "status": "completed"})
 
 
 @dashboard_bp.route("/api/investigations/<int:inv_id>", methods=["GET"])
@@ -1298,8 +1262,9 @@ def api_ip_investigations_list():
 
 @dashboard_bp.route("/api/ip-investigations", methods=["POST"])
 @require_login
+@jobs.heavy
 def api_ip_investigations_create():
-    from ..ip_lookup import investigate_ip
+    from ..ip_lookup import investigate_ip, queue_virustotal_extras
 
     ip = v.ip_address(v.json_body().get("ip"))
 
@@ -1312,14 +1277,31 @@ def api_ip_investigations_create():
     storage = get_storage()
     try:
         result = investigate_ip(ip, abuse_key, vt_key)
+        virustotal = result.get("virustotal") or {}
         inv_id = storage.save_ip_investigation(
             ip=ip,
             abuseipdb_data=result.get("abuseipdb") or {},
-            virustotal_data=result.get("virustotal") or {},
+            virustotal_data=virustotal,
         )
-        return jsonify({"ok": True, "id": inv_id})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        extras = virustotal.get("extras_status")
+        if extras == "pending":
+            # VirusTotal's resolutions and communicating files are two more
+            # rate-limited calls. They run on a queue outside this request and
+            # are merged into the saved record; until then it is "running".
+            storage.update_ip_investigation(inv_id, status="running")
+
+            def save(fields: dict) -> None:
+                storage.update_ip_investigation(inv_id, fields, status="completed")
+
+            extras = queue_virustotal_extras(ip, vt_key, save)
+            if extras == "skipped":
+                save({
+                    "extras_status": extras,
+                    "extras_note": "Not fetched: too many lookups are waiting for VirusTotal. Run the lookup again later.",
+                })
+        return jsonify({"ok": True, "id": inv_id, "extras_status": extras})
+    except Exception:
+        return api_error("The IP lookup failed.")
 
 
 @dashboard_bp.route("/api/ip-investigations/<int:inv_id>", methods=["GET"])
@@ -1440,14 +1422,7 @@ def api_ransomware_groups_delete(slug):
 def api_ransomware_add_seeds():
     """Add all known ransomware .onion URLs to the seed list."""
     from ..ransomware_data import RANSOMWARE_ONION_SEEDS
-    _ensure_data_dir()
-    existing = _load_seeds()
-    added = 0
-    for url in RANSOMWARE_ONION_SEEDS:
-        if url not in existing:
-            existing.append(url)
-            added += 1
-    SEEDS_FILE.write_text("\n".join(existing) + "\n")
+    added = _update_seeds(add=RANSOMWARE_ONION_SEEDS)
     return jsonify({"ok": True, "added": added, "total": len(RANSOMWARE_ONION_SEEDS)})
 
 
@@ -1455,20 +1430,9 @@ def api_ransomware_add_seeds():
 @require_admin
 def api_ransomware_add_keywords():
     """Add all ransomware group names as keywords."""
-    import yaml
-
     from ..ransomware_data import RANSOMWARE_GROUPS
-    _ensure_data_dir()
-    cats = _load_keywords()
-    cats.setdefault("ransomware", [])
-    added = 0
-    for group in RANSOMWARE_GROUPS:
-        for kw in group.get("keywords", []):
-            if kw not in cats["ransomware"]:
-                cats["ransomware"].append(kw)
-                added += 1
-    KEYWORDS_FILE.write_text(
-        yaml.dump({"keywords": cats}, default_flow_style=False, allow_unicode=True)
+    added = _add_keywords(
+        [(kw, "ransomware") for group in RANSOMWARE_GROUPS for kw in group.get("keywords", [])]
     )
     return jsonify({"ok": True, "added": added})
 
@@ -1574,20 +1538,9 @@ def api_threat_actors_delete(slug):
 @require_admin
 def api_threat_actors_add_keywords():
     """Add all threat actor names as keywords."""
-    import yaml
-
     from ..threat_actors import THREAT_ACTORS
-    _ensure_data_dir()
-    cats = _load_keywords()
-    cats.setdefault("threat-actors", [])
-    added = 0
-    for actor in THREAT_ACTORS:
-        for kw in actor.get("keywords", []):
-            if kw not in cats["threat-actors"]:
-                cats["threat-actors"].append(kw)
-                added += 1
-    KEYWORDS_FILE.write_text(
-        yaml.dump({"keywords": cats}, default_flow_style=False, allow_unicode=True)
+    added = _add_keywords(
+        [(kw, "threat-actors") for actor in THREAT_ACTORS for kw in actor.get("keywords", [])]
     )
     return jsonify({"ok": True, "added": added})
 
@@ -1623,6 +1576,29 @@ def api_digest_subscribers_remove():
     return jsonify({"ok": True})
 
 
+# One digest send at a time, and how long its request waits for the result.
+_digest_sending = threading.Lock()
+DIGEST_SEND_WAIT = 60
+_DIGEST_HTTP_ERROR = re.compile(r"^\S+@\S+: HTTP \d{3}$")
+
+
+def _plain_digest_result(result: dict) -> dict:
+    """send_digest()'s result without exception text.
+
+    digest.py puts the text of an exception after "PDF build failed: " and
+    after "<recipient>: ". The answer keeps what happened and to whom.
+    """
+    plain = dict(result)
+    if str(plain.get("error") or "").startswith("PDF build failed"):
+        plain["error"] = "PDF build failed"
+    if "errors" in plain:
+        plain["errors"] = [
+            entry if _DIGEST_HTTP_ERROR.match(entry) else f"{entry.split(': ', 1)[0]}: could not be sent"
+            for entry in map(str, plain["errors"] or [])
+        ]
+    return plain
+
+
 @dashboard_bp.route("/api/digest/send", methods=["POST"])
 @require_admin
 def api_digest_send():
@@ -1635,14 +1611,50 @@ def api_digest_send():
             return jsonify({"error": "recipients must be a list of at most 50 addresses"}), 400
         recipients = [v.email(r, "recipient") for r in recipients]
     storage = get_storage()
-    result = send_digest(storage, recipients=recipients)
-    if result["ok"]:
-        return jsonify(result)
-    return jsonify(result), 500
+
+    # Sending is one request to the mail service per recipient, one after the
+    # other. It runs outside the request; the request waits a bounded time for
+    # the result so that the usual, short send still answers with its counts.
+    if not _digest_sending.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "A digest is being sent right now. Wait for it to finish."}), 409
+    try:
+        slot = jobs.acquire_slot()
+    except BaseException:
+        _digest_sending.release()
+        raise
+    done = threading.Event()
+    outcome: dict = {}
+
+    def run():
+        try:
+            outcome["result"] = send_digest(storage, recipients=recipients)
+        except Exception:
+            outcome["error_id"] = log_error("digest send failed")
+        finally:
+            _digest_sending.release()
+            done.set()
+
+    try:
+        jobs.start_background(run, slot, name="digest_send")
+    except BaseException:
+        if not done.is_set():
+            _digest_sending.release()
+        raise
+    if not done.wait(DIGEST_SEND_WAIT):
+        return jsonify({
+            "ok": False,
+            "pending": True,
+            "error": "The digest is still being sent. It goes on in the background; do not send it again.",
+        }), 202
+    if "result" not in outcome:
+        return api_error("The digest could not be sent.", error_id=outcome.get("error_id"), ok=False)
+    result = _plain_digest_result(outcome["result"])
+    return jsonify(result), (200 if result.get("ok") else 500)
 
 
 @dashboard_bp.route("/api/digest/preview", methods=["GET"])
 @require_login
+@jobs.heavy
 def api_digest_preview():
     """Download a preview of the digest PDF without sending."""
     from ..digest import build_digest_pdf
@@ -1666,36 +1678,21 @@ def api_digest_preview():
             mimetype="application/pdf",
             headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
-    except Exception as e:
-        import traceback
-        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+    except Exception:
+        return api_error("The digest preview could not be built.")
 
 
 @dashboard_bp.route("/api/digest/feeds", methods=["GET"])
 @require_login
+@jobs.heavy
 def api_digest_feeds():
     """Preview feed data without building PDF."""
     from ..feeds import fetch_all_feeds
     try:
         data = fetch_all_feeds()
         return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@dashboard_bp.route("/api/digest/subscribe", methods=["POST"])
-def api_public_subscribe():
-    """Public endpoint — no auth required. For static website subscribe form."""
-    from ..digest import add_subscriber
-    body = v.json_body()
-    # Honeypot
-    if body.get("website"):
-        return jsonify({"ok": True})  # silently drop bots
-    email = v.email(body.get("email"))
-    name = v.text(body.get("name"), "name", 100, required=False) or ""
-    org = v.text(body.get("org"), "org", 200, required=False) or ""
-    added = add_subscriber(email, name=name, org=org)
-    return jsonify({"ok": True, "new": added})
+    except Exception:
+        return api_error("The feeds could not be fetched.")
 
 
 # ── DNS Crawler API ────────────────────────────────────────────────────────────
@@ -1712,26 +1709,38 @@ def api_dns_list():
 @require_login
 def api_dns_start():
     """Start a DNS investigation — runs in background thread."""
-    import threading
+    from ..dns_crawler import NotPublicName, check_public_domain, run_dns_recon
 
-    from ..dns_crawler import run_dns_recon
-
-    domain = v.domain(v.json_body().get("domain"))
+    # Recon is for public names. v.domain() wants two labels; check_public_domain()
+    # also refuses names that only exist inside private networks (.internal,
+    # .local ...). A name that resolves to an internal address is refused when
+    # the job starts, see run_dns_recon().
+    try:
+        domain = check_public_domain(v.domain(v.json_body().get("domain")))
+    except NotPublicName as err:
+        return jsonify({"error": err.message}), 400
 
     storage = get_storage()
-    inv_id = storage.create_dns_investigation(domain)
+    slot = jobs.acquire_slot()  # Busy (429) when too many long requests are running
+    try:
+        inv_id = storage.create_dns_investigation(domain)
+    except Exception:
+        slot.release()
+        return api_error("The DNS investigation could not be created.")
 
     def run():
         try:
             result = run_dns_recon(domain)
             storage.complete_dns_investigation(inv_id, result)
-        except Exception as e:
-            import traceback
-            storage.fail_dns_investigation(inv_id, str(e))
-            print(f"DNS investigation {inv_id} failed: {traceback.format_exc()}", flush=True)
+        except NotPublicName as err:
+            storage.fail_dns_investigation(inv_id, err.message)
+        except Exception:
+            error_id = log_error(f"DNS investigation {inv_id} failed")
+            storage.fail_dns_investigation(inv_id, f"The recon failed. Error id: {error_id}")
 
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
+    # The recon keeps its slot until it ends: there are never more than
+    # HEAVY_JOBS_MAX of these threads.
+    jobs.start_background(run, slot, name="dns_recon")
 
     return jsonify({"ok": True, "id": inv_id, "domain": domain})
 
@@ -1777,8 +1786,9 @@ def api_dns_enrich(inv_id: int):
 
     # ── Call DNSDumpster API ──────────────────────────────────────────────────
     try:
-        _dn = safe_fetch(
-            f"https://api.dnsdumpster.com/domain/{domain}",
+        _dn = _cached_fetch(
+            ("dnsdumpster", domain),
+            f"https://api.dnsdumpster.com/domain/{quote(domain, safe='')}",
             headers={
                 "X-API-Key": api_key,
                 "Accept": "application/json",
@@ -1789,15 +1799,19 @@ def api_dns_enrich(inv_id: int):
     except SafeFetchError as e:
         logger.warning("DNSDumpster safe_fetch blocked: %s", e)
         return jsonify({"error": "External request blocked by security policy."}), 502
+    if _dn is None:
+        return jsonify({"error": "DNSDumpster did not answer. Try again in a minute."}), 502
     status, body = _dn["status"], _dn["body"]
 
     if status != 200:
-        return jsonify({"error": f"DNSDumpster API returned {status}", "body": body[:200].decode("utf-8", errors="replace")}), 502
+        return jsonify({"error": f"DNSDumpster API returned {status}"}), 502
 
     try:
         dd_data = _json.loads(body)
-    except Exception as e:
-        return jsonify({"error": f"Failed to parse DNSDumpster response: {e}"}), 502
+        if not isinstance(dd_data, dict):
+            raise ValueError("not a JSON object")
+    except Exception:
+        return api_error("DNSDumpster sent an answer that could not be read.", 502)
 
     # ── Merge into existing result ────────────────────────────────────────────
     result = inv.get("result", {})
@@ -1891,27 +1905,31 @@ def api_dns_certs(domain: str):
     """
     import json as _json
 
-    domain = domain.strip().lower().split("/")[0]
+    domain = v.domain(domain.strip().split("/")[0])
 
     # Query crt.sh — use the deduplicated JSON endpoint
     try:
-        _result = safe_fetch(
-            f"https://crt.sh/?q=%.{domain}&output=json",
+        _result = _cached_fetch(
+            ("crt.sh", domain),
+            "https://crt.sh/?" + urlencode({"q": f"%.{domain}", "output": "json"}),
             headers={"User-Agent": "OSINTPH-DNSCrawler/1.0", "Accept": "application/json"},
             timeout=30,
         )
     except SafeFetchError as e:
         logger.warning("crt.sh safe_fetch blocked: %s", e)
         return jsonify({"error": "Certificate transparency lookup failed."}), 502
+    if _result is None:
+        return jsonify({"error": "crt.sh did not answer. Try again in a minute."}), 502
 
     if _result["status"] != 200:
         return jsonify({"error": f"crt.sh returned HTTP {_result['status']}"}), 502
 
     try:
         raw = _json.loads(_result["body"])
+        if not isinstance(raw, list):
+            raise ValueError("not a JSON list")
     except Exception:
-        preview = _result["body"][:120].decode("utf-8", errors="replace")
-        return jsonify({"error": f"crt.sh returned non-JSON: {preview}"}), 502
+        return jsonify({"error": "crt.sh sent an answer that could not be read."}), 502
 
     from datetime import datetime as dt
     now = dt.now(timezone.utc).replace(tzinfo=None)
@@ -2672,8 +2690,9 @@ window._ready = true;
     try:
         graph_img = build_graph_image()
         story.append(graph_img)
-    except Exception as e:
-        story.append(Paragraph(f"Graph generation failed: {pdf_text(e, 300)}", s_warn))
+    except Exception:
+        graph_error_id = log_error(f"DNS PDF {inv_id}: graph generation failed")
+        story.append(Paragraph(f"Graph generation failed. Error id: {graph_error_id}", s_warn))
 
     # ── DNS Records ───────────────────────────────────────────────────────────
     section_header("DNS Records")
@@ -2789,12 +2808,13 @@ window._ready = true;
         # Try to fetch rich cert data from crt.sh for the PDF
         rich_cert_data = None
         try:
-            _cr_result = safe_fetch(
-                f"https://crt.sh/?q=%.{domain}&output=json",
+            _cr_result = _cached_fetch(
+                ("crt.sh", domain),
+                "https://crt.sh/?" + urlencode({"q": f"%.{domain}", "output": "json"}),
                 headers={"User-Agent": "OSINTPH-PDFGen/1.0", "Accept": "application/json"},
                 timeout=20,
             )
-            if _cr_result["status"] == 200:
+            if _cr_result is not None and _cr_result["status"] == 200:
                 from datetime import datetime as _dt
                 _now = _dt.now(timezone.utc).replace(tzinfo=None)
                 _raw = json.loads(_cr_result["body"])
@@ -3207,12 +3227,10 @@ def api_project_keywords_add(project_id):
     keyword = v.keyword(body.get("keyword"))
     is_regex = v.strict_bool(body.get("is_regex"), "is_regex")
     if is_regex:
-        import re
-
         try:
-            re.compile(keyword)
-        except re.error:
-            return jsonify({"error": "keyword is not a valid regular expression"}), 400
+            regex_safety.check_pattern(keyword)
+        except regex_safety.UnsafePattern as exc:
+            return jsonify({"error": f"The pattern is not accepted: {exc}."}), 400
     kid = get_storage().add_project_keyword(
         project_id, keyword,
         category=v.category(body.get("category")),
@@ -3330,36 +3348,6 @@ def api_project_stats(project_id):
 
 
 
-# ── Paste Monitor API ──────────────────────────────────────────────────────────
-
-@dashboard_bp.route("/api/paste/hits", methods=["GET"])
-@require_login
-def api_paste_hits():
-    limit = v.int_arg("limit", 100, 1, 1000)
-    source = request.args.get("source")
-    pattern = request.args.get("pattern")
-    return jsonify(get_storage().get_recent_paste_hits(limit=limit, source=source, pattern=pattern))
-
-
-@dashboard_bp.route("/api/paste/stats", methods=["GET"])
-@require_login
-def api_paste_stats():
-    return jsonify(get_storage().get_paste_stats())
-
-
-@dashboard_bp.route("/api/paste/scan", methods=["POST"])
-@require_admin
-def api_paste_scan():
-    """Trigger a one-shot paste scan (admin only)."""
-    storage = get_storage()
-    try:
-        from darkweb_scanner.paste_monitor import run_paste_monitor
-        result = run_paste_monitor(storage, single_run=True)
-        return jsonify({"ok": True, **result})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 # ── OSINT Toolkit Proxy Routes ────────────────────────────────────────────────
 # Server-side proxy so browser CORS restrictions don't block external APIs
 # All routes use safe_fetch() which enforces HTTPS, host allowlist, and IP
@@ -3371,19 +3359,29 @@ def api_paste_scan():
 def osint_github(username):
     """Proxy GitHub public API."""
     import json as _json
-    try:
-        _r1 = safe_fetch(
-            f"https://api.github.com/users/{username}",
-            headers={"Accept": "application/vnd.github+json", "User-Agent": "OsintTool/1.0"},
-        )
-        _r2 = safe_fetch(
-            f"https://api.github.com/users/{username}/events/public?per_page=10",
-            headers={"Accept": "application/vnd.github+json", "User-Agent": "OsintTool/1.0"},
-        )
-    except SafeFetchError as e:
-        logger.warning("GitHub OSINT safe_fetch blocked: %s", e)
+    user = _path_segment(username, "username")
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "OsintTool/1.0"}
+
+    def get(key, url):
+        # A blocked request comes back as the exception: the two calls run on the pool.
+        try:
+            return _cached_fetch(key, url, headers=headers)
+        except SafeFetchError as exc:
+            return exc
+
+    got = jobs.call_all({
+        "profile": lambda: get(("github", user), f"https://api.github.com/users/{user}"),
+        "events": lambda: get(
+            ("github events", user), f"https://api.github.com/users/{user}/events/public?per_page=10"
+        ),
+    }, timeout=25)
+    _r1, _r2 = got["profile"], got["events"]
+    if isinstance(_r1, SafeFetchError) or isinstance(_r2, SafeFetchError):
+        logger.warning("GitHub OSINT safe_fetch blocked: %s", _r1 if isinstance(_r1, SafeFetchError) else _r2)
         return jsonify({"error": "External request blocked by security policy."}), 502
-    status, body, ev_body = _r1["status"], _r1["body"], _r2["body"]
+    if _r1 is None:
+        return jsonify({"error": "GitHub did not answer. Try again in a minute."}), 502
+    status, body, ev_body = _r1["status"], _r1["body"], (_r2 or {}).get("body")
     try:
         profile = _json.loads(body)
         events = _json.loads(ev_body) if ev_body else []
@@ -3395,57 +3393,79 @@ def osint_github(username):
         } - {""})
         profile["_extracted_emails"] = emails
         return jsonify(profile), status
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return api_error("GitHub sent an answer that could not be read.")
 
 
 @dashboard_bp.route("/api/osint/reddit/<username>")
 @require_login
 def osint_reddit(username):
     import json as _json
+    user = _path_segment(username, "username")
     try:
-        _r = safe_fetch(
-            f"https://www.reddit.com/user/{username}/about.json",
+        _r = _cached_fetch(
+            ("reddit", user),
+            f"https://www.reddit.com/user/{user}/about.json",
             headers={"User-Agent": "OsintTool/1.0 (research)", "Accept": "application/json"},
         )
     except SafeFetchError as e:
         logger.warning("Reddit OSINT safe_fetch blocked: %s", e)
         return jsonify({"error": "External request blocked by security policy."}), 502
+    if _r is None:
+        return jsonify({"error": "Reddit did not answer. Try again in a minute."}), 502
     try:
         return jsonify(_json.loads(_r["body"])), _r["status"]
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return api_error("Reddit sent an answer that could not be read.")
 
 
 @dashboard_bp.route("/api/osint/discord/<user_id>")
 @require_login
 def osint_discord(user_id):
     import json as _json
+    user = _path_segment(user_id, "user id")
     try:
-        _r = safe_fetch(f"https://discordlookup.mesalytic.moe/v1/user/{user_id}")
+        _r = _cached_fetch(("discord", user), f"https://discordlookup.mesalytic.moe/v1/user/{user}")
     except SafeFetchError as e:
         logger.warning("Discord OSINT safe_fetch blocked: %s", e)
         return jsonify({"error": "External request blocked by security policy."}), 502
+    if _r is None:
+        return jsonify({"error": "The Discord lookup did not answer. Try again in a minute."}), 502
     try:
         return jsonify(_json.loads(_r["body"])), _r["status"]
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return api_error("The Discord lookup sent an answer that could not be read.")
 
 
 @dashboard_bp.route("/api/osint/domain/<path:domain>")
 @require_login
 def osint_domain(domain):
     import json as _json
-    domain = domain.strip().lower().split("/")[0]
+    domain = v.domain(domain.strip().split("/")[0])
     results = {}
+
+    def get(key, url, **kwargs):
+        try:
+            return _cached_fetch(key, url, **kwargs)
+        except SafeFetchError:
+            return None
+
+    # The two lookups do not depend on each other: they run side by side.
     # RDAP — rdap.org is allowlisted; registry-specific redirect targets are not.
     # If rdap.org redirects to a non-allowlisted registry RDAP server, SafeFetchError
     # is raised and we return an empty rdap result gracefully.
-    try:
-        _rdap = safe_fetch(f"https://rdap.org/domain/{domain}", allow_redirects=True)
-        rdap_status, rdap_body = _rdap["status"], _rdap["body"]
-    except SafeFetchError:
-        rdap_status, rdap_body = 0, b""
+    got = jobs.call_all({
+        "rdap": lambda: get(
+            ("rdap", domain), f"https://rdap.org/domain/{quote(domain, safe='')}", allow_redirects=True
+        ),
+        "crtsh": lambda: get(
+            ("crt.sh names", domain),
+            "https://crt.sh/?" + urlencode({"q": domain, "output": "json"}),
+            headers={"User-Agent": "OsintTool/1.0", "Accept": "application/json"},
+        ),
+    }, timeout=25)
+    _rdap, _crt = got["rdap"], got["crtsh"]
+    rdap_status, rdap_body = (_rdap["status"], _rdap["body"]) if _rdap else (0, b"")
     try:
         results["rdap"] = _json.loads(rdap_body)
         results["rdap_status"] = rdap_status
@@ -3453,14 +3473,7 @@ def osint_domain(domain):
         results["rdap"] = None
         results["rdap_status"] = rdap_status
     # crt.sh
-    try:
-        _crt = safe_fetch(
-            f"https://crt.sh/?q={domain}&output=json",
-            headers={"User-Agent": "OsintTool/1.0", "Accept": "application/json"},
-        )
-        crt_status, crt_body = _crt["status"], _crt["body"]
-    except SafeFetchError:
-        crt_status, crt_body = 0, b"[]"
+    crt_status, crt_body = (_crt["status"], _crt["body"]) if _crt else (0, b"[]")
     try:
         certs = _json.loads(crt_body) if crt_status == 200 else []
         names = sorted(set(
@@ -3479,9 +3492,11 @@ def osint_domain(domain):
 @require_login
 def osint_tiktok(username):
     import json as _json
+    user = v.text(username, "username", 100)
     try:
-        _r = safe_fetch(
-            f"https://www.tiktok.com/api/user/detail/?uniqueId={username}&aid=1988",
+        _r = _cached_fetch(
+            ("tiktok", user),
+            "https://www.tiktok.com/api/user/detail/?" + urlencode({"uniqueId": user, "aid": "1988"}),
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 "Referer": "https://www.tiktok.com/",
@@ -3491,56 +3506,75 @@ def osint_tiktok(username):
     except SafeFetchError as e:
         logger.warning("TikTok OSINT safe_fetch blocked: %s", e)
         return jsonify({"error": "External request blocked by security policy."}), 502
+    if _r is None:
+        return jsonify({"error": "TikTok did not answer. Try again in a minute."}), 502
     try:
         data = _json.loads(_r["body"])
         return jsonify(data), _r["status"]
-    except Exception as e:
-        return jsonify({"error": str(e), "raw": _r["body"][:200].decode("utf-8", errors="replace")}), 500
+    except Exception:
+        return api_error("TikTok sent an answer that could not be read.")
+
+
+def _wmn_sites() -> list:
+    """The WhatsMyName site list, fetched at most once in six hours. Raises when there is none."""
+    def fetch():
+        result = safe_fetch(
+            "https://raw.githubusercontent.com/WebBreacher/WhatsMyName/main/wmn-data.json",
+            timeout=15,
+        )
+        if result["status"] != 200:
+            raise _UpstreamFailed(f"HTTP {result['status']} for the WhatsMyName list")
+        sites = json.loads(result["body"]).get("sites", [])
+        return [s for s in sites if isinstance(s, dict) and s.get("uri_check") and s.get("e_code") == 200][:200]
+
+    sites = _wmn_cache.get("sites", fetch)
+    if sites is None:
+        raise _UpstreamFailed("no WhatsMyName list")
+    return sites
+
+
+# One username check: how many sites are asked at a time, and for how long in all.
+USERNAME_CHECK_PARALLEL = 12
+USERNAME_CHECK_SECONDS = 45
 
 
 @dashboard_bp.route("/api/osint/username/<username>")
 @require_login
+@jobs.heavy
 def osint_username_check(username):
     """Check a username against WhatsMyName dataset."""
-    import concurrent.futures
-    import json as _json
+    account = _path_segment(username, "username")
     try:
-        _wmn = safe_fetch(
-            "https://raw.githubusercontent.com/WebBreacher/WhatsMyName/main/wmn-data.json",
-            timeout=15,
-        )
-        wmn = _json.loads(_wmn["body"])
-    except (SafeFetchError, Exception) as e:
-        return jsonify({"error": f"Could not fetch WMN data: {e}"}), 500
-
-    sites = [s for s in wmn.get("sites", []) if s.get("uri_check") and s.get("e_code") == 200][:200]
-    found = []
+        sites = _wmn_sites()
+    except Exception:
+        return api_error("Could not fetch WMN data")
 
     def check(site):
-        url = site["uri_check"].replace("{account}", username)
+        url = site["uri_check"].replace("{account}", account)
         # WhatsMyName spans 200+ public sites — host allowlist not applied.
         # HTTPS enforced; private-IP blocklist applied to block SSRF.
         if not url.startswith("https://"):
-            return None
+            return False
         try:
             # Resolves once, refuses internal addresses, connects to the address it checked.
-            r = fetch_public(url, timeout=6, max_bytes=512_000)
+            r = fetch_public(url, timeout=5, max_bytes=512_000)
             st, body_b = r["status"], r["body"]
         except (SafeFetchError, Exception):
-            return None
+            return False
         text = body_b.decode("utf-8", errors="replace")
         e_string = site.get("e_string", "")
         m_string = site.get("m_string", "")
         if st == site["e_code"] and (not e_string or e_string in text) and (not m_string or m_string not in text):
-            return {"name": site["name"], "url": url, "pretty": site.get("uri_pretty", "").replace("{account}", username)}
-        return None
+            return {"name": site["name"], "url": url, "pretty": site.get("uri_pretty", "").replace("{account}", account)}
+        return False
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=30) as pool:
-        for result in pool.map(check, sites):
-            if result:
-                found.append(result)
+    # The sites are asked through the shared pool, a few at a time, and the
+    # whole check has a time limit. A site not reached by then gives None.
+    answers = jobs.fan_out(check, sites, parallel=USERNAME_CHECK_PARALLEL, timeout=USERNAME_CHECK_SECONDS)
+    found = [a for a in answers if a]
+    skipped = sum(1 for a in answers if a is None)
 
-    return jsonify({"found": found, "checked": len(sites)})
+    return jsonify({"found": found, "checked": len(sites) - skipped, "skipped": skipped})
 
 
 # ── ThreatFox proxy (avoids browser CORS) ─────────────────────────────────────
@@ -3556,23 +3590,27 @@ def proxy_threatfox():
     asked = v.json_body()
     if asked.get("query") != "get_iocs":
         return jsonify({"error": "only the get_iocs query is relayed"}), 400
-    body = json.dumps({"query": "get_iocs", "days": v.to_int(asked.get("days"), 1, 1, 7)}).encode()
+    days = v.to_int(asked.get("days"), 1, 1, 7)
+    body = json.dumps({"query": "get_iocs", "days": days}).encode()
     api_key = os.getenv("THREATFOX_API_KEY", "")
     _hdrs = {"Content-Type": "application/json", "User-Agent": "OSINTPH/1.0"}
     if api_key:
         _hdrs["Auth-Key"] = api_key
     try:
-        _r = safe_fetch(
+        _r = _cached_fetch(
+            ("threatfox", days),
             "https://threatfox-api.abuse.ch/api/v1/",
             method="POST",
             headers=_hdrs,
             data=body,
             timeout=15,
         )
-        return Response(_r["body"], mimetype="application/json")
     except SafeFetchError as e:
         logger.warning("ThreatFox proxy safe_fetch blocked: %s", e)
         return jsonify({"error": "External request blocked by security policy."}), 502
+    if _r is None:
+        return jsonify({"error": "ThreatFox did not answer. Try again in a minute."}), 502
+    return Response(_r["body"], mimetype="application/json")
 
 
 @dashboard_bp.route("/api/proxy/urlhaus", methods=["POST"])
@@ -3580,17 +3618,20 @@ def proxy_threatfox():
 def proxy_urlhaus():
     """Proxy URLhaus recent URLs."""
     try:
-        _r = safe_fetch(
+        _r = _cached_fetch(
+            "urlhaus recent",
             "https://urlhaus-api.abuse.ch/v1/urls/recent/",
             method="POST",
             headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "OSINTPH/1.0"},
             data=b"limit=200",
             timeout=15,
         )
-        return Response(_r["body"], mimetype="application/json")
     except SafeFetchError as e:
         logger.warning("URLhaus proxy safe_fetch blocked: %s", e)
         return jsonify({"error": "External request blocked by security policy."}), 502
+    if _r is None:
+        return jsonify({"error": "URLhaus did not answer. Try again in a minute."}), 502
+    return Response(_r["body"], mimetype="application/json")
 
 
 @dashboard_bp.route("/api/proxy/feodo")
@@ -3598,11 +3639,13 @@ def proxy_urlhaus():
 def proxy_feodo():
     """Proxy Feodo Tracker C2 blocklist."""
     try:
-        _r = safe_fetch("https://feodotracker.abuse.ch/downloads/ipblocklist.json")
-        return Response(_r["body"], mimetype="application/json")
+        _r = _cached_fetch("feodo blocklist", "https://feodotracker.abuse.ch/downloads/ipblocklist.json")
     except SafeFetchError as e:
         logger.warning("Feodo proxy safe_fetch blocked: %s", e)
         return jsonify({"error": "External request blocked by security policy."}), 502
+    if _r is None:
+        return jsonify({"error": "Feodo Tracker did not answer. Try again in a minute."}), 502
+    return Response(_r["body"], mimetype="application/json")
 
 
 # ── WhiteIntel proxy ───────────────────────────────────────────────────────────
@@ -3620,32 +3663,35 @@ def whiteintel_alerts():
     if not api_key:
         return jsonify({"ok": False, "error": "WHITEINTEL_API_KEY not set", "data": []}), 200
 
-    page     = request.args.get("page", "1")
-    limit    = request.args.get("limit", "50")
-    severity = request.args.get("severity", "")
-
-    params = f"?page={page}&limit={limit}"
+    query = {
+        "page": v.int_arg("page", 1, 1, 100000),
+        "limit": v.int_arg("limit", 50, 1, 500),
+    }
+    severity = request.args.get("severity", "").strip()[:40]
     if severity:
-        params += f"&severity={severity}"
+        query["severity"] = severity
 
     try:
-        _r = safe_fetch(
-            f"https://whiteintel.io/api/v1/alerts{params}",
+        _r = _cached_fetch(
+            ("whiteintel alerts", tuple(query.items())),
+            "https://whiteintel.io/api/v1/alerts?" + urlencode(query),
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Accept": "application/json",
                 "User-Agent": "OSINTPH/1.0",
             },
         )
-        status, body = _r["status"], _r["body"]
     except SafeFetchError as e:
         logger.warning("WhiteIntel alerts safe_fetch blocked: %s", e)
         return jsonify({"ok": False, "error": "External request blocked by security policy.", "data": []}), 200
+    if _r is None:
+        return jsonify({"ok": False, "error": "WhiteIntel did not answer. Try again in a minute.", "data": []}), 200
+    status, body = _r["status"], _r["body"]
     try:
         data = _json.loads(body)
         return jsonify({"ok": True, "data": data})
     except Exception:
-        return jsonify({"ok": False, "error": f"HTTP {status}", "raw": body[:200].decode("utf-8", errors="replace")}), 200
+        return jsonify({"ok": False, "error": f"HTTP {status}"}), 200
 
 
 @dashboard_bp.route("/api/whiteintel/search")
@@ -3661,18 +3707,21 @@ def whiteintel_search():
         return jsonify({"ok": False, "error": "WHITEINTEL_API_KEY not set", "data": []}), 200
 
     try:
-        _r = safe_fetch(
-            f"https://whiteintel.io/api/v1/search?domain={domain}",
+        _r = _cached_fetch(
+            ("whiteintel search", domain.lower()),
+            "https://whiteintel.io/api/v1/search?" + urlencode({"domain": domain}),
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Accept": "application/json",
                 "User-Agent": "OSINTPH/1.0",
             },
         )
-        status, body = _r["status"], _r["body"]
     except SafeFetchError as e:
         logger.warning("WhiteIntel search safe_fetch blocked: %s", e)
         return jsonify({"ok": False, "error": "External request blocked by security policy."}), 200
+    if _r is None:
+        return jsonify({"ok": False, "error": "WhiteIntel did not answer. Try again in a minute."}), 200
+    status, body = _r["status"], _r["body"]
     try:
         data = _json.loads(body)
         return jsonify({"ok": True, "data": data})
@@ -3724,7 +3773,6 @@ def quick_scan_page():
 @require_login
 def api_quick_scan_start():
     import asyncio
-    import threading
 
     from ..quick_scan import (
         VALID_TARGET_TYPES,
@@ -3761,13 +3809,19 @@ def api_quick_scan_start():
     if storage.has_active_quick_scan(user_id):
         return jsonify({"error": "A quick scan is already running"}), 409
 
-    session_id = storage.create_quick_scan_session(
-        user_id=user_id,
-        target_value=target,
-        target_type=target_type,
-        normalized_variants=variants,
-        sources_used=source_names,
-    )
+    # A scan counts as one heavy operation until its thread ends.
+    slot = jobs.acquire_slot()  # Busy (429) when too many long requests are running
+    try:
+        session_id = storage.create_quick_scan_session(
+            user_id=user_id,
+            target_value=target,
+            target_type=target_type,
+            normalized_variants=variants,
+            sources_used=source_names,
+        )
+    except BaseException:
+        slot.release()
+        raise
 
     def run():
         loop = asyncio.new_event_loop()
@@ -3792,7 +3846,7 @@ def api_quick_scan_start():
                 pass
             loop.close()
 
-    threading.Thread(target=run, daemon=True, name="quick_scan_thread").start()
+    jobs.start_background(run, slot, name="quick_scan_thread")
 
     return jsonify({"session_id": session_id}), 201
 

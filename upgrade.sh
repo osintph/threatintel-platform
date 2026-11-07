@@ -5,7 +5,7 @@
 #
 #  Usage (as root, from the install directory):
 #    sudo ./upgrade.sh              # move to the tip of main
-#    sudo ./upgrade.sh v1.2.0       # move to a release tag, a branch or a commit
+#    sudo ./upgrade.sh v1.3.0       # move to a release tag, a branch or a commit
 #
 #  Optional env:
 #    SERVICES="tor dashboard"   rebuild and recreate only these services
@@ -21,6 +21,8 @@
 #  What it does, in order: pre-flight checks, database dump, git checkout,
 #  .env fixes and checks, origin lock update, image build, containers recreated one by one
 #  (postgres, tor, dashboard, nginx), health checks, URL checks.
+#  The database schema is brought up to date by the dashboard when it starts. Going
+#  back to a release with an older schema takes the schema back first (see below).
 #  It never touches SSH, ufw or volumes. See docs/runbook.md for rollback.
 # =============================================================================
 set -euo pipefail
@@ -91,6 +93,36 @@ backup_database() {
   success "Database dump verified ($objects tables, $(du -h "$out" | cut -f1))."
 }
 
+# Run a command line of the application in a one-off container of the image that
+# is running now (the dashboard itself may be stopped).
+app_cli() { docker compose run --rm --no-deps -T dashboard python -m darkweb_scanner.main "$@" 2>/dev/null; }
+
+# Going back to an older release: its code cannot run against a newer database
+# schema, so the schema is taken back first, by the code that knows how (the
+# release that is installed now). The dashboard is stopped for this, because any
+# start of the installed release would upgrade the schema again.
+schema_step_back() { # ref
+  local ref=$1 sha current wanted
+  docker compose ps --status running --services 2>/dev/null | grep -qx postgres || return 0
+  if git show-ref --verify --quiet "refs/remotes/origin/$ref"; then ref="origin/$ref"; fi
+  sha="$(git rev-parse --verify --quiet "$ref^{commit}")" || return 0   # checkout_ref reports an unknown ref
+  # Revision of the database; empty for a release from before schema revisions (1.2.0 and older).
+  current="$(app_cli db-status --quiet | tail -1 | tr -d '[:space:]' || true)"
+  [[ "$current" =~ ^[0-9]{4}$ ]] || return 0
+  # Newest revision the target release knows; a release without revisions has the baseline schema.
+  wanted="$(git ls-tree -r --name-only "$sha" -- src/darkweb_scanner/migrations/versions/ \
+    | sed -nE 's#.*/([0-9]{4})_[^/]*\.py$#\1#p' | sort | tail -1)"
+  wanted="${wanted:-0001}"
+  [[ "$current" > "$wanted" ]] || return 0
+
+  [[ "${SKIP_BACKUP:-}" != "1" ]] || error "The database schema is at revision $current and $1 needs $wanted. Taking it back drops what newer revisions added, so run this without SKIP_BACKUP=1."
+  warn "The database schema is at revision $current; $1 needs revision $wanted."
+  info "Stopping the dashboard and taking the schema back (the dump made a moment ago holds the current state)..."
+  docker compose stop dashboard >/dev/null
+  app_cli db-downgrade "$wanted" --yes || error "Could not take the schema back to $wanted. Nothing else was changed; start the dashboard again with: docker compose up -d dashboard"
+  success "Database schema is at revision $wanted."
+}
+
 checkout_ref() { # ref
   local ref=$1 sha before recorded actual
   before="$(git rev-parse HEAD)"
@@ -100,6 +132,7 @@ checkout_ref() { # ref
     # The www submodule is handled below, so the fetch does not descend into it.
     git fetch --tags --prune --no-recurse-submodules origin || error "git fetch failed; nothing was changed."
   fi
+  schema_step_back "$ref"
   if git show-ref --verify --quiet "refs/remotes/origin/$ref"; then
     # A branch: stay on it, fast-forward only.
     git checkout -q "$ref" 2>/dev/null || git checkout -q -b "$ref" --track "origin/$ref"
@@ -160,6 +193,20 @@ migrate_env() {
   missing="$(comm -23 <(grep -oE '^[A-Z][A-Z0-9_]*=' .env.example | sort -u) <(grep -oE '^[A-Z][A-Z0-9_]*=' .env | sort -u) | tr -d '=' | tr '\n' ' ')"
   [[ -n "$missing" ]] && info "Settings in .env.example that your .env does not set (defaults apply): $missing"
   return 0
+}
+
+# The paste monitor was removed in 1.3.0. Its documentation had you add a cron job
+# to root's crontab; left there it would fail every five minutes.
+remove_paste_cron() {
+  local tab copy
+  tab="$(crontab -l 2>/dev/null || true)"
+  grep -q 'paste_monitor' <<<"$tab" || return 0
+  mkdir -p backups && chmod 700 backups
+  copy="backups/root-crontab-before-$(date -u +%Y%m%dT%H%M%SZ)"
+  printf '%s\n' "$tab" > "$copy" && chmod 600 "$copy"
+  # grep -v exits 1 when that job was the only line; the empty crontab is still the right result.
+  { grep -v 'paste_monitor' <<<"$tab" || true; } | crontab - || error "Could not rewrite root's crontab (copy: $copy)."
+  success "Removed the paste monitor job from root's crontab (copy of the old crontab: $copy)."
 }
 
 update_origin_lock() {
@@ -301,6 +348,7 @@ main() {
   fi
 
   migrate_env
+  remove_paste_cron
   update_origin_lock
   build_and_start
   echo ""

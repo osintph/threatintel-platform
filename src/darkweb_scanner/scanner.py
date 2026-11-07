@@ -11,6 +11,11 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+# Keywords are matched as literal text (re.escape), so a search is linear in
+# the length of the page. These two bound what one page can cost.
+MAX_SCAN_TEXT = 2_000_000  # characters of one page that are scanned
+MAX_HITS_PER_KEYWORD = 100  # per page, when every occurrence is reported
+
 
 @dataclass
 class KeywordHit:
@@ -80,22 +85,25 @@ class Scanner:
         """Scan text for all configured keywords. Returns list of hits."""
         if not text:
             return []
+        if len(text) > MAX_SCAN_TEXT:
+            logger.info(f"Scanning the first {MAX_SCAN_TEXT} characters of {url}")
+            text = text[:MAX_SCAN_TEXT]
 
         hits = []
-        seen_keywords: set[str] = set()
 
         for keyword, (category, pattern) in self._patterns.items():
-            matches = list(pattern.finditer(text))
-            if not matches:
-                continue
-
             if self.config.alert_on_first_hit_only:
-                matches = matches[:1]
+                # One search, not a list of every occurrence on the page.
+                first = pattern.search(text)
+                matches = [first] if first else []
+            else:
+                matches = []
+                for match in pattern.finditer(text):
+                    matches.append(match)
+                    if len(matches) >= MAX_HITS_PER_KEYWORD:
+                        break
 
             for match in matches:
-                if self.config.alert_on_first_hit_only and keyword in seen_keywords:
-                    break
-
                 context = self._get_context(text, match)
                 hits.append(
                     KeywordHit(
@@ -107,7 +115,6 @@ class Scanner:
                         depth=depth,
                     )
                 )
-                seen_keywords.add(keyword)
 
         if hits:
             logger.info(f"Found {len(hits)} keyword hit(s) on {url}")

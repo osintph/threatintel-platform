@@ -29,6 +29,8 @@ info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
 success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+# Never stop without saying where: with set -e a failing command would otherwise end the script silently.
+trap 'echo -e "${RED}[ERROR]${NC} deploy.sh stopped at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
 [[ $EUID -ne 0 ]] && error "Please run as root:  sudo bash deploy.sh"
 
@@ -121,17 +123,38 @@ chmod 600 .env
 success "Config files ready."
 
 # ── Patch .env ────────────────────────────────────────────────────────────────
-SECRET_KEY="$(openssl rand -hex 32)"
-sed -i "s/^DASHBOARD_SECRET_KEY=.*/DASHBOARD_SECRET_KEY=${SECRET_KEY}/" .env
-PG_PASS="$(openssl rand -hex 24)"
-sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=${PG_PASS}/" .env
-sed -i "s|^DATABASE_URL=.*|DATABASE_URL=postgresql+psycopg2://scanner:${PG_PASS}@postgres:5432/darkweb_scanner|" .env
+# Every secret is generated once, while its value is still empty or a placeholder.
+# Running this script again keeps what is there: a new database password in .env
+# would not match the one the existing database volume was created with, and a new
+# session secret would sign everyone out. Values are never printed.
+env_get() { grep -m1 "^$1=" .env | cut -d= -f2- | tr -d '[:space:]' || true; }
+env_set() {
+  if grep -q "^$1=" .env; then sed -i "s|^$1=.*|$1=$2|" .env; else printf '%s=%s\n' "$1" "$2" >> .env; fi
+}
 
-# One-time token for creating the first administrator at /register. Generated only
-# when the setting is empty, so a re-run does not replace a token already handed out.
-grep -q '^SETUP_TOKEN=' .env || echo 'SETUP_TOKEN=' >> .env
-if [[ -z "$(grep '^SETUP_TOKEN=' .env | cut -d= -f2- | tr -d '[:space:]')" ]]; then
-  sed -i "s/^SETUP_TOKEN=.*/SETUP_TOKEN=$(openssl rand -hex 24)/" .env
+case "$(env_get DASHBOARD_SECRET_KEY)" in
+  ""|changeme|change-me-in-production|change-me-to-a-long-random-string)
+    env_set DASHBOARD_SECRET_KEY "$(openssl rand -hex 32)"
+    info "Generated DASHBOARD_SECRET_KEY." ;;
+  *) info "Keeping the DASHBOARD_SECRET_KEY already in .env." ;;
+esac
+
+case "$(env_get POSTGRES_PASSWORD)" in
+  ""|changeme)
+    if docker volume inspect darkweb-scanner_pg_data &>/dev/null; then
+      error "POSTGRES_PASSWORD in .env is empty or a placeholder, but the database volume darkweb-scanner_pg_data already exists. Put the password that database was created with into .env (POSTGRES_PASSWORD and DATABASE_URL), or set a new one as described in docs/deployment.md under 'Password authentication failed'."
+    fi
+    PG_PASS="$(openssl rand -hex 24)"
+    env_set POSTGRES_PASSWORD "$PG_PASS"
+    env_set DATABASE_URL "postgresql+psycopg2://scanner:${PG_PASS}@postgres:5432/darkweb_scanner"
+    unset PG_PASS
+    info "Generated POSTGRES_PASSWORD and DATABASE_URL." ;;
+  *) info "Keeping the POSTGRES_PASSWORD and DATABASE_URL already in .env." ;;
+esac
+
+# One-time token for creating the first administrator at /register.
+if [[ -z "$(env_get SETUP_TOKEN)" ]]; then
+  env_set SETUP_TOKEN "$(openssl rand -hex 24)"
 fi
 
 # Set domain and SSL email if provided
@@ -200,13 +223,16 @@ done
 [[ $ELAPSED -lt 60 ]] && success "Dashboard container is healthy."
 
 # ── Wait for dashboard ────────────────────────────────────────────────────────
+# nginx answers only for the configured name, so ask for that name on loopback.
+CHECK_HOST="${DOMAIN:-$(env_get DOMAIN)}"; CHECK_HOST="${CHECK_HOST:-localhost}"
+check_https() { curl -sk -o /dev/null -m 10 -w '%{http_code}' --resolve "${CHECK_HOST}:443:127.0.0.1" "https://${CHECK_HOST}/login" 2>/dev/null || true; }
 info "Waiting for HTTPS to respond..."
 TIMEOUT=90; ELAPSED=0
-until curl -sfk "https://localhost" -o /dev/null 2>/dev/null; do
+until [[ "$(check_https)" == "200" ]]; do
   [[ $ELAPSED -ge $TIMEOUT ]] && { warn "HTTPS not responding after ${TIMEOUT}s. Check: docker compose logs nginx"; break; }
   sleep 3; ELAPSED=$((ELAPSED + 3))
 done
-curl -sfk "https://localhost" -o /dev/null 2>/dev/null && success "HTTPS is live!"
+[[ "$(check_https)" == "200" ]] && success "HTTPS is live!"
 
 # ── Wait for Tor to bootstrap ─────────────────────────────────────────────────
 info "Waiting for Tor to bootstrap (up to 3 minutes)..."
@@ -222,8 +248,8 @@ docker compose logs tor 2>/dev/null | grep -q "Bootstrapped 100%" && success "To
 
 # ── Post-deploy smoke check ───────────────────────────────────────────────────
 info "Running post-deploy smoke check..."
-_HTTP_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "https://localhost" 2>/dev/null || true)
-if [[ "$_HTTP_STATUS" == "200" || "$_HTTP_STATUS" == "302" ]]; then
+_HTTP_STATUS="$(check_https)"
+if [[ "$_HTTP_STATUS" == "200" ]]; then
   success "Smoke check passed (HTTP ${_HTTP_STATUS})."
 else
   warn "Smoke check returned HTTP ${_HTTP_STATUS} — the dashboard may not be fully up yet."

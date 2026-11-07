@@ -19,11 +19,6 @@ logger = logging.getLogger(__name__)
 MIN_SECRET_KEY_LENGTH = 32
 _PLACEHOLDER_SECRETS = ("change-me-in-production", "change-me-to-a-long-random-string")
 
-# Endpoints that take a POST from another site by design and have no session to protect.
-# /api/digest/subscribe is the public subscribe form; nginx rate-limits it.
-CSRF_EXEMPT_ENDPOINTS = frozenset({"dashboard.api_public_subscribe"})
-
-
 class _SkipHealthcheckLog(logging.Filter):
     """Keep the container healthcheck (one request every 15 s) out of the access log."""
 
@@ -78,13 +73,17 @@ def create_app() -> Flask:
     from .auth_routes import auth_bp
     from .channel_monitor_routes import channel_monitor_bp
     from .dashboard_routes import dashboard_bp
+    from .errors import install_error_handlers
     from .ransomware_live_routes import rw_live_bp
+    from .security_headers import init_security_headers
     from .storage_helper import close_db, get_storage
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(dashboard_bp)
     app.register_blueprint(channel_monitor_bp)
     app.register_blueprint(rw_live_bp)
+    init_security_headers(app)
+    install_error_handlers(app)
     app.teardown_appcontext(close_db)
 
     # Fail at start, not at the first request, when the database is not configured.
@@ -102,8 +101,6 @@ def create_app() -> Flask:
 
     @app.before_request
     def _csrf_protect():
-        if request.endpoint in CSRF_EXEMPT_ENDPOINTS:
-            return None
         reason = csrf_failure()
         if reason is None:
             return None

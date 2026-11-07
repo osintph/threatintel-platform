@@ -19,30 +19,19 @@ TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890
 TELEGRAM_PHONE=+639XXXXXXXXX
 ```
 
-`TELEGRAM_PHONE` is your Telegram account phone number with country code. This is required for the Channel Monitor — the background scraper does not use it.
+`TELEGRAM_PHONE` is your Telegram account phone number with country code. Only the sign-in command below uses it; the background scraper does not.
 
 ### First-time authentication
 
-Run this once on the server to generate the session file:
+Sign the Channel Monitor session in once, on the server, from the install directory:
 
 ```bash
-cd ~/darkweb-scanner
-docker compose exec dashboard python3 -c "
-import asyncio
-from telethon import TelegramClient
-import os
-from dotenv import load_dotenv
-load_dotenv('/app/.env')
-async def auth():
-    c = TelegramClient('/app/data/channel_monitor/channel_monitor', int(os.environ['TELEGRAM_API_ID']), os.environ['TELEGRAM_API_HASH'])
-    await c.start(phone=os.environ['TELEGRAM_PHONE'])
-    print('Auth OK:', (await c.get_me()).username)
-    await c.disconnect()
-asyncio.run(auth())
-"
+docker compose exec dashboard python -m darkweb_scanner.main channel-monitor-auth
 ```
 
-Enter the OTP sent to your Telegram app when prompted. The session is saved to `/app/data/channel_monitor/channel_monitor.session` and persists across restarts — you only need to do this once.
+Enter the code that Telegram sends to your app when prompted (and the phone number, if `TELEGRAM_PHONE` is empty). The session is saved to `/app/data/channel_monitor/channel_monitor.session` (mode 600) and persists across restarts. The command is safe to repeat; run it when no job is running.
+
+A job never asks Telegram for a login code. If the session is missing or was revoked, the job ends with an error that names this command.
 
 ### Using the tab
 
@@ -52,6 +41,20 @@ Enter the OTP sent to your Telegram app when prompted. The session is saved to `
 4. Watch the live log — the scan runs in the background so you can navigate away
 5. When the status changes to **✓ Completed**, click **⬇ Download ZIP**
 
+One job runs at a time. A second start is refused with a message that says which job is running and who started it.
+
+### Job states
+
+| State | Meaning |
+|-------|---------|
+| Running | The job is reading the channel now |
+| Completed | Finished; the ZIP can be downloaded |
+| Error | Stopped with an error. The log ends with a plain sentence and, for unexpected faults, an error id; the details are in the server log under `[error_id=...]`. What was saved by then can still be downloaded |
+| Interrupted | The server restarted while the job was running. What was saved by then can still be downloaded |
+| Archived | An export made before version 1.3.0, found on disk. It can be downloaded and deleted; it has no owner and no log |
+
+Jobs are kept on disk (`job.json` and `job.log` in each job folder), so the list survives a restart.
+
 ### What's in the ZIP
 
 | File | Contents |
@@ -59,6 +62,9 @@ Enter the OTP sent to your Telegram app when prompted. The session is saved to `
 | `messages.html` | Full rendered report — original text, English translation, inline photos/videos |
 | `messages.json` | Structured data for all messages: original text, translation, and the text split into `segments` (plain text, links, formatting) |
 | `media/` | All downloaded photos and video files |
+| `job.log` | The job's log |
+
+The ZIP is built once and kept until the job is deleted or expires, so a job that has been downloaded takes about twice its size on disk.
 
 ### Privacy, access and retention
 
@@ -72,12 +78,28 @@ Enter the OTP sent to your Telegram app when prompted. The session is saved to `
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| Message Limit | 200 | Number of messages to fetch. 0 = all |
+| Message Limit | 200 | Number of messages to fetch, from 1 to the server's maximum (5,000). There is no "all messages" |
 | Last N Days | — | Only fetch messages newer than N days ago |
 | Force Source Language | Auto | Override per-message language detection |
-| Max Video Size (MB) | 50 | Skip videos larger than this. 0 = skip all |
-| Min Free Disk (GB) | 1.0 | Abort scan if server disk falls below this |
+| Max Video Size (MB) | 50 | Skip videos larger than this, up to the server's maximum. 0 = skip all |
+| Translate | On | Send message text to Google Translate. Off: nothing is sent to Google and the report holds the original text only |
 | Skip English translation | Off | Don't translate messages already detected as English |
+
+### Limits set on the server
+
+These are settings in `.env`, not options of a job. Apply a change with `docker compose up -d dashboard`.
+
+| Setting | Default | What it limits |
+|---------|---------|----------------|
+| `CHANNEL_MONITOR_MAX_MESSAGES` | `5000` | Messages one job may read |
+| `CHANNEL_MONITOR_MAX_FILE_MB` | `50` | Size of one photo or image file. Larger ones are skipped |
+| `CHANNEL_MONITOR_MAX_VIDEO_MB` | `200` | Highest value the "Max Video Size" option accepts. `0`: videos are never downloaded |
+| `CHANNEL_MONITOR_MAX_JOB_GB` | `2` | Media of one job. When it is reached, media downloads stop and the text export finishes |
+| `CHANNEL_MONITOR_MIN_FREE_GB` | `5` | Free disk space. Below it no job starts, and a running job stops, saves what it has read and ends with an error |
+| `CHANNEL_MONITOR_MAX_DOWNLOAD_GB` | `5` | Size of a ZIP that can be downloaded |
+| `CHANNEL_MONITOR_RETENTION_DAYS` | `90` | Days a job folder and its ZIP are kept |
+
+Keep `CHANNEL_MONITOR_MAX_JOB_GB` at or below `CHANNEL_MONITOR_MAX_DOWNLOAD_GB`, or a job can grow too large to download.
 
 ### Supported languages
 
@@ -86,8 +108,9 @@ Auto-detection and translation supports: Farsi, Russian, Chinese (Simplified/Tra
 ### Notes
 
 - Only **public** channels are supported
-- Job history is held in memory and resets when the container restarts
 - Output files are stored at `/app/data/channel_monitor/{job_id}/` on the server
+- The job log keeps the first 20,000 lines, each up to 500 characters
+- A translation that hangs holds the only job slot; restarting the dashboard (`docker compose up -d --force-recreate dashboard`) ends the job as Interrupted
 - Use a dedicated Telegram account for scanning — not your personal account
 - Telegram may rate-limit heavy usage; the scanner handles this gracefully
 
@@ -186,7 +209,6 @@ This saves a session file to `/app/data/telegram.session`. You only need to do t
 # Scan all channels configured in TELEGRAM_CHANNELS
 docker compose exec dashboard python -m darkweb_scanner.main telegram-scan
 
-# Or trigger from the dashboard — Seeds tab > Telegram Channels section
 ```
 
 ### How It Works

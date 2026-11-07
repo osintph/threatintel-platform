@@ -5,11 +5,13 @@ Plain-Python, typed source definitions for the ad-hoc "Quick Scan" feature.
 Kept as code (not YAML/JSON) on purpose: adding, removing, or re-pointing a
 source is a reviewable diff.
 
-Transport model:
+Transport model (nothing is fetched from the server's own address during a scan):
   - ``tor``      : fetched through the existing Tor SOCKS5 client (.onion hosts).
-  - ``clearnet`` : fetched through ``dashboard.http_client.safe_fetch`` — HTTPS-only,
-                   host-allowlisted, IP-blocklisted. Any clearnet source host MUST be
-                   present in ALLOWED_EXTERNAL_HOSTS or the fetch is refused.
+  - ``clearnet`` : also fetched through Tor — HTTPS-only, certificate checked, no
+                   redirects followed. Any clearnet source host MUST be present in
+                   ALLOWED_EXTERNAL_HOSTS or the fetch is refused.
+
+Links found on result pages are followed only when they are .onion addresses.
 
 A source exposes one or more ``url_templates``. A template containing the literal
 ``{query}`` placeholder is a search endpoint (the URL-encoded target is substituted
@@ -113,7 +115,7 @@ _RANSOMWARE_LEAKS = [
 ]
 
 
-# ── Paste sites (clearnet, via safe_fetch) ───────────────────────────────────────
+# ── Paste sites (clearnet, via Tor) ──────────────────────────────────────────────
 # Neither rentry.co nor dpaste.org exposes a documented public *search* endpoint, so
 # both ship disabled (empty url_templates -> skipped cleanly). Populate a search
 # template and flip enabled=True once an endpoint is confirmed. dpaste.org is kept in

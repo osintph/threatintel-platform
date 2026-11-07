@@ -53,6 +53,7 @@
   <nav class="toc">
     <a href="#accounts">Signing in</a>
     <a href="#roles">Who can do what</a>
+    <a href="#patterns">Project patterns</a>
     <a href="#channel-monitor">Channel Monitor</a>
     <a href="#third-parties">Data sent to other services</a>
     <a href="#stored">What is stored and logged</a>
@@ -86,7 +87,7 @@
     <table>
       <tr><th>Area</th><th>Every signed-in user</th><th>Administrators only</th></tr>
       <tr><td>Hits, crawl sessions, feeds, trackers</td><td>View</td><td>—</td></tr>
-      <tr><td>Keywords, seeds, sources, Telegram channel list</td><td>View</td><td>Add, import, remove</td></tr>
+      <tr><td>Keywords, seeds, custom ransomware-group and threat-actor entries</td><td>View</td><td>Add, import, remove</td></tr>
       <tr><td>Crawl</td><td>See status</td><td>Start and stop</td></tr>
       <tr><td>Investigations (breach, IP, DNS)</td><td>Start and view; all users see all of them</td><td>Delete</td></tr>
       <tr><td>Projects</td><td>Create; view and change your own</td><td>View, change and delete all</td></tr>
@@ -98,18 +99,34 @@
     </div>
   </section>
 
+  <section id="patterns">
+    <h2>Project keyword patterns</h2>
+    <p>A project keyword marked <strong>Regex</strong> is a regular expression. It is checked when you save it, and a
+      pattern that could take the server minutes to run is refused. The message starts with <em>The pattern is not
+      accepted:</em> and says why, for example that a repeated part can also match what follows it
+      (<code>(a+)+</code>), that alternatives overlap (<code>(a|aa)+</code>), or that it uses a back-reference.
+      Patterns are at most 200 characters.</p>
+    <ul>
+      <li><strong>What a pattern sees:</strong> the 1,000 characters around each keyword hit, not the whole page.</li>
+      <li><strong>Patterns saved before version 1.3.0</strong> are checked again by the crawl. One that is refused
+        is skipped and written to the server log with its project's name; the other keywords of the project still
+        match. Delete it and save a safe version.</li>
+    </ul>
+  </section>
+
   <section id="channel-monitor">
     <h2>Channel Monitor <span class="admin">ADMIN</span></h2>
     <p>Channel Monitor reads messages from a <strong>public Telegram channel</strong> through the Telegram account
-      configured on the server, translates them to English and packs the result into a ZIP archive.</p>
+      configured on the server, translates them to English and packs the result into a ZIP archive. One job runs at a
+      time, within limits on messages, file sizes and disk space set on the server.</p>
     <ul>
       <li><strong>Public channels only.</strong> Only a public channel user name (<code>@name</code> or a
         <code>t.me/name</code> link) is accepted. Private chats, saved messages, phone numbers, numeric ids and
         invite links are refused.</li>
       <li><strong>Translation is done by Google Translate.</strong> The text of every message that is not detected
         as English is sent from this server to Google's public translation service. No account or key is used;
-        media files, sender names and the channel name are not sent. Do not run it on a channel whose content must
-        not be disclosed to Google.</li>
+        media files, sender names and the channel name are not sent. Turn <strong>Translate</strong> off for a job
+        whose content must not be disclosed to Google: then nothing is sent and the report holds the original text.</li>
       <li><strong>Who can see jobs.</strong> Only administrators can start a job, see the job list and logs, and
         download or delete an archive. Each job records the administrator who started it.</li>
       <li><strong>Retention.</strong> Archives and their job folders are deleted automatically
@@ -122,26 +139,26 @@
   <section id="third-parties">
     <h2>Data sent to other services</h2>
     <p>The platform looks things up on your behalf. Each lookup sends the value you entered to the service named
-      here, from this server's address (onion sites are reached through Tor). A service is contacted only when its
+      here, from this server's address. Onion sites, and every source a Quick Scan checks, are reached through Tor. A service is contacted only when its
       feature is used and, where a key is needed, only when the administrator has configured one.</p>
     <div class="table-wrap">
     <table>
       <tr><th>Feature</th><th>What is sent</th><th>To</th></tr>
       <tr><td>Breach investigation</td><td>The e-mail addresses you enter</td><td>Have I Been Pwned</td></tr>
       <tr><td>IP investigation</td><td>The IP address</td><td>AbuseIPDB, VirusTotal</td></tr>
-      <tr><td>DNS recon</td><td>The domain and the host names found for it</td><td>Public DNS, crt.sh, HackerTarget, RDAP, ip-api.com, DNSDumpster (enrich), and the hosts of the domain itself (one HTTP request each, no redirects followed)</td></tr>
+      <tr><td>DNS recon</td><td>The domain and the host names found for it</td><td>Public DNS, crt.sh, HackerTarget, RDAP, ipwho.is (location of the addresses found), DNSDumpster (enrich), and the hosts of the domain itself (one HTTP request each, no redirects followed)</td></tr>
       <tr><td>OSINT user lookups</td><td>The user name or domain</td><td>GitHub, Reddit, TikTok, a Discord lookup service, and the sites checked for that user name</td></tr>
       <tr><td>Credential exposure</td><td>The search term</td><td>WhiteIntel</td></tr>
       <tr><td>Threat feeds and trackers</td><td>Nothing about you; fixed queries</td><td>abuse.ch (ThreatFox, URLhaus, Feodo), ransomware.live, AlienVault OTX, NVD, CISA, security news feeds</td></tr>
-      <tr><td>Crawl, Quick Scan</td><td>Requests for the pages being crawled; Quick Scan sends your search term to onion search engines</td><td>Onion sites, through Tor</td></tr>
-      <tr><td>Channel Monitor</td><td>Message text, for translation</td><td>Google Translate; Telegram (to read the channel)</td></tr>
+      <tr><td>Crawl, Quick Scan</td><td>Requests for the pages being crawled; Quick Scan sends your search term to onion search engines and paste sites</td><td>Onion sites and the paste sites Quick Scan checks, through Tor</td></tr>
+      <tr><td>Channel Monitor</td><td>Message text, for translation (unless Translate is off)</td><td>Google Translate; Telegram (to read the channel)</td></tr>
       <tr><td>Telegram scan</td><td>Reads the configured channels</td><td>Telegram</td></tr>
       <tr><td>Digest and alerts</td><td>Subscriber addresses and the digest; alert e-mails</td><td>Mailgun; your SMTP server</td></tr>
     </table>
     </div>
-    <div class="note">The dashboard page loads the world-map library (a script and a style sheet) from the jsDelivr
-      CDN, so your browser contacts <code>cdn.jsdelivr.net</code>. Profile pictures shown in OSINT user lookups are
-      loaded by your browser from the sites they belong to.</div>
+    <div class="note">The dashboard's scripts, including the world-map library, are served by this platform; your
+      browser loads no script from anywhere else. Profile pictures shown in OSINT user lookups are loaded by your
+      browser from the sites they belong to.</div>
   </section>
 
   <section id="stored">
@@ -154,7 +171,7 @@
         came from. Kept for 365 days. Administrators can read it.</li>
       <li><strong>Web server log:</strong> every request with the visitor's address, kept in rotating container logs.</li>
       <li><strong>Work data:</strong> crawl results and hits, investigations, projects, Quick Scan results, the
-        keyword, seed and channel lists, digest subscribers, and Channel Monitor archives (for {{ retention_days }} days).</li>
+        keyword and seed lists, digest subscribers, and Channel Monitor archives (for {{ retention_days }} days).</li>
       <li><strong>Where:</strong> on the server that runs this platform, in its PostgreSQL database and data
         volume, and in that server's backups. Nothing is sent to the software's authors.</li>
     </ul>

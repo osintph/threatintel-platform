@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from darkweb_scanner.storage import Base, Storage
+from darkweb_scanner.storage import Storage
 from tests.helpers import use_storage
 
 SECRET_KEY = "test-secret-key-0123456789abcdef0123456789abcdef"
@@ -23,13 +23,23 @@ def db(monkeypatch):
     if not url:
         yield use_storage(monkeypatch, Storage("sqlite:///:memory:"))
         return
+    empty_database(url)
     storage = Storage(url)
-    Base.metadata.drop_all(storage.engine)
-    Base.metadata.create_all(storage.engine)
     try:
         yield use_storage(monkeypatch, storage)
     finally:
         storage.engine.dispose()
+
+
+def empty_database(url: str) -> None:
+    """Drop every table in a PostgreSQL test database, including alembic_version."""
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(text("DROP SCHEMA public CASCADE"))
+        conn.execute(text("CREATE SCHEMA public"))
+    engine.dispose()
 
 
 @pytest.fixture
@@ -44,9 +54,6 @@ def data_dir(monkeypatch, tmp_path):
         ("SEEDS_FILE", "seeds.txt"),
         ("CRAWL_FLAG", "crawl.start"),
         ("STOP_FLAG", "crawl.stop"),
-        ("CLEARNET_SEEDS_FILE", "clearnet_seeds.txt"),
-        ("PASTE_SOURCES_FILE", "paste_sources.txt"),
-        ("TELEGRAM_CHANNELS_FILE", "telegram_channels.txt"),
     ):
         monkeypatch.setattr(dr, name, tmp_path / rel if rel else tmp_path)
     monkeypatch.setattr(digest, "DATA_DIR", tmp_path)

@@ -8,9 +8,28 @@ import logging
 from flask import Blueprint, Response, jsonify, request
 
 from ..auth import require_login
+from . import jobs
+from . import validation as v
+from .jobs import heavy
 
 logger = logging.getLogger(__name__)
 rw_live_bp = Blueprint("rw_live", __name__)
+
+# Answers come from the in-process cache in ransomware_live.py. The routes
+# whose upstream request is fixed (the ones the home page calls on every load)
+# cost one fetch per cache period however often they are called. The routes
+# that take a name or a search term can be made to ask for something new every
+# time, so they also run inside the heavy-job limiter (@heavy).
+
+
+@rw_live_bp.errorhandler(jobs.Busy)
+def _busy(err):
+    return jobs.busy_answer(err, ok=False)
+
+
+@rw_live_bp.errorhandler(v.Invalid)
+def _invalid_input(err):
+    return _err(str(err))
 
 
 def _rw():
@@ -24,6 +43,16 @@ def _ok(data):
 
 def _err(msg, status=400):
     return jsonify({"ok": False, "error": msg}), status
+
+
+def _name(value, field: str = "name") -> str:
+    """A group, note, chat or victim name from the URL: one short line of text."""
+    return v.text(value, field, 100)  # type: ignore[return-value]
+
+
+def _arg(name: str, max_len: int = 100):
+    """An optional text filter from the query string, or None."""
+    return v.text(request.args.get(name), name, max_len, required=False)
 
 
 # ── Status / Stats ─────────────────────────────────────────────────────────────
@@ -80,8 +109,8 @@ def rwlive_groups():
     live_names = {g.get("name", "").lower() for g in live_groups}
     for lg in LOCAL:
         if lg["name"].lower() not in live_names:
-            lg["_local_only"] = True
-            live_groups.append(lg)
+            # A copy: the built-in list is shared by every request.
+            live_groups.append({**lg, "_local_only": True})
 
     if request.args.get("sea"):
         live_groups = [g for g in live_groups if g.get("_sea_targeting") or g.get("targeting_sea")]
@@ -93,9 +122,10 @@ def rwlive_groups():
 
 @rw_live_bp.route("/api/rwlive/groups/<group_name>")
 @require_login
+@heavy
 def rwlive_group_detail(group_name: str):
     """Full group profile + victims, IOCs, negotiations, ransom notes, YARA."""
-    return _ok(_rw().build_group_profile(group_name))
+    return _ok(_rw().build_group_profile(_name(group_name)))
 
 
 # ── Victims ────────────────────────────────────────────────────────────────────
@@ -105,7 +135,7 @@ def rwlive_group_detail(group_name: str):
 def rwlive_victims_recent():
     """?sea=1  ?limit=N (default 40, max 200)"""
     rw = _rw()
-    limit   = min(int(request.args.get("limit", 40)), 200)
+    limit   = v.int_arg("limit", 40, 1, 200)
     victims = rw.get_recent_victims(limit=limit)
     if request.args.get("sea"):
         victims = [v for v in victims if (v.get("country") or "").upper() in rw.SEA_ISO2]
@@ -116,33 +146,35 @@ def rwlive_victims_recent():
 @require_login
 def rwlive_sea_victims():
     """All recent SEA victims deduplicated."""
-    limit = min(int(request.args.get("limit", 50)), 200)
+    limit = v.int_arg("limit", 50, 1, 200)
     return _ok(_rw().get_sea_victims(limit=limit))
 
 
 @rw_live_bp.route("/api/rwlive/victims/search")
 @require_login
+@heavy
 def rwlive_victims_search():
     """?q=keyword"""
-    q = request.args.get("q", "").strip()
-    if not q:
+    if not request.args.get("q", "").strip():
         return _err("q parameter required")
-    limit = min(int(request.args.get("limit", 50)), 200)
+    q = v.text(request.args.get("q"), "q", 200, allow_markup=True)
+    limit = v.int_arg("limit", 50, 1, 200)
     return _ok(_rw().search_victims(q, limit=limit))
 
 
 @rw_live_bp.route("/api/rwlive/victims")
 @require_login
+@heavy
 def rwlive_victims():
     """?group ?country ?sector ?year ?month ?query ?limit ?sea"""
     rw    = _rw()
-    group   = request.args.get("group")
-    country = request.args.get("country")
-    sector  = request.args.get("sector")
+    group   = _arg("group")
+    country = _arg("country")
+    sector  = _arg("sector")
     year    = request.args.get("year",  type=int)
     month   = request.args.get("month", type=int)
-    query   = request.args.get("query")
-    limit   = min(int(request.args.get("limit", 50)), 500)
+    query   = v.text(request.args.get("query"), "query", 200, required=False, allow_markup=True)
+    limit   = v.int_arg("limit", 50, 1, 500)
     if request.args.get("sea"):
         return _ok(rw.get_sea_victims(limit=limit))
     return _ok(rw.get_victims(
@@ -153,8 +185,9 @@ def rwlive_victims():
 
 @rw_live_bp.route("/api/rwlive/victims/<victim_id>")
 @require_login
+@heavy
 def rwlive_victim_detail(victim_id: str):
-    result = _rw().get_victim_by_id(victim_id)
+    result = _rw().get_victim_by_id(_name(victim_id, "victim id"))
     if result is None:
         return _err("Victim not found or PRO key required", 404)
     return _ok(result)
@@ -170,10 +203,11 @@ def rwlive_ioc_groups():
 
 @rw_live_bp.route("/api/rwlive/iocs/<group_name>")
 @require_login
+@heavy
 def rwlive_group_iocs(group_name: str):
     """?type=ip|domain|url|hash"""
-    ioc_type = request.args.get("type")
-    return _ok(_rw().get_group_iocs(group_name, ioc_type=ioc_type))
+    ioc_type = _arg("type", 20)
+    return _ok(_rw().get_group_iocs(_name(group_name), ioc_type=ioc_type))
 
 
 # ── Negotiations ───────────────────────────────────────────────────────────────
@@ -186,14 +220,16 @@ def rwlive_negotiation_groups():
 
 @rw_live_bp.route("/api/rwlive/negotiations/<group_name>")
 @require_login
+@heavy
 def rwlive_group_negotiations(group_name: str):
-    return _ok(_rw().get_group_negotiations(group_name))
+    return _ok(_rw().get_group_negotiations(_name(group_name)))
 
 
 @rw_live_bp.route("/api/rwlive/negotiations/<group_name>/<chat_id>")
 @require_login
+@heavy
 def rwlive_negotiation_chat(group_name: str, chat_id: str):
-    result = _rw().get_negotiation_chat(group_name, chat_id)
+    result = _rw().get_negotiation_chat(_name(group_name), _name(chat_id, "chat id"))
     if result is None:
         return _err("Chat not found or PRO key required", 404)
     return _ok(result)
@@ -206,7 +242,7 @@ def rwlive_negotiation_chat(group_name: str, chat_id: str):
 def rwlive_press_recent():
     """?country=ISO2  ?sea=1"""
     rw      = _rw()
-    country = request.args.get("country")
+    country = _arg("country", 20)
     if request.args.get("sea"):
         return _ok(rw.get_sea_press(limit=30))
     return _ok(rw.get_press_recent(country=country))
@@ -216,7 +252,7 @@ def rwlive_press_recent():
 @require_login
 def rwlive_press_all():
     """?country=ISO2"""
-    return _ok(_rw().get_press_all(country=request.args.get("country")))
+    return _ok(_rw().get_press_all(country=_arg("country", 20)))
 
 
 # ── Ransom Notes ───────────────────────────────────────────────────────────────
@@ -229,14 +265,16 @@ def rwlive_ransomnote_groups():
 
 @rw_live_bp.route("/api/rwlive/ransomnotes/<group_name>")
 @require_login
+@heavy
 def rwlive_group_ransomnotes(group_name: str):
-    return _ok(_rw().get_group_ransomnotes(group_name))
+    return _ok(_rw().get_group_ransomnotes(_name(group_name)))
 
 
 @rw_live_bp.route("/api/rwlive/ransomnotes/<group_name>/<note_name>")
 @require_login
+@heavy
 def rwlive_ransomnote_content(group_name: str, note_name: str):
-    content = _rw().get_ransomnote_content(group_name, note_name)
+    content = _rw().get_ransomnote_content(_name(group_name), _name(note_name, "note name"))
     if content is None:
         return _err("Note not found or PRO key required", 404)
     return Response(content, mimetype="text/plain")
@@ -252,8 +290,9 @@ def rwlive_yara_groups():
 
 @rw_live_bp.route("/api/rwlive/yara/<group_name>")
 @require_login
+@heavy
 def rwlive_group_yara(group_name: str):
-    content = _rw().get_group_yara(group_name)
+    content = _rw().get_group_yara(_name(group_name))
     if content is None:
         return _err("No YARA rules found", 404)
     return Response(content, mimetype="text/plain")
@@ -271,8 +310,9 @@ def rwlive_8k():
 
 @rw_live_bp.route("/api/rwlive/csirt/<country_code>")
 @require_login
+@heavy
 def rwlive_csirt(country_code: str):
-    return _ok(_rw().get_csirt(country_code))
+    return _ok(_rw().get_csirt(_name(country_code, "country code")))
 
 
 @rw_live_bp.route("/api/rwlive/csirt/sea/all")

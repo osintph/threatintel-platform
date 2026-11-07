@@ -2,7 +2,7 @@
 
 A self-hosted, open-source threat intelligence platform built for the Philippine and Southeast Asian security landscape. Crawls .onion networks, monitors Telegram channels, tracks ransomware groups, profiles threat actors, and delivers a daily intelligence digest — all from a single Docker Compose deployment.
 
-**Version: 1.2.0 · License: AGPL-3.0**
+**Version: 1.3.0 · License: AGPL-3.0**
 
 ---
 
@@ -37,6 +37,8 @@ A self-hosted, open-source threat intelligence platform built for the Philippine
 - **CSRF protection** — every request that changes something needs the session's token and, when the browser sends one, a matching `Origin`
 - **Sign-in throttling** — 10 wrong passwords per user name or 20 failures per address in 15 minutes lock sign-in for 15 minutes; 5 wrong codes lock the second step; a code works once
 - **Admin-only changes** — global settings, crawl control, deletes, user administration and Channel Monitor require the administrator role, checked on the server
+- **Content security policy** — dashboard pages run scripts from the application's own `/static/` only: no inline script, no inline event handlers, no third-party script hosts (the map library is served by the application)
+- **Bounded work** — heavy lookups run as background jobs with limits per user and in total (429 when full), keyword patterns are checked for catastrophic backtracking before they are saved, and page bodies are read up to a byte cap
 - **Escaped output** — the dashboard renders API data as text (no data in event handlers, URL schemes checked); PDF exports and the Channel Monitor report escape everything they did not write themselves
 - **No Tor control port** — the Tor container is a SOCKS client only and its configuration is rendered when it starts
 - **Non-root containers** — the app container runs as uid 1000 (appuser); the Tor sidecar runs as debian-tor
@@ -62,7 +64,9 @@ nginx answers only for the names it is configured with: a request for any other 
 
 The nginx entrypoint also generates the static website vhost when `WWW_DOMAIN` is set. That vhost serves the site's own `404.html` with status 404 for missing paths (no fallback to the home page) and permanently redirects the withdrawn Thai and German page URLs to their English pages. The config is generated when the container starts, so a change to `docker/nginx/entrypoint.sh` takes effect only after the nginx image is rebuilt.
 
-All external API calls (ransomware.live, ThreatFox, AbuseIPDB, VirusTotal, etc.) go over the clearnet. Only `.onion` crawling is Tor-routed.
+API calls to third-party services (ransomware.live, ThreatFox, AbuseIPDB, VirusTotal, etc.) go over the clearnet from the server's address. The crawler fetches `.onion` addresses only, and Quick Scan sends everything through Tor, including its clearnet sources (HTTPS, allowlisted hosts, no redirects).
+
+The database schema is versioned with Alembic; the dashboard brings it up to date when it starts (see [docs/runbook.md](docs/runbook.md#database-schema)).
 
 SQLAlchemy sessions are request-scoped via Flask `g` and torn down at request end, reducing connection pool pressure.
 
@@ -114,10 +118,12 @@ The script installs Docker, clones the repo, generates secrets (including the on
 ```bash
 cd ~/threatintel-platform
 sudo ./upgrade.sh            # tip of main
-sudo ./upgrade.sh v1.2.0     # or a release tag
+sudo ./upgrade.sh v1.3.0     # or a release tag
 ```
 
 `upgrade.sh` dumps the database first, checks out the release, fixes known `.env` issues (and removes settings that are no longer used, after keeping a copy), rebuilds the images from the lock file, recreates the containers one by one and ends by checking that nginx answers 200 for each site. Details and rollback: [docs/runbook.md](docs/runbook.md#upgrading).
+
+**Upgrading to 1.3.0:** the database schema is upgraded at the first start (the paste monitor tables and the OAuth columns are dropped; `upgrade.sh` dumps the database first); the paste monitor and the public `/api/digest/subscribe` and `/api/send-brief` endpoints are gone; Channel Monitor runs one job at a time and never asks Telegram for a login code; if its session is not signed in, a job ends with an error that names `make channel-monitor-auth`. See the upgrade notes in [CHANGELOG.md](CHANGELOG.md).
 
 **Upgrading to 1.2.0:** everyone signs in again; every account needs a second factor; Channel Monitor archives older than 90 days are deleted at the first start. See the upgrade notes in [CHANGELOG.md](CHANGELOG.md).
 
@@ -162,9 +168,10 @@ All configuration lives in `.env`. **Never commit this file.**
 |----------|-------------|
 | `TELEGRAM_API_ID` | From my.telegram.org/apps |
 | `TELEGRAM_API_HASH` | From my.telegram.org/apps |
-| `TELEGRAM_PHONE` | Your phone number with country code — required for Channel Monitor |
+| `TELEGRAM_PHONE` | Your phone number with country code — used by the one-time Channel Monitor sign-in (`make channel-monitor-auth`) |
 | `TELEGRAM_CHANNELS` | Comma-separated channel usernames (no @) — used by background scraper |
 | `CHANNEL_MONITOR_RETENTION_DAYS` | Channel Monitor archives are deleted after this many days (default `90`) |
+| `CHANNEL_MONITOR_MAX_*`, `CHANNEL_MONITOR_MIN_FREE_GB` | Limits of a Channel Monitor job: messages, file, video and job size, free disk, download size. See [TELEGRAM.md](TELEGRAM.md) |
 
 ### Quick Scan
 
@@ -173,6 +180,10 @@ All configuration lives in `.env`. **Never commit this file.**
 | `QUICK_SCAN_MAX_CONCURRENT` | `4` | Max concurrent source checks per scan session |
 | `QUICK_SCAN_DELAY_MIN` | falls back to `CRAWL_DELAY_MIN` (2s) | Min delay between source requests |
 | `QUICK_SCAN_DELAY_MAX` | falls back to `CRAWL_DELAY_MAX` (8s) | Max delay between source requests |
+
+### Limits and timeouts
+
+Optional; the defaults suit one server. `MAX_PAGE_BYTES` (page body cap), `TOR_CHECK_TIMEOUT`, `CRAWL_HEARTBEAT_SECONDS` and `CRAWL_STALE_SECONDS`, `HEAVY_JOBS_MAX` and `HEAVY_JOBS_PER_USER`, `FANOUT_WORKERS`, `UPSTREAM_CACHE_SECONDS`, `VIRUSTOTAL_PER_MINUTE`, `SMTP_TIMEOUT`, `ALERT_QUEUE_SIZE`, `ALERT_FLUSH_SECONDS`. Each is described in `.env.example`.
 
 See `.env.example` for all variables with descriptions and safe placeholder values.
 
@@ -185,7 +196,7 @@ source .venv/bin/activate
 pytest tests/ -v
 ```
 
-Current count: **595 passed, 2 skipped**. Tests cover:
+Current count: **801 passed, 2 skipped**. Tests cover:
 
 - Sign-in, sessions, CSRF, lockouts, the second factor and the setup token, against the real application
 - Authorization: every admin-only route as a non-admin, and deletes scoped to their project
@@ -194,11 +205,17 @@ Current count: **595 passed, 2 skipped**. Tests cover:
 - Channel Monitor report and routes (escaping, public-channel check, ownership, retention)
 - Outbound requests (allowlist, IP blocklist, pinned address, redirects, PDF text escaping)
 - Scanner, crawler, storage, Quick Scan, proxy routes, Tor client
+- Background job limits, the upstream cache, keyword pattern checks, crawl heartbeat and ownership, alert queue
+- Channel Monitor job states, limits and sign-in; the content security policy
+- Schema migrations (the revisions alone produce the models' schema, on SQLite and PostgreSQL)
 - Tor connectivity (skipped unless `TOR_INTEGRATION=1`)
 
 Set `TEST_DATABASE_URL` to run the integration tests on PostgreSQL instead of in-memory SQLite (the database is emptied before each test). CI does this, and also runs:
 
 ```bash
+tests/deploy/test_env_secrets.sh             # deploy.sh keeps secrets on a second run
+tests/upgrade/test_upgrade_steps.sh          # paste cron removal, schema step-back before a rollback
+tests/scripts/test_restore_test.sh           # restore test accepts a good dump, rejects a damaged one
 python tests/browser/xss_check.py            # dashboard pages in headless Chromium, hostile data in every API answer
 tests/nginx/test_entrypoint.sh <nginx image> # certificates survive restarts, unknown hosts refused
 tests/tor/test_entrypoint.sh <tor image>     # rendered torrc, no control port
@@ -231,7 +248,7 @@ Or via Docker Compose:
 docker compose up -d
 ```
 
-> The dashboard runs under gunicorn with one worker process (see `docker-compose.yml`). Keep it at one: crawl, Quick Scan and Channel Monitor state lives in that process.
+> The dashboard runs under gunicorn with one worker process (see `docker-compose.yml`). Keep it at one: job limits, the upstream cache, Quick Scan and Channel Monitor jobs live in that process. The crawl session's owner and heartbeat are in the database.
 
 ---
 
@@ -257,7 +274,8 @@ src/darkweb_scanner/
   threat_actors.py       # threat actor profile data
   telegram_scraper.py    # background Telegram channel scraper
   channel_monitor.py     # on-demand Telegram channel monitor
-  paste_monitor.py       # rentry.co paste polling
+  regex_safety.py        # checks keyword patterns before they are used
+  migrations/            # Alembic revisions of the database schema
   auth.py                # sessions, CSRF, lockouts, bcrypt, TOTP
   pdf_text.py            # escaping for text placed in PDF exports
   templates/             # Channel Monitor report template
@@ -271,6 +289,12 @@ src/darkweb_scanner/
     channel_monitor_routes.py  # Channel Monitor API + job runner
     quick_scan_routes.py       # /api/quick-scan/* blueprint
     storage_helper.py    # request-scoped Storage singleton
+    jobs.py              # background jobs, limits, shared fan-out pool
+    upstream_cache.py    # cache for third-party answers
+    file_store.py        # locked updates of the keyword and seed files
+    errors.py            # error answers with an error id
+    security_headers.py  # content security policy, static file caching
+    static/              # dashboard scripts and the vendored map library
     templates/
       index.html         # single-page dashboard UI
       help.html          # Help & privacy page
@@ -296,6 +320,8 @@ make check-tor     # verify Tor connectivity
 make stats         # show scan statistics
 make hits          # show recent keyword hits
 make users         # list accounts and sign-in locks
+make db-status     # database schema revision
+make channel-monitor-auth  # sign the Channel Monitor session in (once)
 make logs          # tail all container logs
 make stop          # stop all containers
 ```

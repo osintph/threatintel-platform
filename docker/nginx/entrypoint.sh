@@ -82,7 +82,7 @@ warn_damaged_lineages() {
     [[ -n "$d" ]] || continue
     lineage_damaged "$d" || continue
     log "WARNING: the certificate files for $d were overwritten by an older version of this script."
-    log "WARNING: repair with: docker compose exec nginx certbot renew --cert-name $d --force-renewal && docker compose exec nginx nginx -s reload"
+    log "WARNING: repair with: docker compose exec nginx certbot renew --cert-name $d --force-renewal --no-random-sleep-on-renew && docker compose exec nginx nginx -s reload"
   done
   return 0
 }
@@ -171,8 +171,8 @@ server {
     # The container healthcheck endpoint is not for the outside.
     location = /healthz { return 404; }
 
-    # Sign-in and public endpoints: 10 requests a minute per visitor, short bursts allowed.
-    location ~ ^/(login|register|totp/verify|totp/setup|api/digest/subscribe|api/send-brief)\$ {
+    # Sign-in steps: 10 requests a minute per visitor, short bursts allowed.
+    location ~ ^/(login|register|totp/verify|totp/setup)\$ {
         limit_req zone=login burst=10 nodelay;
         proxy_pass \$dashboard;
 $(proxy_headers)

@@ -8,10 +8,14 @@ Run inside the application image, which has Flask, playwright and Chromium
     python tests/browser/xss_check.py
 
 The script does not start the real application and does not sign in. It serves
-the two page templates from a small Flask app, answers every /api/ call with
-fixtures in which every string a third party could influence is a hostile
+the two page templates and the static files from a small Flask app, with the
+response headers of the real application (``init_security_headers``: the
+Content-Security-Policy with ``script-src 'self'``), answers every /api/ call
+with fixtures in which every string a third party could influence is a hostile
 value, opens every tab and sub-view, and checks that
 
+  * the browser reports no violation of the policy and logs no error: no
+    inline script, no inline event handler, nothing loaded from another host;
   * no value from the data ran as script, became an element, an attribute or an
     event handler, or ended up as a javascript: link;
   * the values are on the page as plain text;
@@ -19,12 +23,18 @@ value, opens every tab and sub-view, and checks that
   * every write request carries the CSRF token, signing out is a POST form,
     an expired session leads to the sign-in page, and "admin required" is
     reported as "Admin only";
+  * an API answer that is not a success is shown with the server's text and
+    its error id, and the polls (crawl, Channel Monitor, quick scan) stop
+    with a reason;
   * a non-admin does not get the admin-only controls.
 
 The markers are inert: they set ``window.__xss`` or add a ``data-audit-*``
 attribute, nothing else.
 
-XSS_CHECK_TEMPLATES=<dir> points the script at another copy of the templates.
+XSS_CHECK_TEMPLATES=<dir> points the script at another copy of the templates
+(static files are then served from ``<dir>/../static`` when that exists). The
+policy is the current one either way, so a run against the templates of an
+older release shows what the policy would have blocked there.
 Exit status: 0 when every check passes, 1 otherwise.
 """
 
@@ -37,15 +47,25 @@ import threading
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 from playwright.sync_api import sync_playwright
 from werkzeug.serving import make_server
 
 REPO = Path(__file__).resolve().parents[2]
+# The headers come from this checkout, not from the copy inside the image.
+sys.path.insert(0, str(REPO / "src"))
+from darkweb_scanner import __version__  # noqa: E402
+from darkweb_scanner.dashboard.security_headers import (  # noqa: E402
+    CONTENT_SECURITY_POLICY,
+    STATIC_CACHE_CONTROL,
+    init_security_headers,
+)
+
 TEMPLATES = Path(
     os.environ.get("XSS_CHECK_TEMPLATES")
     or REPO / "src" / "darkweb_scanner" / "dashboard" / "templates"
 )
+STATIC = TEMPLATES.parent / "static"
 CSRF = "csrf-fixture-token"
 
 # ── Hostile values ─────────────────────────────────────────────────────────────
@@ -238,14 +258,22 @@ FIXTURES = {
         "total_hits": 2,
         "top_keywords": [{"keyword": X("topkw"), "count": 2}, {"keyword": CALL, "count": 1}],
     },
-    "crawl/status": {"active": False},
+    "crawl/status": {
+        "active": False,
+        "session": None,
+        "stats": {},
+        "last_session": {
+            "id": 7,
+            "status": "failed",
+            "started_at": WHEN,
+            "ended_at": WHEN,
+            "error": X("crawl-err"),
+        },
+    },
     "sessions": [SESSION],
     "keywords": {"categories": {X("cat"): [X("kw"), CALL]}},
     ("POST", "keywords/generate"): {"ok": True, "keywords": {X("gen-cat"): [X("gen-kw")]}},
     "seeds": {"seeds": [X("seed"), CALL]},
-    "seeds/clearnet": {"seeds": [X("cseed"), CALL]},
-    "seeds/paste": {"sources": [X("psrc"), CALL]},
-    "telegram/channels": {"channels": [X("chan"), CALL]},
     "admin/auth-events": [
         {
             "ts": WHEN,
@@ -282,36 +310,11 @@ FIXTURES = {
             "last_login": None,
         },
     ],
-    "paste/stats": {
-        "total_hits": 1,
-        "total_scanned": 1,
-        "total_with_hits": 1,
-        "by_source": [{"source": X("paste-stat"), "count": 1}],
-    },
-    "paste/hits": [
-        {
-            "matched_pattern": X("paste-pat"),
-            "matched_value": X("paste-val"),
-            "source": X("paste-src"),
-            "url": JS_URL,
-            "context": X("paste-ctx"),
-            "found_at": WHEN,
-        },
-        {
-            "matched_pattern": "ph_mobile",
-            "matched_value": "x",
-            "source": "pastebin",
-            "url": X("paste-url"),
-            "context": "x",
-            "found_at": WHEN,
-        },
-    ],
     "projects": [PROJECT],
     "settings/profile": {
         "username": X("me"),
         "email": X("me-mail"),
         "is_admin": True,
-        "oauth_provider": X("oauth"),
         "last_login": WHEN,
         "totp_enabled": True,
     },
@@ -336,11 +339,52 @@ FIXTURES = {
         dict(DNS_ROW, id=1, domain=X("dns")),
         dict(DNS_ROW, id=2, domain=X("dns2")),
     ],
-    "channel-monitor/credentials": {"configured": True},
+    "channel-monitor/credentials": {
+        "configured": True,
+        "limits": {"max_messages": 5000, "max_video_mb": 200, "max_file_mb": 100, "max_job_gb": 2},
+    },
+    # One job per status the page knows, one with a status it does not know.
     "channel-monitor/jobs": [
         {"id": "job1", "channel": X("cm"), "started_at": WHEN, "status": "completed"},
-        {"id": CALL, "channel": X("cm2"), "started_at": WHEN, "status": "error"},
+        {
+            "id": CALL,
+            "channel": X("cm2"),
+            "started_at": WHEN,
+            "status": "error",
+            "error": X("cm-err"),
+        },
+        {"id": "job-int", "channel": X("cm3"), "started_at": WHEN, "status": "interrupted"},
+        {"id": "job-arch", "channel": X("cm4"), "started_at": None, "status": "archived"},
+        {"id": "job-odd", "channel": X("cm5"), "started_at": WHEN, "status": X("cm-status")},
+        {"id": "job-run", "channel": X("cm6"), "started_at": WHEN, "status": "running"},
     ],
+    "channel-monitor/jobs/job1": {
+        "channel": X("cm"),
+        "log": [X("cm-log")],
+        "total": 1,
+        "status": "completed",
+    },
+    "channel-monitor/jobs/job-int": {
+        "channel": X("cm3"),
+        "log": [X("cm-int-log")],
+        "status": "interrupted",
+        "error": X("cm-int-err"),
+    },
+    # An archive from before this release: no log, no details.
+    "channel-monitor/jobs/job-arch": {"channel": X("cm4"), "status": "archived"},
+    "channel-monitor/jobs/job-odd": {"channel": X("cm5"), "log": [], "status": X("cm-status")},
+    "channel-monitor/jobs/job-run": {
+        "channel": X("cm6"),
+        "log": [X("cm-run-log")],
+        "status": "running",
+    },
+    "channel-monitor/jobs/job-new/log": {
+        "status": "completed",
+        "log": [X("cm-new-log")],
+        "total": 1,
+    },
+    ("POST", "channel-monitor/start"): {"ok": True, "job_id": "job-new"},
+    ("POST", "crawl/start"): {"ok": True},
     "rwlive/stats": {
         "ok": True,
         "data": {"stats": {"groups": 1, "victims": 1, "press": 1}, "last_update": WHEN},
@@ -530,9 +574,16 @@ PATTERNS = [
             ],
         },
     ),
+    # The job whose id is the hostile value CALL.
     (
         r"channel-monitor/jobs/.+",
-        {"channel": X("cm"), "log": [X("cm-log")], "total": 1, "status": "completed"},
+        {
+            "channel": X("cm2"),
+            "log": [X("cm2-log")],
+            "total": 1,
+            "status": "error",
+            "error": X("cm-err"),
+        },
     ),
     (
         r"osint/github/.+",
@@ -661,12 +712,41 @@ PATTERNS = [
 
 # ── The stub application ───────────────────────────────────────────────────────
 
-app = Flask(__name__, template_folder=str(TEMPLATES))
+app = Flask(
+    __name__,
+    template_folder=str(TEMPLATES),
+    static_folder=str(STATIC) if STATIC.is_dir() else None,
+    static_url_path="/static",
+)
 app.jinja_env.globals["csrf_token"] = lambda: CSRF
+# The same after_request hook and asset_url() helper as the real application.
+init_security_headers(app)
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 writes = []  # every request to /api/ that is not a GET
 missing = set()  # GET paths without a fixture
+asked = []  # every /api/ path that was requested
+asked_queries = []  # the same, as (path, query string)
+provoked = set()  # paths the stub answered with an error status on purpose
+# (METHOD, path) -> (status, body): set by a step that wants one answer to be an error.
+overrides = {}
+# (METHOD, path) -> answers in order, the last one repeated: a poll that is
+# answered first and then meets an error.
+SEQUENCES = {
+    ("GET", "channel-monitor/jobs/job-run/log"): [
+        (200, {"status": "running", "log": [X("cm-live")], "total": 2}),
+        (404, {"error": "Job not found"}),
+    ],
+    ("GET", "quick-scan/status/2"): [
+        (200, {"status": "running", "urls_visited": 1, "findings_count": 0, "error_message": None}),
+        (500, {"error": X("qs-stop"), "error_id": "0f0f0f0f"}),
+    ],
+}
+served = {}  # (METHOD, path) -> how many times a sequence was asked
+# Paths of the features removed in v1.3.0: the page must not ask for them.
+REMOVED = re.compile(
+    r"paste(/|$)|seeds/(clearnet|paste)|telegram/channels|digest/subscribe$|send-brief|dns/investigations/[^/]+/scan"
+)
 
 
 @app.route("/")
@@ -702,10 +782,28 @@ def api(path):
                 "body": request.get_data(as_text=True),
             }
         )
+    asked.append(path)
+    asked_queries.append((path, request.query_string.decode()))
     if path == "audit-401":
+        provoked.add(path)
         return jsonify({"error": "unauthorized"}), 401
     if path == "audit-403":
+        provoked.add(path)
         return jsonify({"error": "admin required"}), 403
+    if (request.method, path) in overrides:
+        status, body = overrides[(request.method, path)]
+        provoked.add(path)
+        if isinstance(body, str):
+            return Response(body, status=status, mimetype="text/html")
+        return jsonify(body), status
+    if (request.method, path) in SEQUENCES:
+        answers = SEQUENCES[(request.method, path)]
+        n = served.get((request.method, path), 0)
+        served[(request.method, path)] = n + 1
+        status, body = answers[min(n, len(answers) - 1)]
+        if status != 200:
+            provoked.add(path)
+        return jsonify(body), status
     for key in ((request.method, path), path):
         if key in FIXTURES:
             return jsonify(FIXTURES[key])
@@ -790,9 +888,33 @@ class Checker:
                 self.fail(where, f"value not shown as text: {value!r}")
 
     # Ways to drive the page. ``js_click`` reaches elements whatever their
-    # visibility and triggers inline handlers and delegated listeners alike.
+    # visibility and triggers the delegated listeners. A control names its
+    # function in data-act and its arguments in data-args; the second half of
+    # each selector is the markup before v1.3.0 (inline handlers), so that a
+    # run against an older copy still presses the same buttons.
     def tab(self, name):
-        return lambda: self.page.click(f"button.nav-tab[onclick*=\"'{name}'\"]")
+        return lambda: self.page.click(
+            f"button.nav-tab[data-args='[\"{name}\"]'], button.nav-tab[onclick*=\"'{name}'\"]"
+        )
+
+    def osint_tab(self, tool):
+        self.page.click(
+            f"button.osint-sub-tab[data-args='[\"{tool}\"]'], button.osint-sub-tab[onclick*=\"'{tool}'\"]"
+        )
+
+    def toast(self):
+        return self.page.evaluate("() => document.getElementById('toast').textContent")
+
+    def expect_toast(self, where, text):
+        shown = self.toast()
+        if shown != text:
+            self.fail(where, f"the toast shows {shown!r}, not {text!r}")
+
+    def text_of(self, selector):
+        return self.page.evaluate(
+            "selector => (document.querySelector(selector) || {textContent: ''}).textContent",
+            selector,
+        )
 
     def js_click(self, selector, skip_text=None):
         def run():
@@ -814,7 +936,7 @@ class Checker:
 
     def lookup(self, tool, value, button="button.btn-primary"):
         def run():
-            self.page.click(f"button.osint-sub-tab[onclick*=\"'{tool}'\"]")
+            self.osint_tab(tool)
             self.page.fill(f"#osint-{tool}-input", value)
             self.page.click(f"#osint-{tool} {button}")
 
@@ -853,8 +975,25 @@ def check_dashboard(c, base):
             X("press-src"),
         ],
     )
+    # A row built by the script leads to another tab.
+    c.step("home: group row", c.js_click("#hdGroupFeed .hd-group-row"))
+    if not page.evaluate(
+        "() => document.getElementById('panel-ransomware').classList.contains('active')"
+    ):
+        c.fail("home: group row", "the row did not open the Ransomware tab")
 
-    c.step("crawls", c.tab("dashboard"), [X("topkw"), CALL])
+    # REL-4: how the last crawl ended is on the card, with the server's text.
+    c.step("crawls", c.tab("dashboard"), [X("topkw"), CALL, "Last crawl failed", X("crawl-err")])
+    # A refused start shows the server's text; a start that worked polls the status.
+    overrides[("POST", "crawl/start")] = (409, {"error": X("crawl-409")})
+    c.step("crawls: start refused", c.js_click("#crawlBtn"))
+    c.expect_toast("crawls: start refused", X("crawl-409"))
+    del overrides[("POST", "crawl/start")]
+    polls = asked.count("crawl/status")
+    c.step("crawls: start", c.js_click("#crawlBtn"))
+    c.expect_toast("crawls: start", "Crawl started.")
+    if asked.count("crawl/status") <= polls:
+        c.fail("crawls: start", "the crawl status was not asked for after the start")
     c.step("crawls: keyword pills", c.js_click("#topKeywords .kw-pill"))
     c.step(
         "crawls: session hits",
@@ -873,24 +1012,31 @@ def check_dashboard(c, base):
         )
 
     c.step("keywords: generator", generate, [X("gen-cat"), X("gen-kw")])
+    c.step(
+        "keywords: generated, select none and all", c.js_click("#genResults button.btn-secondary")
+    )
+    c.step("keywords: generated, toggle one", c.js_click("#genResults .gen-kw-item"))
+
+    # The project dropdown reads the list GET /api/projects answers with.
+    c.step("keywords: project scope", c.js_click("#kwProjectScope"))
+    options = page.evaluate(
+        "() => [...document.querySelectorAll('#kwProjectSelect option')].map(o => o.textContent)"
+    )
+    if options != [X("proj")]:
+        c.fail("keywords: project scope", f"the project dropdown holds {options!r}")
+    c.step("keywords: search", lambda: page.fill("#keywordSearch", "kw"), [X("kw")])
 
     c.step("seeds", c.tab("seeds"), [X("seed")])
-    c.step("seeds: sub-tabs", c.js_click(".seeds-tab-btn"), [X("cseed"), X("psrc"), X("chan")])
     c.step(
-        "seeds: remove",
-        c.js_click(
-            "#seedsList button, #clearnetSeedsList button, #pasteSourcesList button, #channelsList button"
-        ),
+        "seeds: sub-tabs",
+        c.js_click(".seeds-tab-btn"),
+        ["reads its channels from TELEGRAM_CHANNELS in .env"],
     )
-    for path, field in (
-        ("/api/seeds", "seed"),
-        ("/api/seeds/clearnet", "cseed"),
-        ("/api/seeds/paste", "psrc"),
-    ):
-        c.expect_write("seeds: remove", "DELETE", path, X(field))
-        c.expect_write("seeds: remove", "DELETE", path, CALL)
-    c.expect_write("seeds: remove", "DELETE", "/api/telegram/channels", X("chan"))
-    c.expect_write("seeds: remove", "DELETE", "/api/telegram/channels", CALL)
+    if page.evaluate("() => document.querySelectorAll('.seeds-tab-btn').length") != 2:
+        c.fail("seeds: sub-tabs", "expected the two sub-tabs Onion Seeds and Telegram")
+    c.step("seeds: remove", c.js_click("#seedsList button"))
+    c.expect_write("seeds: remove", "DELETE", "/api/seeds", X("seed"))
+    c.expect_write("seeds: remove", "DELETE", "/api/seeds", CALL)
 
     c.step(
         "users",
@@ -957,7 +1103,14 @@ def check_dashboard(c, base):
             ]
             + [X(key + "-hkw"), X(key + "-hurl"), X(key + "-hctx")],
         )
-        c.step(name + ": close detail", lambda: page.evaluate("() => closeIntelModalDirect()"))
+        # A click inside the detail keeps it open; a click on the overlay around it closes it.
+        is_open = "() => document.getElementById('intelDetailOverlay').classList.contains('open')"
+        c.step(name + ": click inside the detail", c.js_click("#intelDetailModal"))
+        if not page.evaluate(is_open):
+            c.fail(name + ": detail", "a click inside the detail closed it")
+        c.step(name + ": close detail", c.js_click("#intelDetailOverlay"))
+        if page.evaluate(is_open):
+            c.fail(name + ": detail", "a click on the overlay did not close the detail")
         c.step(name + ": delete", c.js_click(grid + " .intel-card button"))
         c.expect_write(name + ": delete", "DELETE", key + "-slug")
 
@@ -976,18 +1129,8 @@ def check_dashboard(c, base):
         [X("ph-kw"), X("ph-on"), X("ph-val"), X("ph-ctx")],
     )
 
-    c.step(
-        "paste",
-        c.tab("paste"),
-        [
-            X("paste-stat"),
-            X("paste-pat"),
-            X("paste-val"),
-            X("paste-src"),
-            X("paste-ctx"),
-            X("paste-url"),
-        ],
-    )
+    if page.evaluate("() => !!document.querySelector('#panel-paste, [data-args*=\"paste\"]')"):
+        c.fail("paste", "the Paste Monitor tab is still on the page")
 
     c.step("dns", c.tab("dns"), [X("dns"), X("dns2")])
     c.step("dns: result", c.js_click("#dnsContent > div > div:nth-child(1)"))
@@ -1007,16 +1150,42 @@ def check_dashboard(c, base):
         ]
         + [X("svc"), X("de-target"), X("de-path"), X("txt"), X("ptr"), X("san"), X("cert-san")],
     )
-    c.step("dns: back to the list", c.tab("dns"))
+    # The world map and its library come from /static/ and run under the policy.
+    c.step(
+        "dns: graph reset, section headers, copy",
+        c.js_click(
+            "#dnsContent [data-act='dnsResetGraph'], #dnsContent .is-hdr, #dnsContent [data-act='copyCertSANs']"
+        ),
+    )
+    c.step(
+        "dns: refresh certificates",
+        c.js_click("#dnsContent [data-act='dnsRefreshCerts']"),
+        [X("san")],
+    )
+    if page.evaluate("() => typeof jsVectorMap") != "function":
+        c.fail("dns: map", "the map library did not load from /static/vendor/jsvectormap")
+    elif not page.evaluate("() => !!document.querySelector('#infra-world-map svg')"):
+        c.fail("dns: map", "the world map was not drawn")
+    c.step(
+        "dns: back to the list", c.js_click("#dnsContent [data-act='showDNSHistory']"), [X("dns2")]
+    )
     c.step(
         "dns: result without a scan",
         c.js_click("#dnsContent > div > div:nth-child(2)"),
-        ["Probes " + X("dns2")],
+        [
+            "There are no port scan results for " + X("dns2") + ".",
+            "There are no directory scan results for " + X("dns2") + ".",
+        ],
     )
+    if page.evaluate(
+        "() => [...document.querySelectorAll('#dnsContent button')].some(b => /scan|enum/i.test(b.textContent))"
+    ):
+        c.fail(
+            "dns: result without a scan",
+            "a button that starts a port or directory scan is on the page",
+        )
 
-    c.step("channel monitor", c.tab("channelmonitor"), [X("cm"), X("cm2")])
-    c.step("channel monitor: log and delete", c.js_click("#cmJobsTable button", skip_text="ZIP"))
-    c.expect_write("channel monitor: delete", "DELETE", "/api/channel-monitor/jobs/job1")
+    check_channel_monitor(c)
 
     c.step("reports", c.tab("reports"), [X("sub-mail"), ATTR_SQ, ATTR_DQ, CALL])
     c.step("reports: remove subscribers", c.js_click("#subscribersList button"))
@@ -1044,10 +1213,11 @@ def check_dashboard(c, base):
         [X("rdap-name"), X("rdap-reg"), X("rdap-ns"), X("crt-name")],
     )
     c.step("osint: email", c.lookup("email", "alice@example.com"))
-    c.step("osint: resources", lambda: page.click("button.osint-sub-tab[onclick*=\"'resources'\"]"))
+    c.step("osint: resources", lambda: c.osint_tab("resources"))
 
-    c.step("settings", c.tab("settings"), [X("me"), X("me-mail"), X("oauth")])
+    c.step("settings", c.tab("settings"), [X("me"), X("me-mail")])
 
+    check_errors(c)
     check_shell(c, "dashboard")
 
     # "admin required" is reported, an ended session goes to the sign-in page.
@@ -1068,6 +1238,206 @@ def check_dashboard(c, base):
         page.wait_for_url(re.compile(r"/login\?next=%2Fdashboard$"), timeout=4000)
     except Exception:
         c.fail("dashboard", "401 from the API does not lead to /login?next=<current path>")
+
+
+def check_channel_monitor(c):
+    """REL-1: heading, badge, note and download button follow the job's status."""
+    page = c.page
+    unknown = "Finished (" + X("cm-status") + ")"
+
+    def state():
+        return page.evaluate(
+            """() => ({
+              heading: document.getElementById('cmActiveState').textContent,
+              badge: document.getElementById('cmStatusBadge').textContent,
+              note: document.getElementById('cmStatusNote').textContent,
+              download: document.getElementById('cmDownloadBtn').style.display !== 'none',
+              log: document.getElementById('cmLogBox').textContent,
+            })"""
+        )
+
+    def view(job_id):
+        def run():
+            clicked = page.evaluate(
+                """id => {
+                  const els = [...document.querySelectorAll("#cmJobsTable [data-act='cmViewJob']")]
+                    .filter(e => JSON.parse(e.dataset.args)[0] === id);
+                  els.forEach(e => e.click());
+                  return els.length;
+                }""",
+                job_id,
+            )
+            if clicked != 1:
+                raise RuntimeError(f"{clicked} Log buttons for job {job_id!r}")
+
+        return run
+
+    def expect_state(where, label, download, note_part=""):
+        got = state()
+        if got["heading"] != label or got["badge"] != label:
+            c.fail(
+                where, f"heading {got['heading']!r} and badge {got['badge']!r}, expected {label!r}"
+            )
+        if got["download"] != download:
+            c.fail(where, "the download button is " + ("shown" if got["download"] else "hidden"))
+        if note_part not in got["note"]:
+            c.fail(where, f"the note is {got['note']!r}, expected {note_part!r} in it")
+        return got
+
+    c.step(
+        "channel monitor",
+        c.tab("channelmonitor"),
+        [
+            X("cm"),
+            X("cm2"),
+            "✓ Completed",
+            "✗ Error",
+            "✗ Interrupted",
+            "Archived",
+            unknown,
+            "⏳ Running",
+        ]
+        + [
+            "Limits of one job: 5,000 messages, a video up to 200 MB, any other file up to 100 MB, 2 GB in total."
+        ],
+    )
+    bounds = page.evaluate(
+        "() => [document.getElementById('cmLimit').max, document.getElementById('cmMaxVideo').max, !!document.getElementById('cmMinSpace')]"
+    )
+    if bounds != ["5000", "200", False]:
+        c.fail("channel monitor", f"form bounds and fields: {bounds!r}")
+
+    c.step("channel monitor: completed job", view("job1"), [X("cm-log")])
+    expect_state("channel monitor: completed job", "✓ Completed", True)
+    c.step("channel monitor: failed job", view(CALL), [X("cm2-log"), X("cm-err")])
+    expect_state("channel monitor: failed job", "✗ Error", True, X("cm-err"))
+    c.step("channel monitor: interrupted job", view("job-int"), [X("cm-int-log"), X("cm-int-err")])
+    expect_state("channel monitor: interrupted job", "✗ Interrupted", True, X("cm-int-err"))
+    c.step("channel monitor: archive from an older release", view("job-arch"))
+    expect_state("channel monitor: archive", "Archived", True, "Archive from before this release")
+    c.step("channel monitor: status the page does not know", view("job-odd"), [unknown])
+    expect_state("channel monitor: unknown status", unknown, True)
+
+    # A running job: the log is polled, the first answer brings a line, the next
+    # one is 404 (the application restarted). The poll stops and says why.
+    log_path = "channel-monitor/jobs/job-run/log"
+    c.step("channel monitor: running job", view("job-run"), [X("cm-run-log")])
+    expect_state("channel monitor: running job", "⏳ Running", False)
+    try:
+        page.wait_for_function(
+            "() => document.getElementById('cmLogBox').textContent.includes('Log updates stopped')",
+            timeout=9000,
+        )
+    except Exception:
+        c.fail("channel monitor: poll", "the log poll did not stop on a 404 answer")
+    c.step(
+        "channel monitor: poll stopped",
+        expect=[X("cm-live"), "Log updates stopped: the server no longer knows this job"],
+    )
+    expect_state("channel monitor: poll stopped", "Status not known", False, "Log updates stopped")
+    polls = asked.count(log_path)
+    page.wait_for_timeout(3500)
+    if asked.count(log_path) != polls or polls != 2:
+        c.fail(
+            "channel monitor: poll",
+            f"the log was asked for {asked.count(log_path)} times, expected 2 and then silence",
+        )
+
+    # Start: a refusal (another job is running) shows the server's text; the
+    # request says whether to translate and no longer carries min_space_gb.
+    def start(translate):
+        def run():
+            page.fill("#cmChannel", "@example_channel")
+            page.evaluate(
+                "on => { document.getElementById('cmTranslate').checked = on; }", translate
+            )
+            page.evaluate("() => document.getElementById('cmStartBtn').click()")
+
+        return run
+
+    if not page.evaluate("() => document.getElementById('cmTranslate').defaultChecked"):
+        c.fail("channel monitor: start", "translation is not on by default")
+    overrides[("POST", "channel-monitor/start")] = (409, {"error": X("cm-409")})
+    c.step("channel monitor: start refused", start(False), ["sent to translate.google.com"])
+    c.expect_toast("channel monitor: start refused", X("cm-409"))
+    del overrides[("POST", "channel-monitor/start")]
+    c.step("channel monitor: start", start(True))
+    sent = [json.loads(w["body"]) for w in writes if w["path"] == "/api/channel-monitor/start"]
+    if [s.get("translate") for s in sent] != [False, True]:
+        c.fail(
+            "channel monitor: start",
+            f"translate was sent as {[s.get('translate') for s in sent]!r}",
+        )
+    if any("min_space_gb" in s for s in sent) or any(
+        s.get("channel") != "example_channel" for s in sent
+    ):
+        c.fail("channel monitor: start", f"unexpected start request: {sent!r}")
+    try:
+        page.wait_for_function(
+            "() => document.getElementById('cmActiveState').textContent === '✓ Completed'",
+            timeout=6000,
+        )
+    except Exception:
+        c.fail("channel monitor: start", "the panel did not follow the new job to its end")
+    c.step("channel monitor: started job finished", expect=[X("cm-new-log")])
+    expect_state("channel monitor: started job finished", "✓ Completed", True)
+
+    c.step("channel monitor: delete", c.js_click("#cmJobsTable [data-act='cmDeleteJob']"))
+    c.expect_write("channel monitor: delete", "DELETE", "/api/channel-monitor/jobs/job1")
+    if page.evaluate(
+        "() => !!document.querySelector(\"#cmJobsTable [data-act='cmDeleteJob'][data-args*='job-run']\")"
+    ):
+        c.fail("channel monitor: delete", "a running job has a delete button")
+
+
+def check_errors(c):
+    """An API answer that is not a success is shown: the server's text and its error id."""
+    page = c.page
+    with_id = X("boom") + " (error id ab12cd34)"
+
+    # A list that cannot be loaded says why, in its own place and as a toast.
+    overrides[("GET", "investigations")] = (500, {"error": X("boom"), "error_id": "ab12cd34"})
+    c.step("errors: list", c.tab("investigations"), [with_id])
+    c.expect_toast("errors: list", with_id)
+    if c.text_of("#investigationsList") != with_id:
+        c.fail("errors: list", f"the list shows {c.text_of('#investigationsList')!r}")
+    del overrides[("GET", "investigations")]
+
+    # 429 from a heavy lookup, started with the Enter key.
+    overrides[("POST", "ip-investigations")] = (429, {"error": X("slow")})
+
+    def lookup():
+        c.tab("iplookup")()
+        page.fill("#ipInput", "192.0.2.7")
+        page.press("#ipInput", "Enter")
+
+    c.step("errors: 429", lookup)
+    c.expect_toast("errors: 429", X("slow"))
+    c.expect_write("errors: 429", "POST", "/api/ip-investigations", "192.0.2.7")
+    del overrides[("POST", "ip-investigations")]
+
+    # An answer that is not JSON (a proxy's error page).
+    overrides[("POST", "ransomware/add-seeds")] = (502, "<html><body>Bad Gateway</body></html>")
+    c.step("errors: not JSON", c.js_click("[data-act='addRansomwareSeeds']"))
+    c.expect_toast("errors: not JSON", "The server answered with an error (502)")
+    del overrides[("POST", "ransomware/add-seeds")]
+
+    # A failed write is not reported as a success.
+    overrides[("DELETE", "dns/investigations/1")] = (
+        500,
+        {"error": X("no-delete"), "error_id": "00ff00ff"},
+    )
+    c.step("errors: failed delete, list", c.tab("dns"), [X("dns")])
+    c.step("errors: failed delete", c.nth("#dnsContent [data-act='deleteDNS']", 0))
+    c.expect_toast("errors: failed delete", X("no-delete") + " (error id 00ff00ff)")
+    del overrides[("DELETE", "dns/investigations/1")]
+
+    # No answer at all.
+    provoked.add("threat-actors/add-keywords")
+    page.route("**/api/threat-actors/add-keywords", lambda route: route.abort())
+    c.step("errors: no answer", c.js_click("[data-act='addThreatActorKeywords']"))
+    c.expect_toast("errors: no answer", "Network error: no answer from the server")
+    page.unroute("**/api/threat-actors/add-keywords")
 
 
 def check_shell(c, where):
@@ -1106,20 +1476,16 @@ def check_roles(c, base):
     page.goto(base + "/dashboard?admin=0")
     c.settle()
     visits = [
-        (None, ["button.nav-tab[onclick*=\"'channelmonitor'\"]", "#tab-users", "#crawlBtn"]),
-        ("keywords", ["#keywordsList button", 'input[onchange="importKeywords(this)"]']),
+        (None, ["button.nav-tab[data-args='[\"channelmonitor\"]']", "#tab-users", "#crawlBtn"]),
+        ("keywords", ["#keywordsList button", 'input[data-act-change="importKeywords"]']),
         (
             "seeds",
-            [
-                "#seedsList button",
-                'button[onclick="addSeed()"]',
-                "button[onclick=\"bulkAddSeeds('onion')\"]",
-            ],
+            ["#seedsList button", 'button[data-act="addSeed"]', 'button[data-act="bulkAddSeeds"]'],
         ),
         ("investigations", ["#investigationsList button"]),
         ("iplookup", ["#ipInvestigationsList button"]),
         ("dns", ["#dnsContent button"]),
-        ("reports", ["#digestSendBtn", 'button[onclick="addSubscriber()"]']),
+        ("reports", ["#digestSendBtn", 'button[data-act="addSubscriber"]']),
     ]
     for name, selectors in visits:
         where = "non-admin: " + (name or "header")
@@ -1131,6 +1497,12 @@ def check_roles(c, base):
                 continue
             c.settle()
         for selector in selectors:
+            if not page.evaluate("selector => !!document.querySelector(selector)", selector):
+                c.fail(
+                    where,
+                    f"nothing matches {selector}: the check looks for a control that is not there",
+                )
+                continue
             shown = page.evaluate(
                 """selector => [...document.querySelectorAll(selector)].some(e => {
                   const target = e.type === 'file' ? e.closest('label') || e : e;
@@ -1160,6 +1532,45 @@ def check_quick_scan(c, base):
 
     c.step("quick scan: start", start)
     c.expect_write("quick scan: start", "POST", "/api/quick-scan/start", "example.com")
+    c.step("quick scan: high-signal filter", c.js_click("#qs-hi-only"))
+    if not any(
+        p.startswith("quick-scan/findings/") and "high_signal_only=1" in q for p, q in asked_queries
+    ):
+        c.fail(
+            "quick scan: high-signal filter",
+            "the findings were not asked for again with the filter",
+        )
+    c.step(
+        "quick scan: refresh sessions", c.js_click("[data-act='loadSessions']"), [X("qs-target")]
+    )
+
+    # A refused start shows the server's text.
+    overrides[("POST", "quick-scan/start")] = (409, {"error": X("qs-409")})
+    c.step("quick scan: start refused", start)
+    c.expect_toast("quick scan: start refused", X("qs-409"))
+    del overrides[("POST", "quick-scan/start")]
+
+    # A running scan whose status can no longer be read: the poll stops and says why.
+    status_path = "quick-scan/status/2"
+    FIXTURES[("POST", "quick-scan/start")] = {"session_id": 2}
+    c.step("quick scan: start, then the status fails", start)
+    stopped = "Status updates stopped: " + X("qs-stop") + " (error id 0f0f0f0f)"
+    try:
+        page.wait_for_function(
+            "text => document.getElementById('qs-warn').textContent.includes(text)",
+            arg=stopped,
+            timeout=8000,
+        )
+    except Exception:
+        c.fail("quick scan: poll", f"the page shows {c.text_of('#qs-warn')!r}, not {stopped!r}")
+    c.step("quick scan: poll stopped", expect=[stopped])
+    polls = asked.count(status_path)
+    page.wait_for_timeout(4500)
+    if asked.count(status_path) != polls or polls != 2:
+        c.fail(
+            "quick scan: poll",
+            f"the status was asked for {asked.count(status_path)} times, expected 2 and then silence",
+        )
     check_shell(c, "quick scan")
 
 
@@ -1169,6 +1580,21 @@ def launch(playwright):
     except Exception:
         # Containers that do not allow Chromium's own sandbox.
         return playwright.chromium.launch(headless=True, args=["--no-sandbox"])
+
+
+# Reports every violation of the Content-Security-Policy to the check. Added by
+# the browser before the page's own scripts; the policy does not apply to it.
+REPORT_VIOLATIONS = """
+document.addEventListener('securitypolicyviolation', e => {
+  window.__policyViolation(JSON.stringify({
+    directive: e.effectiveDirective || e.violatedDirective,
+    blocked: e.blockedURI,
+    sample: e.sample,
+    line: e.lineNumber,
+    page: location.pathname,
+  }));
+});
+"""
 
 
 def main() -> int:
@@ -1182,20 +1608,45 @@ def main() -> int:
     base = f"http://127.0.0.1:{server.server_port}"
 
     failures, steps, errors = [], 0, []
+    violations, console_errors, outside, responses = [], [], [], []
+
+    def on_console(msg):
+        if msg.type != "error":
+            return
+        url = (msg.location or {}).get("url", "")
+        # The browser logs every answer with an error status. The ones this
+        # check asks the stub for are expected; anything else is a finding.
+        if msg.text.startswith("Failed to load resource") and url.startswith(base + "/api/"):
+            if urlsplit(url).path[len("/api/") :] in provoked:
+                return
+        console_errors.append(f"{msg.text[:200]} ({url[len(base) :] or 'no url'})")
+
+    def on_response(response):
+        if response.url.startswith(base):
+            responses.append((urlsplit(response.url), response.status, response.headers))
+
+    def route(route):
+        if route.request.url.startswith(base):
+            route.continue_()
+        else:
+            # Nothing but the stub: the page must not depend on, or talk to, the outside.
+            outside.append(f"{route.request.resource_type} {route.request.url[:120]}")
+            route.abort()
+
     with sync_playwright() as playwright:
         browser = launch(playwright)
         context = browser.new_context()
-        # Nothing but the stub: the page must not depend on, or talk to, the outside.
-        context.route(
-            "**/*",
-            lambda route: (
-                route.continue_() if route.request.url.startswith(base) else route.abort()
-            ),
+        context.expose_binding(
+            "__policyViolation", lambda source, report: violations.append(json.loads(report))
         )
+        context.add_init_script(REPORT_VIOLATIONS)
+        context.route("**/*", route)
+        context.on("response", on_response)
         for check in (check_dashboard, check_roles, check_quick_scan):
             page = context.new_page()
             page.set_default_timeout(4000)
             page.on("dialog", lambda dialog: dialog.accept())
+            page.on("console", on_console)
             page.on(
                 "pageerror",
                 lambda exc, name=check.__name__: errors.append(f"{name}: {str(exc)[:200]}"),
@@ -1215,9 +1666,31 @@ def main() -> int:
     failures += [
         f"no fixture for GET /api/{p}: add one to FIXTURES or PATTERNS" for p in sorted(missing)
     ]
+    failures += [
+        f"the page asked for /api/{p}, which belongs to a removed feature"
+        for p in sorted({p for p in asked if REMOVED.search(p)})
+    ]
+    failures += [f"request to another host: {r}" for r in dict.fromkeys(outside)]
+    failures += [f"error in the browser console: {e}" for e in dict.fromkeys(console_errors)]
+    seen = {}
+    for v in violations:
+        key = (v["page"], v["directive"], v["blocked"], (v["sample"] or "")[:40])
+        seen[key] = seen.get(key, 0) + 1
+    failures += [
+        f"policy violation on {page}: {directive} blocked {blocked or 'inline'}"
+        + (f" ({sample!r})" if sample else "")
+        + (f", {count} times" if count > 1 else "")
+        for (page, directive, blocked, sample), count in seen.items()
+    ]
+    failures += check_headers(responses)
 
     print(f"xss_check: templates {TEMPLATES}")
+    print(f"xss_check: policy {CONTENT_SECURITY_POLICY}")
     print(f"xss_check: {steps} page states inspected, {len(writes)} write requests recorded")
+    print(
+        f"xss_check: {len(violations)} policy violations, {len(console_errors)} console errors, "
+        f"{len(outside)} requests to other hosts"
+    )
     if failures:
         print(f"xss_check: FAILED, {len(failures)} problem(s):")
         for failure in failures:
@@ -1225,6 +1698,32 @@ def main() -> int:
         return 1
     print("xss_check: OK")
     return 0
+
+
+def check_headers(responses) -> list[str]:
+    """Every answer carried the policy; pages and API answers are not stored, static files are."""
+    problems, static_seen = [], set()
+    for url, status, headers in responses:
+        policy, cache = headers.get("content-security-policy"), headers.get("cache-control", "")
+        if policy != CONTENT_SECURITY_POLICY:
+            problems.append(f"{url.path}: Content-Security-Policy is {policy!r}")
+        if url.path.startswith("/static/"):
+            static_seen.add(url.path)
+            if status != 200 or url.query != f"v={__version__}" or cache != STATIC_CACHE_CONTROL:
+                problems.append(f"{url.path}?{url.query}: status {status}, Cache-Control {cache!r}")
+        elif url.path.startswith("/api/") or "text/html" in headers.get("content-type", ""):
+            if cache != "no-store":
+                problems.append(f"{url.path}: Cache-Control is {cache!r}, not no-store")
+    if STATIC.is_dir():
+        expected = {
+            "/static/js/dashboard.js",
+            "/static/js/quick_scan.js",
+            "/static/vendor/jsvectormap/jsvectormap.min.css",
+            "/static/vendor/jsvectormap/jsvectormap.min.js",
+            "/static/vendor/jsvectormap/world.js",
+        }
+        problems += [f"{p} was never loaded" for p in sorted(expected - static_seen)]
+    return list(dict.fromkeys(problems))
 
 
 if __name__ == "__main__":

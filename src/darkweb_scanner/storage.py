@@ -1,6 +1,9 @@
 """
-Storage layer — SQLite (default) or PostgreSQL via SQLAlchemy.
-Stores crawl results, keyword hits, and crawl session metadata.
+Storage layer — PostgreSQL (or SQLite in tests) via SQLAlchemy.
+Stores users, crawl results, keyword hits, investigations and projects.
+
+The schema is versioned with Alembic (see migrations/): a change to a model
+here needs a new revision there.
 """
 
 import json
@@ -31,11 +34,9 @@ class User(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String(100), unique=True, nullable=False)
     email = Column(String(255), unique=True, nullable=True)
-    password_hash = Column(String(255), nullable=True)  # None for OAuth-only users
+    password_hash = Column(String(255), nullable=True)
     totp_secret = Column(String(64), nullable=True)
     totp_enabled = Column(Boolean, default=False)
-    oauth_provider = Column(String(50), nullable=True)  # "google" | "github" | None
-    oauth_id = Column(String(255), nullable=True)
     is_admin = Column(Boolean, default=False)
     must_change_password = Column(Boolean, default=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
@@ -44,7 +45,6 @@ class User(Base):
     __table_args__ = (
         Index("ix_users_username", "username"),
         Index("ix_users_email", "email"),
-        Index("ix_users_oauth", "oauth_provider", "oauth_id"),
     )
 
 
@@ -101,7 +101,12 @@ class CrawlSession(Base):
     seed_urls = Column(Text)  # JSON list
     pages_crawled = Column(Integer, default=0)
     hits_found = Column(Integer, default=0)
-    status = Column(String(50), default="running")  # running | completed | failed
+    status = Column(String(50), default="running")  # running | completed | stopped | failed | interrupted
+    # Written by the process that runs the crawl; a running session whose
+    # heartbeat has gone stale belongs to a process that died.
+    heartbeat_at = Column(DateTime, nullable=True)
+    owner = Column(String(100), nullable=True)  # host:pid of that process
+    error = Column(Text, nullable=True)  # why it failed, in plain words
 
 
 class CrawledPage(Base):
@@ -282,42 +287,6 @@ class ProjectHit(Base):
 
 
 
-# ── Paste Monitor Models ────────────────────────────────────────────────────────
-
-class SeenPaste(Base):
-    __tablename__ = "seen_pastes"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    source = Column(String(50), nullable=False)       # pastebin|rentry|pastesio|controlc|ghostbin
-    paste_id = Column(String(200), nullable=False)
-    url = Column(Text, nullable=False)
-    fetched_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
-    had_hits = Column(Boolean, default=False)
-
-    __table_args__ = (
-        Index("ix_seen_pastes_source_id", "source", "paste_id", unique=True),
-        Index("ix_seen_pastes_fetched", "fetched_at"),
-    )
-
-
-class PasteHit(Base):
-    __tablename__ = "paste_hits"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    paste_id = Column(String(200), nullable=False)
-    url = Column(Text, nullable=False)
-    source = Column(String(50), nullable=False)
-    matched_pattern = Column(String(100), nullable=False)  # pattern name e.g. ph_mobile
-    matched_value = Column(String(500), nullable=True)     # the actual matched string
-    context = Column(Text, nullable=True)
-    found_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
-
-    __table_args__ = (
-        Index("ix_paste_hits_found_at", "found_at"),
-        Index("ix_paste_hits_source", "source"),
-        Index("ix_paste_hits_pattern", "matched_pattern"),
-    )
-
 # ── Custom Intel Models ─────────────────────────────────────────────────────────
 
 class CustomIntel(Base):
@@ -400,21 +369,29 @@ class Storage:
                 "for example postgresql+psycopg2://scanner:<password>@postgres:5432/darkweb_scanner"
             )
         self.database_url = normalise_database_url(database_url)
-        connect_args = {}
+        connect_args: dict = {}
         if self.database_url.startswith("sqlite"):
             connect_args["check_same_thread"] = False
+        elif self.database_url.startswith("postgresql"):
+            # Fail in seconds, not minutes, when PostgreSQL is not answering.
+            connect_args["connect_timeout"] = 10
 
         self.engine = create_engine(
             self.database_url,
             connect_args=connect_args,
             echo=False,
+            # Test a pooled connection before use, so a PostgreSQL restart costs
+            # one reconnect and not a failed request.
+            pool_pre_ping=True,
         )
         self._SessionFactory = sessionmaker(bind=self.engine)
-        self._create_tables()
+        self._migrate()
 
-    def _create_tables(self):
-        Base.metadata.create_all(self.engine, checkfirst=True)
-        logger.info("Database tables ready")
+    def _migrate(self):
+        from . import migrations
+
+        revision = migrations.migrate(self.engine)
+        logger.info("Database schema ready (revision %s)", revision)
 
     @contextmanager
     def get_session(self):
@@ -448,28 +425,194 @@ class Storage:
             session.close()
 
     # --- Crawl Sessions ---
+    # A session with an owner (host:pid) belongs to a crawl. The process that
+    # runs the crawl refreshes heartbeat_at; a running session whose heartbeat
+    # has gone stale is ended as "interrupted" by whoever notices. A session
+    # without an owner (telegram-scan) is written at its start and at its end
+    # only, and is not what the dashboard calls the running crawl.
 
-    def create_crawl_session(self, seed_urls: list[str]) -> int:
+    # Serialises "is a crawl running? then start one" across processes (PostgreSQL).
+    _CRAWL_LOCK_KEY = 7130001
+    # A running session without an owner that is older than this did not end.
+    _UNOWNED_SESSION_MAX_AGE = timedelta(hours=24)
+
+    def create_crawl_session(self, seed_urls: list[str], owner: Optional[str] = None) -> int:
         import json
 
         with self.get_session() as session:
-            record = CrawlSession(seed_urls=json.dumps(seed_urls))
+            record = CrawlSession(
+                seed_urls=json.dumps(seed_urls),
+                status="running",
+                owner=owner,
+                heartbeat_at=_utcnow() if owner else None,
+            )
             session.add(record)
             session.commit()
             session.refresh(record)
             return record.id
 
+    def begin_crawl_session(
+        self, seed_urls: list[str], owner: str, stale_after: float
+    ) -> Optional[int]:
+        """Start a crawl session for ``owner`` unless a crawl is running, in any process.
+
+        Returns the new session id, or None when a crawl is running. Sessions
+        whose heartbeat is older than ``stale_after`` seconds are ended first.
+        Check and insert are one transaction; on PostgreSQL an advisory lock
+        keeps two processes from both passing the check.
+        """
+        import json
+
+        from sqlalchemy import text
+
+        with self.get_session() as session:
+            try:
+                if self.engine.dialect.name == "postgresql":
+                    session.execute(
+                        text("SELECT pg_advisory_xact_lock(:key)"), {"key": self._CRAWL_LOCK_KEY}
+                    )
+                self._interrupt_stale(session, stale_after, None)
+                running = (
+                    session.query(CrawlSession.id)
+                    .filter(CrawlSession.status == "running", CrawlSession.owner.isnot(None))
+                    .first()
+                )
+                if running is not None:
+                    session.commit()
+                    return None
+                record = CrawlSession(
+                    seed_urls=json.dumps(seed_urls),
+                    status="running",
+                    owner=owner,
+                    heartbeat_at=_utcnow(),
+                )
+                session.add(record)
+                session.commit()
+                session.refresh(record)
+                return record.id
+            except Exception:
+                session.rollback()
+                raise
+
+    def heartbeat_crawl_session(
+        self,
+        session_id: int,
+        pages_crawled: Optional[int] = None,
+        hits_found: Optional[int] = None,
+    ) -> bool:
+        """Refresh the heartbeat (and the counters) of a running session.
+
+        False when the session is no longer running: someone ended it, and
+        the crawl that called this should stop.
+        """
+        values: dict = {"heartbeat_at": _utcnow()}
+        if pages_crawled is not None:
+            values["pages_crawled"] = pages_crawled
+        if hits_found is not None:
+            values["hits_found"] = hits_found
+        with self.get_session() as session:
+            updated = (
+                session.query(CrawlSession)
+                .filter(CrawlSession.id == session_id, CrawlSession.status == "running")
+                .update(values, synchronize_session=False)
+            )
+            session.commit()
+            return updated == 1
+
+    def _interrupt_stale(self, session, stale_after: float, idle_owner: Optional[str]) -> int:
+        now = _utcnow()
+        cutoff = now - timedelta(seconds=stale_after)
+        unowned_cutoff = now - self._UNOWNED_SESSION_MAX_AGE
+        changed = 0
+        rows = session.query(CrawlSession).filter(CrawlSession.status == "running").all()
+        for row in rows:
+            still = [CrawlSession.id == row.id, CrawlSession.status == "running"]
+            if row.owner is None:
+                if row.started_at is not None and row.started_at >= unowned_cutoff:
+                    continue
+                reason = "No heartbeat was recorded for this session and it did not end within 24 hours."
+            elif idle_owner is not None and row.owner == idle_owner:
+                reason = "The process that ran this crawl was restarted before the crawl ended."
+            else:
+                beat = row.heartbeat_at or row.started_at
+                if beat is not None and beat >= cutoff:
+                    continue
+                since = beat.strftime("%Y-%m-%d %H:%M:%S UTC") if beat else "its start"
+                reason = (
+                    f"No heartbeat from the crawl process ({row.owner}) since {since}: "
+                    "it was stopped or it crashed."
+                )
+                # Not when a heartbeat arrived in the meantime.
+                still.append((CrawlSession.heartbeat_at.is_(None)) | (CrawlSession.heartbeat_at < cutoff))
+            changed += (
+                session.query(CrawlSession)
+                .filter(*still)
+                .update(
+                    {"status": "interrupted", "ended_at": now, "error": reason},
+                    synchronize_session=False,
+                )
+            )
+        return changed
+
+    def interrupt_stale_crawl_sessions(
+        self, stale_after: float, idle_owner: Optional[str] = None
+    ) -> int:
+        """End, as "interrupted", the running sessions whose process is gone. Returns how many.
+
+        A session is gone when its heartbeat is older than ``stale_after``
+        seconds, or when its owner is ``idle_owner``: the caller's own name,
+        passed only while the caller runs no crawl (a restarted process can
+        get the host:pid of the one before it).
+        """
+        with self.get_session() as session:
+            try:
+                changed = self._interrupt_stale(session, stale_after, idle_owner)
+                session.commit()
+                return changed
+            except Exception:
+                session.rollback()
+                raise
+
     def update_crawl_session(
-        self, session_id: int, pages_crawled: int, hits_found: int, status: str = "completed"
+        self,
+        session_id: int,
+        pages_crawled: int,
+        hits_found: int,
+        status: str = "completed",
+        error: Optional[str] = None,
     ):
+        """Write the end of a session: completed, stopped, failed or interrupted."""
         with self.get_session() as session:
             record = session.get(CrawlSession, session_id)
             if record:
-                record.ended_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 record.pages_crawled = pages_crawled
                 record.hits_found = hits_found
-                record.status = status
+                # A crawl that was already ended as interrupted (its heartbeat
+                # went stale) keeps that status and its reason.
+                if not (record.owner and record.status == "interrupted"):
+                    record.ended_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    record.status = status
+                    record.error = error
                 session.commit()
+
+    def get_last_finished_session(self) -> Optional[dict]:
+        """The most recent session that is not running, or None."""
+        with self.get_session() as session:
+            r = (
+                session.query(CrawlSession)
+                .filter(CrawlSession.status != "running")
+                .order_by(CrawlSession.id.desc())
+                .first()
+            )
+            if r is None:
+                return None
+            return {
+                "id": r.id,
+                "status": r.status,
+                "started_at": r.started_at.isoformat() if r.started_at else None,
+                "ended_at": r.ended_at.isoformat() if r.ended_at else None,
+                "error": r.error,
+            }
 
     # --- Pages ---
 
@@ -941,6 +1084,29 @@ class Storage:
                 record.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 session.commit()
 
+    def fail_investigation(self, investigation_id: int):
+        """An investigation that stopped before it finished."""
+        with self.get_session() as session:
+            record = session.get(Investigation, investigation_id)
+            if record:
+                record.status = "failed"
+                record.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                session.commit()
+
+    def fail_running_investigations(self) -> int:
+        """Mark every investigation still "running" as failed. Returns how many.
+
+        For process start: the jobs live in the dashboard process, so none of
+        them can still be running then.
+        """
+        with self.get_session() as session:
+            rows = session.query(Investigation).filter(Investigation.status == "running").all()
+            for record in rows:
+                record.status = "failed"
+                record.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.commit()
+            return len(rows)
+
     def get_investigations(self, limit: int = 50) -> list[dict]:
         with self.get_session() as session:
             rows = (
@@ -1111,12 +1277,55 @@ class Storage:
                 session.delete(r)
                 session.commit()
 
+    def update_ip_investigation(self, inv_id: int, virustotal_fields: Optional[dict] = None,
+                                status: Optional[str] = None) -> bool:
+        """Merge fields into a lookup's saved VirusTotal data and/or set its status.
+
+        Used for the VirusTotal data that arrives after the lookup was saved.
+        False when the lookup has been deleted in the meantime.
+        """
+        with self.get_session() as session:
+            r = session.get(IPInvestigation, inv_id)
+            if not r:
+                return False
+            if virustotal_fields:
+                try:
+                    vt = json.loads(r.virustotal_data or "{}")
+                except Exception:
+                    vt = {}
+                vt.update(virustotal_fields)
+                r.virustotal_data = json.dumps(vt)
+            if status:
+                r.status = status
+            session.commit()
+            return True
+
+    def close_running_ip_investigations(self, note: str) -> int:
+        """Lookups still waiting for their extra VirusTotal data: mark it skipped. Returns how many.
+
+        For process start: the queue that fetches the data lives in the
+        dashboard process and is empty then.
+        """
+        with self.get_session() as session:
+            rows = session.query(IPInvestigation).filter(IPInvestigation.status == "running").all()
+            for r in rows:
+                try:
+                    vt = json.loads(r.virustotal_data or "{}")
+                except Exception:
+                    vt = {}
+                vt.update({"extras_status": "skipped", "extras_note": note})
+                r.virustotal_data = json.dumps(vt)
+                r.status = "completed"
+            session.commit()
+            return len(rows)
+
 
     def get_active_session(self):
+        """The running crawl (a running session that has an owner), in whichever process, or None."""
         with self.get_session() as session:
             r = (
                 session.query(CrawlSession)
-                .filter(CrawlSession.status == "running")
+                .filter(CrawlSession.status == "running", CrawlSession.owner.isnot(None))
                 .order_by(CrawlSession.started_at.desc())
                 .first()
             )
@@ -1128,6 +1337,8 @@ class Storage:
                 "pages_crawled": r.pages_crawled or 0,
                 "hits_found": r.hits_found or 0,
                 "status": r.status,
+                "owner": r.owner,
+                "heartbeat_at": r.heartbeat_at.isoformat() if r.heartbeat_at else None,
             }
 
     # ── DNS Investigations ──────────────────────────────────────────────────
@@ -1164,6 +1375,20 @@ class Storage:
                 r.status = "error"
                 r.error = error[:500]
                 session.commit()
+
+    def fail_running_dns_investigations(self, error: str) -> int:
+        """Mark every recon still "running" as failed with ``error``. Returns how many.
+
+        For process start: a recon runs on a thread of the dashboard process,
+        so one that was running when the process stopped will never finish.
+        """
+        with self.get_session() as session:
+            rows = session.query(DNSInvestigation).filter(DNSInvestigation.status == "running").all()
+            for r in rows:
+                r.status = "error"
+                r.error = error[:500]
+            session.commit()
+            return len(rows)
 
     def get_dns_investigations(self, limit: int = 50) -> list[dict]:
         with self.get_session() as session:
@@ -1439,83 +1664,6 @@ class Storage:
             }
 
 
-    # ── Paste Monitor ─────────────────────────────────────────────────────────────
-
-    def is_paste_seen(self, source: str, paste_id: str) -> bool:
-        with self.get_session() as session:
-            return session.query(SeenPaste).filter(
-                SeenPaste.source == source,
-                SeenPaste.paste_id == paste_id,
-            ).first() is not None
-
-    def mark_paste_seen(self, source: str, paste_id: str, url: str, had_hits: bool = False):
-        with self.get_session() as session:
-            existing = session.query(SeenPaste).filter(
-                SeenPaste.source == source,
-                SeenPaste.paste_id == paste_id,
-            ).first()
-            if not existing:
-                session.add(SeenPaste(source=source, paste_id=paste_id,
-                                      url=url, had_hits=had_hits))
-                session.commit()
-
-    def save_paste_hit(self, paste_id: str, url: str, source: str,
-                       matched_pattern: str, matched_value: str = None,
-                       context: str = None) -> int:
-        with self.get_session() as session:
-            h = PasteHit(paste_id=paste_id, url=url, source=source,
-                         matched_pattern=matched_pattern,
-                         matched_value=matched_value, context=context)
-            session.add(h)
-            session.commit()
-            session.refresh(h)
-            return h.id
-
-    def get_recent_paste_hits(self, limit: int = 100, source: str = None,
-                               pattern: str = None) -> list[dict]:
-        with self.get_session() as session:
-            q = session.query(PasteHit)
-            if source:
-                q = q.filter(PasteHit.source == source)
-            if pattern:
-                q = q.filter(PasteHit.matched_pattern == pattern)
-            hits = q.order_by(PasteHit.found_at.desc()).limit(limit).all()
-            return [{
-                "id": h.id, "paste_id": h.paste_id, "url": h.url,
-                "source": h.source, "matched_pattern": h.matched_pattern,
-                "matched_value": h.matched_value, "context": h.context,
-                "found_at": h.found_at.isoformat() if h.found_at else None,
-            } for h in hits]
-
-    def get_paste_stats(self) -> dict:
-        with self.get_session() as session:
-            total_hits = session.query(func.count(PasteHit.id)).scalar() or 0
-            total_scanned = session.query(func.count(SeenPaste.id)).scalar() or 0
-            total_with_hits = session.query(func.count(SeenPaste.id)).filter(
-                SeenPaste.had_hits.is_(True)).scalar() or 0
-            by_pattern = (
-                session.query(PasteHit.matched_pattern,
-                              func.count(PasteHit.id).label("count"))
-                .group_by(PasteHit.matched_pattern)
-                .order_by(func.count(PasteHit.id).desc())
-                .all()
-            )
-            by_source = (
-                session.query(PasteHit.source,
-                              func.count(PasteHit.id).label("count"))
-                .group_by(PasteHit.source)
-                .order_by(func.count(PasteHit.id).desc())
-                .all()
-            )
-            return {
-                "total_hits": total_hits,
-                "total_scanned": total_scanned,
-                "total_with_hits": total_with_hits,
-                "by_pattern": [{"pattern": p, "count": c} for p, c in by_pattern],
-                "by_source": [{"source": s, "count": c} for s, c in by_source],
-            }
-
-
     def delete_dns_investigation(self, inv_id: int):
         with self.get_session() as session:
             r = session.get(DNSInvestigation, inv_id)
@@ -1677,3 +1825,22 @@ class Storage:
                 .first()
             )
             return record is not None
+
+    def fail_running_quick_scans(self, error: str) -> int:
+        """Mark every Quick Scan still pending or running as failed. Returns how many.
+
+        For process start: a scan runs on a thread of the dashboard process.
+        Left as it is, it would also block its user's next scan.
+        """
+        with self.get_session() as session:
+            rows = (
+                session.query(QuickScanSession)
+                .filter(QuickScanSession.status.in_(("pending", "running")))
+                .all()
+            )
+            for record in rows:
+                record.status = "failed"
+                record.error_message = error[:500]
+                record.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.commit()
+            return len(rows)

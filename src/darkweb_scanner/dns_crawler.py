@@ -1,26 +1,39 @@
 """
 DNS Crawler — passive + active DNS reconnaissance.
 Sources: dnspython (active), crt.sh (passive CT logs),
-         HackerTarget (passive), ip-api.com (geolocation).
+         HackerTarget (passive), ipwho.is (geolocation, over HTTPS).
 No paid API keys required.
+
+Recon is for public domain names only. A name that is not a public, fully
+qualified domain name is refused (check_public_domain), and so is one that
+resolves to an internal address when the recon starts: inside the Docker
+network a name such as ``postgres`` or ``postgres.<network>`` resolves to a
+container. Addresses that are not public are left out of every result, and no
+reverse lookup is made for them.
+
+Everything that fans out (resolving, probing, port checks) runs on the shared
+pool in dashboard/jobs.py; nothing here starts threads of its own.
 """
 
+import ipaddress
 import json
 import logging
 import re
 import socket
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse
 
-import requests
+from .dashboard import http_client, jobs
+from .dashboard.upstream_cache import TTLCache
 
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 10
 DNS_TIMEOUT = 5
+# How many of one operation's lookups or probes are in the shared pool at a time.
+FAN_OUT = 12
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -66,14 +79,82 @@ def _redirect_target(url: str, location: str, max_len: int) -> str:
     return _clean_text(location, max_len)
 
 
-def _safe_http(url: str, method: str = "get", **kwargs) -> Optional[requests.Response]:
+# ── Public names only ──────────────────────────────────────────────────────────
+
+NOT_PUBLIC = "Enter a public domain name, such as example.com"
+RESOLVES_INTERNALLY = "This name resolves to an address that is not public, so recon was not run"
+
+_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+_TLD_RE = re.compile(r"^([a-z]{2,63}|xn--[a-z0-9-]{1,59})$")
+# Top-level names that are never delegated in the public DNS (RFC 6761, RFC 6762,
+# RFC 8375, ICANN's reserved list) and the ones private networks commonly use.
+_NON_PUBLIC_TLDS = frozenset({
+    "local", "localhost", "localdomain", "internal", "intranet", "private", "lan",
+    "home", "corp", "test", "invalid", "example", "onion", "arpa",
+})
+
+
+class NotPublicName(ValueError):
+    """``message`` is written for the user."""
+
+    def __init__(self, message: str = NOT_PUBLIC):
+        super().__init__(message)
+        self.message = message
+
+
+def check_public_domain(name: str) -> str:
+    """``name`` as a lower-case public FQDN, or NotPublicName.
+
+    Refused: a single label (``postgres``), an IP address, a name under a
+    top-level name that only exists inside private networks, and anything that
+    is not a host name. No DNS query is made; see resolves_internally().
+    """
+    name = str(name or "").strip().lower().rstrip(".")
+    labels = name.split(".")
+    if len(name) > 253 or len(labels) < 2:
+        raise NotPublicName(NOT_PUBLIC)
     try:
-        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
-        kwargs.setdefault("headers", {"User-Agent": "OSINTPH-DNSCrawler/1.0"})
-        return getattr(requests, method)(url, **kwargs)
-    except Exception as e:
-        logger.debug(f"HTTP {method} {url} failed: {e}")
-        return None
+        ipaddress.ip_address(name)
+        raise NotPublicName(NOT_PUBLIC)
+    except ValueError as exc:
+        if isinstance(exc, NotPublicName):
+            raise
+    if not all(_LABEL_RE.match(label) for label in labels):
+        raise NotPublicName(NOT_PUBLIC)
+    if not _TLD_RE.match(labels[-1]) or labels[-1] in _NON_PUBLIC_TLDS:
+        raise NotPublicName(NOT_PUBLIC)
+    return name
+
+
+def _is_public_name(name: str) -> bool:
+    try:
+        check_public_domain(name)
+        return True
+    except NotPublicName:
+        return False
+
+
+def resolves_internally(name: str) -> bool:
+    """True when the resolver this process uses gives ``name`` an address that is not public.
+
+    That resolver also knows the names of the private network the app runs in
+    (Docker's service names, a tailnet). A name with no address at all is not
+    internal: a domain may have no A record.
+    """
+    try:
+        infos = socket.getaddrinfo(name, None)
+    except (OSError, UnicodeError):
+        return False
+    return any(http_client._is_private_ip(info[4][0]) for info in infos)
+
+
+def _public_addresses(values: list) -> list:
+    return [v for v in values if not http_client._is_private_ip(v)]
+
+
+def _under(name: str, domain: str) -> bool:
+    """True for ``domain`` itself and for names below it. ``notexample.com`` is not under ``example.com``."""
+    return name == domain or name.endswith(f".{domain}")
 
 
 # ── Active DNS resolution ──────────────────────────────────────────────────────
@@ -132,20 +213,25 @@ def attempt_zone_transfer(domain: str) -> dict:
     except ImportError:
         return {"error": "dnspython not installed"}
 
-    from darkweb_scanner.dashboard.http_client import _is_private_ip
-
     results = {}
     try:
         ns_answers = dns.resolver.resolve(domain, "NS", lifetime=DNS_TIMEOUT)
         nameservers = [str(rdata.target).rstrip(".") for rdata in ns_answers]
     except Exception as e:
-        return {"error": f"Could not resolve NS records: {e}"}
+        logger.debug("NS lookup for %s failed: %s", domain, e)
+        return {"error": "Could not resolve NS records"}
 
     for ns in nameservers:
+        # The NS name comes from the zone under investigation. One that is not a
+        # public name, or does not have a public address, gets the same answer
+        # whether or not it exists here.
+        if not _is_public_name(ns):
+            results[ns] = {"success": False, "error": "Skipped: not a public name server"}
+            continue
         try:
             ns_ip = socket.gethostbyname(ns)
-            if _is_private_ip(ns_ip):
-                results[ns] = {"success": False, "error": "Blocked: nameserver resolves to a private/reserved IP"}
+            if http_client._is_private_ip(ns_ip):
+                results[ns] = {"success": False, "error": "Skipped: not a public name server"}
                 logger.warning("Zone transfer blocked: %r resolves to private IP %r", ns, ns_ip)
                 continue
             zone = dns.zone.from_xfr(dns.query.xfr(ns_ip, domain, timeout=DNS_TIMEOUT))
@@ -165,13 +251,16 @@ def attempt_zone_transfer(domain: str) -> dict:
             }
             logger.warning(f"ZONE TRANSFER SUCCEEDED on {ns} for {domain}")
         except Exception as e:
-            results[ns] = {"success": False, "error": str(e)}
+            logger.debug("Zone transfer from %s for %s failed: %s", ns, domain, e)
+            results[ns] = {"success": False, "error": "Transfer refused or failed"}
 
     return results
 
 
 def reverse_dns(ip: str) -> Optional[str]:
-    """PTR lookup for an IP."""
+    """PTR lookup for a public IP. No lookup is made for any other address."""
+    if http_client._is_private_ip(ip):
+        return None
     try:
         return socket.gethostbyaddr(ip)[0]
     except Exception:
@@ -195,14 +284,13 @@ def fetch_crtsh(domain: str) -> list[dict]:
     Returns list of subdomains with cert metadata.
     """
     # Use safe_fetch: crt.sh is allowlisted, TLS verified, IP pre-checked.
-    from darkweb_scanner.dashboard.http_client import SafeFetchError, safe_fetch
     try:
-        result = safe_fetch(
-            f"https://crt.sh/?q=%.{domain}&output=json",
+        result = http_client.safe_fetch(
+            "https://crt.sh/?" + urlencode({"q": f"%.{domain}", "output": "json"}),
             headers={"User-Agent": "OSINTPH-DNSCrawler/1.0"},
             timeout=REQUEST_TIMEOUT,
         )
-    except SafeFetchError:
+    except http_client.SafeFetchError:
         return []
     if result["status"] != 200:
         return []
@@ -221,7 +309,7 @@ def fetch_crtsh(domain: str) -> list[dict]:
             name = name.strip().lower().lstrip("*.")
             if not name or name in seen:
                 continue
-            if not name.endswith(domain):
+            if not _under(name, domain):
                 continue
             seen.add(name)
             results.append({
@@ -239,20 +327,37 @@ def fetch_crtsh(domain: str) -> list[dict]:
 
 # ── Passive: HackerTarget DNS lookup ──────────────────────────────────────────
 
+def _hackertarget(tool: str, domain: str) -> Optional[str]:
+    """The text answer of one HackerTarget tool for ``domain``, or None."""
+    try:
+        result = http_client.safe_fetch(
+            f"https://api.hackertarget.com/{tool}/?" + urlencode({"q": domain}),
+            headers={"User-Agent": "OSINTPH-DNSCrawler/1.0"},
+            timeout=REQUEST_TIMEOUT,
+            max_bytes=2 * 1024 * 1024,
+        )
+    except http_client.SafeFetchError as e:
+        logger.debug("HackerTarget %s for %s failed: %s", tool, domain, e)
+        return None
+    if result["status"] != 200:
+        return None
+    return result["body"].decode("utf-8", errors="replace")
+
+
 def fetch_hackertarget(domain: str) -> list[str]:
     """
     HackerTarget free API for subdomain enumeration.
     Returns list of subdomains (free tier: 20 results).
     """
-    resp = _safe_http(f"https://api.hackertarget.com/hostsearch/?q={domain}")
-    if not resp or resp.status_code != 200:
+    text = _hackertarget("hostsearch", domain)
+    if text is None:
         return []
 
     subdomains = []
-    for line in resp.text.splitlines():
+    for line in text.splitlines():
         parts = line.strip().split(",")
-        if parts and parts[0].endswith(domain):
-            subdomains.append(parts[0].strip())
+        if parts and _under(parts[0].strip().lower(), domain):
+            subdomains.append(parts[0].strip().lower())
     return subdomains
 
 
@@ -260,11 +365,11 @@ def fetch_hackertarget(domain: str) -> list[str]:
 
 def fetch_dns_history(domain: str) -> list[dict]:
     """Fetch DNS history from HackerTarget."""
-    resp = _safe_http(f"https://api.hackertarget.com/dnslookup/?q={domain}")
-    if not resp or resp.status_code != 200:
+    text = _hackertarget("dnslookup", domain)
+    if text is None:
         return []
     records = []
-    for line in resp.text.splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if line and not line.startswith("error"):
             records.append({"raw": line})
@@ -273,38 +378,78 @@ def fetch_dns_history(domain: str) -> list[dict]:
 
 # ── Passive: ASN / IP geolocation ─────────────────────────────────────────────
 
+GEO_SOURCE = "ipwho.is"
+GEO_TIMEOUT = 8
+# ipwho.is answers over HTTPS without a key, one address per request, 1,000
+# requests a day. So: an address is asked for once a day at most, a recon asks
+# for at most GEO_MAX_IPS addresses it has not seen, and the process stops
+# asking before the day's allowance is gone.
+GEO_MAX_IPS = 30
+GEO_DAILY_LIMIT = 900
+
+_geo_cache = TTLCache("geolocation", ttl=86400, stale_for=6 * 86400, error_ttl=600, max_entries=5000)
+_geo_window = jobs.RateWindow(GEO_DAILY_LIMIT, per=86400.0)
+
+
+class GeoError(Exception):
+    """The geolocation service gave no usable answer for an address."""
+
+
+def _geolocate_one(ip: str) -> Optional[dict]:
+    """Geolocation of one public address, in the field names the pages and the PDF use."""
+    def fetch():
+        if not _geo_window.try_take():
+            raise GeoError("the daily allowance is used up")
+        result = http_client.safe_fetch(
+            f"https://{GEO_SOURCE}/{quote(ip, safe=':')}",
+            headers={"User-Agent": "OSINTPH-DNSCrawler/1.0"},
+            timeout=GEO_TIMEOUT,
+            max_bytes=65536,
+        )
+        if result["status"] != 200:
+            raise GeoError(f"HTTP {result['status']}")
+        data = json.loads(result["body"])
+        if not isinstance(data, dict) or not data.get("success"):
+            raise GeoError("no data for this address")
+        conn = data.get("connection") if isinstance(data.get("connection"), dict) else {}
+        org = str(conn.get("org") or "")
+        asn = conn.get("asn")
+        return {
+            "status": "success",
+            "country": str(data.get("country") or ""),
+            "countryCode": str(data.get("country_code") or ""),
+            "regionName": str(data.get("region") or ""),
+            "city": str(data.get("city") or ""),
+            "org": org,
+            "as": f"AS{asn} {org}".strip() if asn else "",
+            "isp": str(conn.get("isp") or ""),
+            "query": ip,
+        }
+
+    return _geo_cache.get(ip, fetch)
+
+
 def geolocate_ips(ips: list[str]) -> dict[str, dict]:
     """
-    Bulk geolocate IPs using ip-api.com (free, 100/min limit).
-    Returns dict of ip -> geo data.
+    Geolocate public IPs with ipwho.is (HTTPS, no key).
+    Returns dict of ip -> geo data. Addresses that are not public are not sent
+    anywhere. At most GEO_MAX_IPS addresses that are not in the cache are
+    looked up per call; the rest are left out.
     """
-    if not ips:
-        return {}
-
-    # Batch up to 100
-    batch = ips[:100]
-    resp = _safe_http(
-        "http://ip-api.com/batch",
-        method="post",
-        json=[{"query": ip, "fields": "status,country,countryCode,regionName,city,org,as,isp,query"} for ip in batch],
-    )
-    if not resp or resp.status_code != 200:
-        # Fall back to individual lookups
-        results = {}
-        for ip in batch[:10]:  # limit fallback
-            r = _safe_http(f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,regionName,city,org,as,isp,query")
-            if r and r.status_code == 200:
-                try:
-                    results[ip] = r.json()
-                except Exception:
-                    pass
-        return results
-
-    try:
-        data = resp.json()
-        return {entry.get("query", ""): entry for entry in data if entry.get("status") == "success"}
-    except Exception:
-        return {}
+    found: dict = {}
+    todo = []
+    for ip in dict.fromkeys(ips):
+        if http_client._is_private_ip(ip):
+            continue
+        known = _geo_cache.peek(ip)
+        if known is not None:
+            found[ip] = known
+        elif len(todo) < GEO_MAX_IPS:
+            todo.append(ip)
+    for ip, geo in zip(todo, jobs.fan_out(_geolocate_one, todo, parallel=6, timeout=3 * GEO_TIMEOUT)):
+        if geo:
+            found[ip] = geo
+    return found
 
 
 # ── SPF / DMARC / DKIM analysis ───────────────────────────────────────────────
@@ -375,24 +520,16 @@ def resolve_subdomains(subdomains: list[str], max_workers: int = 20) -> list[dic
     Resolve a list of subdomains to IPs in parallel, then geolocate.
     Private IPs are filtered from results before returning.
     """
-    from darkweb_scanner.dashboard.http_client import _is_private_ip
-
-    resolved = []
-
     def resolve_one(sub: str) -> Optional[dict]:
         ips = resolve_ip(sub)
         if ips:
-            public_ips = [ip for ip in ips if not _is_private_ip(ip)]
+            public_ips = _public_addresses(ips)
             if public_ips:
                 return {"subdomain": sub, "ips": public_ips}
         return None
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(resolve_one, s): s for s in subdomains[:300]}
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                resolved.append(result)
+    found = jobs.fan_out(resolve_one, subdomains[:300], parallel=min(max_workers, FAN_OUT), timeout=90)
+    resolved = [r for r in found if r]
 
     # Geolocate all unique IPs
     all_ips = list({ip for r in resolved for ip in r["ips"]})
@@ -412,7 +549,9 @@ def run_dns_recon(domain: str) -> dict:
     Runs passive (crt.sh, HackerTarget) and active (dnspython) in parallel.
     Returns structured result dict suitable for storage and display.
     """
-    domain = _clean_domain(domain)
+    domain = check_public_domain(_clean_domain(domain))
+    if resolves_internally(domain):
+        raise NotPublicName(RESOLVES_INTERNALLY)
     started_at = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
     logger.info(f"Starting DNS recon for {domain}")
 
@@ -428,33 +567,39 @@ def run_dns_recon(domain: str) -> dict:
     }
 
     # ── Phase 1: parallel passive + active fetch ──
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        f_dns = ex.submit(query_dns_records, domain)
-        f_crtsh = ex.submit(fetch_crtsh, domain)
-        f_ht = ex.submit(fetch_hackertarget, domain)
-        f_axfr = ex.submit(attempt_zone_transfer, domain)
+    phase1 = jobs.call_all({
+        "DNS records": lambda: query_dns_records(domain),
+        "crt.sh": lambda: fetch_crtsh(domain),
+        "HackerTarget": lambda: fetch_hackertarget(domain),
+        "Zone transfer": lambda: attempt_zone_transfer(domain),
+    }, timeout=45)
+    for step, answer in phase1.items():
+        if answer is None:
+            result["errors"].append(f"{step}: no answer in time")
+    result["dns_records"] = phase1["DNS records"] or {}
+    result["subdomains_passive"] = phase1["crt.sh"] or []
+    ht_subs = phase1["HackerTarget"] or []
+    result["zone_transfer"] = phase1["Zone transfer"] or {}
 
-        try:
-            result["dns_records"] = f_dns.result(timeout=15)
-        except Exception as e:
-            result["errors"].append(f"DNS records: {e}")
+    # Address records that are not public are left out: this process's resolver
+    # also answers for the private network it runs in.
+    left_out = 0
+    for rtype in ("A", "AAAA"):
+        values = result["dns_records"].get(rtype, [])
+        public = _public_addresses(values)
+        left_out += len(values) - len(public)
+        if public:
+            result["dns_records"][rtype] = public
+        else:
+            result["dns_records"].pop(rtype, None)
+    if left_out:
+        result["errors"].append(f"{left_out} address record(s) that are not public were left out")
 
-        try:
-            crt_entries = f_crtsh.result(timeout=20)
-            result["subdomains_passive"] = crt_entries
-        except Exception as e:
-            result["errors"].append(f"crt.sh: {e}")
-
-        try:
-            ht_subs = f_ht.result(timeout=15)
-        except Exception as e:
-            ht_subs = []
-            result["errors"].append(f"HackerTarget: {e}")
-
-        try:
-            result["zone_transfer"] = f_axfr.result(timeout=20)
-        except Exception as e:
-            result["errors"].append(f"Zone transfer: {e}")
+    # Geolocate the main IPs first: they come before the subdomains' addresses
+    # in the per-recon allowance of new lookups.
+    main_ips = result["dns_records"].get("A", [])
+    result["ip_geo"] = geolocate_ips(main_ips[:20])
+    result["geo_source"] = GEO_SOURCE
 
     # ── Phase 2: merge + deduplicate subdomains ──
     crt_subs = {e["subdomain"] for e in result["subdomains_passive"]}
@@ -477,8 +622,9 @@ def run_dns_recon(domain: str) -> dict:
         for r in bf_results:
             all_subs.add(r["subdomain"])
         logger.info(f"Brute-force added {len(bf_results)} new subdomains for {domain}")
-    except Exception as e:
-        result["errors"].append(f"Brute-force: {e}")
+    except Exception:
+        logger.exception("Brute-force for %s failed", domain)
+        result["errors"].append("Brute-force: failed")
         result["subdomains_bruteforce"] = []
 
     # ── Phase 3: resolve all subdomains ──
@@ -487,24 +633,27 @@ def run_dns_recon(domain: str) -> dict:
     # ── Phase 4: email security analysis ──
     result["email_security"] = analyze_email_security(domain, result["dns_records"])
 
-    # ── Phase 5: reverse DNS on main A records ──
-    main_ips = result["dns_records"].get("A", [])
-    ptr_records = {}
-    for ip in main_ips[:10]:
-        ptr = reverse_dns(ip)
-        if ptr:
-            ptr_records[ip] = ptr
+    # ── Phase 5: reverse DNS on main A records (public addresses only, see Phase 1) ──
+    ptr_ips = main_ips[:10]
+    ptr_records = {ip: ptr for ip, ptr in zip(ptr_ips, jobs.fan_out(reverse_dns, ptr_ips, parallel=FAN_OUT, timeout=30)) if ptr}
     result["ptr_records"] = ptr_records
 
-    # ── Phase 6: geolocate main IPs ──
-    result["ip_geo"] = geolocate_ips(main_ips[:20])
+    # ── Phase 6: geolocation — done after Phase 1; say so when addresses are missing ──
+    located = set(result["ip_geo"]) | {g.get("query") for r in result["subdomains_resolved"] for g in r.get("geo", []) if g}
+    wanted = set(main_ips[:20]) | {ip for r in result["subdomains_resolved"] for ip in r["ips"]}
+    if wanted - located:
+        result["errors"].append(
+            f"Geolocation: {len(wanted & located)} of {len(wanted)} addresses located "
+            f"(at most {GEO_MAX_IPS} new lookups per recon, or {GEO_SOURCE} did not answer)"
+        )
 
     # ── Phase 7: HTTP banner / service probe ──
     try:
         result["services"] = probe_services(list(all_subs)[:40])
-    except Exception as e:
+    except Exception:
+        logger.exception("Service probe for %s failed", domain)
         result["services"] = {}
-        result["errors"].append(f"Service probe: {e}")
+        result["errors"].append("Service probe: failed")
 
     result["completed_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
     result["subdomain_count"] = len(all_subs)
@@ -582,21 +731,12 @@ def scan_ports(host: str, ports: list[tuple] = None, max_workers: int = 50) -> l
     if ports is None:
         ports = COMMON_PORTS
 
-    results = []
-
     def check(port_svc):
         port, svc = port_svc
         status = scan_port(host, port)
         return {"port": port, "service": svc, "status": status}
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(check, ps): ps for ps in ports}
-        for future in as_completed(futures):
-            try:
-                results.append(future.result())
-            except Exception as e:
-                logger.debug(f"Port scan error: {e}")
-
+    results = [r for r in jobs.fan_out(check, ports, parallel=min(max_workers, FAN_OUT), timeout=120) if r]
     results.sort(key=lambda x: x["port"])
     return results
 
@@ -607,28 +747,18 @@ def scan_ports_multi(hosts: list[str], max_workers: int = 30) -> dict[str, list[
     Returns dict of host -> list of port results.
     Private/reserved IPs are skipped and logged.
     """
-    from darkweb_scanner.dashboard.http_client import _is_private_ip
-
     results = {}
 
     safe_hosts = []
     for h in hosts[:10]:  # cap at 10 hosts
-        if _is_private_ip(h):
+        if http_client._is_private_ip(h):
             logger.warning("scan_ports_multi: skipping private/reserved IP %r", h)
         else:
             safe_hosts.append(h)
 
-    def scan_host(host):
-        return host, scan_ports(host, COMMON_PORTS, max_workers=50)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(scan_host, h): h for h in safe_hosts}
-        for future in as_completed(futures):
-            try:
-                host, port_results = future.result()
-                results[host] = port_results
-            except Exception as e:
-                logger.debug(f"Host scan error: {e}")
+    # One host after the other; each host's ports go through the shared pool.
+    for host in safe_hosts:
+        results[host] = scan_ports(host, COMMON_PORTS, max_workers=max_workers)
 
     return results
 
@@ -680,28 +810,21 @@ def brute_force_subdomains(domain: str, wordlist: list[str] = None, max_workers:
     Actively brute-force subdomains by DNS resolution against a wordlist.
     Returns list of {subdomain, ips} for each that resolves to a public IP.
     """
-    from darkweb_scanner.dashboard.http_client import _is_private_ip
-
     if wordlist is None:
         wordlist = SUBDOMAIN_WORDLIST
 
-    candidates = [f"{word}.{domain}" for word in wordlist]
-    found = []
+    candidates = list(dict.fromkeys(f"{word}.{domain}" for word in wordlist))
 
     def try_resolve(fqdn: str) -> Optional[dict]:
         ips = resolve_ip(fqdn)
         if ips:
-            public_ips = [ip for ip in ips if not _is_private_ip(ip)]
+            public_ips = _public_addresses(ips)
             if public_ips:
                 return {"subdomain": fqdn, "ips": public_ips, "source": "bruteforce"}
         return None
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(try_resolve, c): c for c in candidates}
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                found.append(result)
+    answers = jobs.fan_out(try_resolve, candidates, parallel=min(max_workers, FAN_OUT), timeout=90)
+    found = [r for r in answers if r]
 
     found.sort(key=lambda x: x["subdomain"])
     logger.info(f"Brute-force found {len(found)} subdomains for {domain}")
@@ -762,11 +885,9 @@ def enumerate_directories(
     to a checked address. Redirects are not followed; the Location of a 3xx
     answer is reported as redirect_to.
     """
-    from darkweb_scanner.dashboard.http_client import (
-        SafeFetchError,
-        fetch_public,
-        resolve_and_check_target,
-    )
+    SafeFetchError = http_client.SafeFetchError
+    fetch_public = http_client.fetch_public
+    resolve_and_check_target = http_client.resolve_and_check_target
 
     host = _probe_host(target)
     if not host:
@@ -781,7 +902,6 @@ def enumerate_directories(
     if paths is None:
         paths = DIR_WORDLIST
 
-    results = []
     protocols = ["https", "http"]
     scan_headers = {"User-Agent": "Mozilla/5.0 (compatible; OSINTPH-DirScan/1.0)"}
 
@@ -838,13 +958,7 @@ def enumerate_directories(
             "redirect_to": redirect_to,
         }
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(probe, p): p for p in paths}
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                results.append(result)
-
+    results = [r for r in jobs.fan_out(probe, paths, parallel=min(max_workers, FAN_OUT), timeout=120) if r]
     results.sort(key=lambda x: x["status_code"])
     logger.info(f"Dir enum on {target}: {len(results)} non-404 paths found")
     return results
@@ -875,8 +989,9 @@ def run_port_and_dir_scan(domain: str, ips: list[str]) -> dict:
         try:
             logger.info(f"Directory enumeration on {target}")
             result["dir_enum"][target] = enumerate_directories(target)
-        except Exception as e:
-            result["errors"].append(f"Dir enum {target}: {e}")
+        except Exception:
+            logger.exception("Directory enumeration on %s failed", target)
+            result["errors"].append(f"Dir enum {target}: failed")
 
     result["completed_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
     return result
@@ -905,11 +1020,9 @@ def probe_service(fqdn: str) -> Optional[dict]:
     redirect cannot send the probe to an internal address. Header and title
     text is stored as data, without control characters and capped in length.
     """
-    from darkweb_scanner.dashboard.http_client import (
-        SafeFetchError,
-        fetch_public,
-        resolve_and_check_target,
-    )
+    SafeFetchError = http_client.SafeFetchError
+    fetch_public = http_client.fetch_public
+    resolve_and_check_target = http_client.resolve_and_check_target
 
     host = _probe_host(fqdn)
     if not host:
@@ -992,15 +1105,7 @@ def probe_services(hosts: list[str], max_workers: int = 20) -> dict[str, dict]:
     Probe a list of hostnames in parallel.
     Returns dict of host -> probe result.
     """
-    results = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(probe_service, h): h for h in hosts}
-        for future in as_completed(futures):
-            try:
-                r = future.result()
-                if r:
-                    results[r["host"]] = r
-            except Exception as e:
-                logger.debug(f"Service probe error: {e}")
+    probed = jobs.fan_out(probe_service, hosts, parallel=min(max_workers, FAN_OUT), timeout=120)
+    results = {r["host"]: r for r in probed if r}
     logger.info(f"Service probe complete: {len(results)}/{len(hosts)} hosts responded")
     return results
