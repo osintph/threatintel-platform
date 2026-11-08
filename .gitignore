@@ -66,3 +66,6 @@ fix-report.md
 fix-report.html
 fix/
 release-notes-*.md
+
+# Claude Code local settings (saved approvals can contain secrets)
+.claude/settings.local.json
