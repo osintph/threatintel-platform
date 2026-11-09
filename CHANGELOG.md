@@ -5,29 +5,6 @@ The format follows **Keep a Changelog**. This project adheres to **Semantic Vers
 
 ## [Unreleased]
 
-## [1.4.0] - 2026-11-09
-
-An optional demo instance: the same dashboard and sign-in with its own database, filled with fake data. Nothing starts unless you ask for the `demo` profile, and production behaviour is unchanged.
-
-### Upgrade notes
-
-- Upgrade with `sudo ./upgrade.sh v1.4.0`. No schema change.
-- **`docker-compose.yml` now needs Docker Compose 2.24 or newer** (optional `env_file` entries). Check with `docker compose version` before upgrading.
-- **nginx is recreated** by a full upgrade, as on every release, and now also joins the network `demo_net`.
-- The demo is off by default. To turn it on, see "Demo instance" in `docs/runbook.md`.
-
-### Added
-
-- **Compose profile `demo`:** `demo-dashboard` (the dashboard image) and `demo-postgres`, with their own volumes and network. The network has outbound internet and no route to the production database, Tor or dashboard. Production keyword and seed lists are not mounted.
-- **`scripts/demo-env.sh` (`make demo-env`)** writes `.env.demo`: its own secrets and only the keys for read-only lookups and feeds. Mail, digest, alert and Telegram settings are blank there and again in the compose file, so the demo sends nothing.
-- **`make demo-seed`** (`darkweb_scanner.demo_seed`) replaces the demo data with fake data over the last 90 days: six invented client projects, 25 crawl sessions, 300 keyword hits, investigations, IP lookups, DNS investigations, Quick Scan sessions, custom ransomware groups and threat actors, and analyst accounts with sign-in history. It refuses any database but the demo one, and adds accounts only once an administrator exists, so `/register` stays usable.
-- **Certificate history in demo mode.** With `DEMO_MODE=1`, set only on `demo-dashboard`, `/api/dns/certs/<domain>` answers from the seeded certificates for `.example` domains instead of crt.sh. Without it, and for any other domain, the lookup is the live one as before.
-- **nginx virtual host** for `DEMO_DOMAIN`, with `DEMO_CERT_NAME` to reuse a certificate such as a wildcard. nginx starts and the other sites work when the demo is down.
-
-### Changed
-
-- **`upgrade.sh`** moves a running demo instance to the new image after production is up. A problem there is reported and does not fail the upgrade.
-
 ## [1.3.0] - 2026-11-07
 
 Reliability and clean-up release, from the November 2026 audit: long work runs as limited background jobs, user patterns cannot freeze the process, the crawl's state is in the database, Channel Monitor runs one job at a time within server-side limits, the dashboard has a content security policy, the schema is versioned with Alembic, and unused features are removed.

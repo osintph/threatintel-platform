@@ -1907,35 +1907,29 @@ def api_dns_certs(domain: str):
 
     domain = v.domain(domain.strip().split("/")[0])
 
-    if os.getenv("DEMO_MODE") == "1" and domain.endswith(".example"):
-        # The demo instance's invented domains are not in crt.sh.
-        from ..demo_seed import crtsh_entries
+    # Query crt.sh — use the deduplicated JSON endpoint
+    try:
+        _result = _cached_fetch(
+            ("crt.sh", domain),
+            "https://crt.sh/?" + urlencode({"q": f"%.{domain}", "output": "json"}),
+            headers={"User-Agent": "OSINTPH-DNSCrawler/1.0", "Accept": "application/json"},
+            timeout=30,
+        )
+    except SafeFetchError as e:
+        logger.warning("crt.sh safe_fetch blocked: %s", e)
+        return jsonify({"error": "Certificate transparency lookup failed."}), 502
+    if _result is None:
+        return jsonify({"error": "crt.sh did not answer. Try again in a minute."}), 502
 
-        raw = crtsh_entries(get_storage(), domain)
-    else:
-        # Query crt.sh — use the deduplicated JSON endpoint
-        try:
-            _result = _cached_fetch(
-                ("crt.sh", domain),
-                "https://crt.sh/?" + urlencode({"q": f"%.{domain}", "output": "json"}),
-                headers={"User-Agent": "OSINTPH-DNSCrawler/1.0", "Accept": "application/json"},
-                timeout=30,
-            )
-        except SafeFetchError as e:
-            logger.warning("crt.sh safe_fetch blocked: %s", e)
-            return jsonify({"error": "Certificate transparency lookup failed."}), 502
-        if _result is None:
-            return jsonify({"error": "crt.sh did not answer. Try again in a minute."}), 502
+    if _result["status"] != 200:
+        return jsonify({"error": f"crt.sh returned HTTP {_result['status']}"}), 502
 
-        if _result["status"] != 200:
-            return jsonify({"error": f"crt.sh returned HTTP {_result['status']}"}), 502
-
-        try:
-            raw = _json.loads(_result["body"])
-            if not isinstance(raw, list):
-                raise ValueError("not a JSON list")
-        except Exception:
-            return jsonify({"error": "crt.sh sent an answer that could not be read."}), 502
+    try:
+        raw = _json.loads(_result["body"])
+        if not isinstance(raw, list):
+            raise ValueError("not a JSON list")
+    except Exception:
+        return jsonify({"error": "crt.sh sent an answer that could not be read."}), 502
 
     from datetime import datetime as dt
     now = dt.now(timezone.utc).replace(tzinfo=None)

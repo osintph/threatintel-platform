@@ -82,19 +82,6 @@ users:  ## List accounts and sign-in locks (unlock: see docs/runbook.md)
 db-status:  ## Show the revision of the database schema
 	docker compose exec dashboard python -m darkweb_scanner.main db-status
 
-# ── Demo instance (see docs/runbook.md) ─────────────────────────────────────
-demo-env:  ## Write .env.demo: own secrets, lookup keys only, nothing that sends
-	bash scripts/demo-env.sh
-
-demo-up:  ## Start the demo instance on the current dashboard image
-	docker compose --profile demo up -d --no-build demo-postgres demo-dashboard
-
-demo-seed:  ## Replace the demo data with fresh fake data (refuses any other database)
-	docker compose --profile demo exec -T demo-dashboard python -m darkweb_scanner.demo_seed
-
-demo-stop:  ## Stop the demo instance; its data stays
-	docker compose --profile demo stop demo-dashboard demo-postgres
-
 # ── Maintenance ───────────────────────────────────────────────────────────────
 check-seeds:  ## Show currently configured seed URLs
 	docker compose exec dashboard python -c "from pathlib import Path; f=Path('/app/data/seeds.txt'); print(f.read_text() if f.exists() else 'No seeds in /app/data/seeds.txt — add via dashboard Seeds tab')"
