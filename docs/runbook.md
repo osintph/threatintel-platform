@@ -13,6 +13,7 @@ Day-to-day operations for a production install. Commands are run as root from th
 - [nginx](#nginx)
 - [Certificates](#certificates)
 - [Cloudflare origin lock](#cloudflare-origin-lock)
+- [Demo instance](#demo-instance)
 
 ---
 
@@ -21,7 +22,7 @@ Day-to-day operations for a production install. Commands are run as root from th
 ```bash
 cd /path/to/install
 sudo ./upgrade.sh            # tip of main
-sudo ./upgrade.sh v1.3.0     # a release tag, branch or commit
+sudo ./upgrade.sh v1.4.0     # a release tag, branch or commit
 ```
 
 What it does, in order:
@@ -36,6 +37,8 @@ What it does, in order:
 8. **Checks.** Version and container states, then every URL in `SITE_URLS` (default: `https://DOMAIN/login` and `https://WWW_DOMAIN/`) is requested from this server's own nginx on loopback, under its host name, and must answer 200; the script exits non-zero otherwise. The same URLs are then tried the public way. A server error (5xx) there also fails the run. Any other answer is only reported: Cloudflare, for one, answers requests from the server's own address with a challenge page (403), which says nothing about the site, so open the URL from another machine.
 
 `SERVICES="tor dashboard" sudo ./upgrade.sh` limits steps 7 and 8 to those services.
+
+A [demo instance](#demo-instance) that is running is moved to the new image after step 7. A problem there is reported and does not fail the upgrade.
 
 ### Roll back
 
@@ -301,3 +304,43 @@ The ports are then reachable from any address again. `systemctl start cf-origin-
 ### After a reboot
 
 The unit applies the lock on its own. To confirm: `cf-origin-lock selftest`, then the two checks above.
+
+## Demo instance
+
+A second copy of the dashboard filled with fake data, for showing the product. It is the `demo` profile in `docker-compose.yml` and never starts unless asked: `demo-dashboard` (the dashboard image), `demo-postgres`, their own volumes `demo_pg_data` and `demo_app_data`, and their own network `demo_net`.
+
+- **Isolation.** `demo_net` has normal outbound internet, so the live feeds work, and no route to `postgres`, `tor` or `dashboard`. nginx is on both networks and is the only thing shared. Without Tor, starting a crawl or a Quick Scan in the demo fails with the plain message the product shows when Tor is down.
+- **Secrets.** `.env.demo` (mode 600, not in git) has its own `DASHBOARD_SECRET_KEY`, `POSTGRES_PASSWORD` and `SETUP_TOKEN`. From `.env` it takes only the keys for read-only lookups and feeds: ransomware.live, ThreatFox, OTX, WhiteIntel, VirusTotal, AbuseIPDB, DNSDumpster, HIBP. Mail, digest, alert and Telegram settings are blank in that file and again in `docker-compose.yml`, so the demo sends nothing. The live tabs use your real API quotas.
+- **Production data.** `./config` is not mounted, so production keyword and seed lists stay out.
+
+### Set it up
+
+Needs Docker Compose 2.24 or newer. In `.env` set the host name, and the name of a certificate that covers it if there is one (without it nginx orders a certificate for the name):
+
+```bash
+vi .env                 # DEMO_DOMAIN=demo.example.com   DEMO_CERT_NAME=example.com
+make demo-env           # writes .env.demo; run again after changing a lookup key, the secrets stay
+docker compose up -d --build --no-deps nginx   # short interruption of every site on this server
+make demo-up
+make demo-seed
+```
+
+### First administrator
+
+`/register` works only while the demo has no users, so the first `make demo-seed` adds no accounts.
+
+1. `grep '^SETUP_TOKEN=' .env.demo`
+2. Open `https://DEMO_DOMAIN/register`, enter the token, choose a user name and password, and enrol an authenticator app.
+3. Run `make demo-seed` again. It adds the analyst accounts and their sign-in history and gives the projects and Quick Scan sessions to the first administrator. Quick Scan shows each user only their own sessions.
+
+### Refresh and remove
+
+`make demo-seed` replaces all demo data with the same fake data, dated over the 90 days before the run. Accounts you created stay; the analysts are recreated. It refuses to run unless `DEMO_MODE=1` is set and the database is `darkweb_scanner_demo` on `demo-postgres`. The analysts cannot sign in: their passwords are random and never stored. The data is invented: `.example` domains, documentation IP ranges (RFC 5737), masked passwords, and onion addresses that are valid in form only. Hits name only invented groups.
+
+With `DEMO_MODE=1`, which only `demo-dashboard` has, the DNS tab's certificate history shows the seeded certificates for `.example` domains instead of asking crt.sh. Any other domain gets the live lookup, as in production.
+
+`make demo-stop` stops it and keeps the data. `docker compose --profile demo down -v` would remove every volume of the project, including production's, so never use it. To delete the demo: `make demo-stop`, `docker compose --profile demo rm -f demo-dashboard demo-postgres`, `docker volume rm darkweb-scanner_demo_pg_data darkweb-scanner_demo_app_data`.
+
+### Upgrades and rollback
+
+`upgrade.sh` moves a running demo to the new image once production is up. It does not dump the demo database. The demo upgrades its own schema when it starts. After rolling back to a release with an older schema the demo may not start, because its schema is newer than the code: delete it as above and set it up again.

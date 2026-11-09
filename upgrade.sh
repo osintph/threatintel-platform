@@ -5,7 +5,7 @@
 #
 #  Usage (as root, from the install directory):
 #    sudo ./upgrade.sh              # move to the tip of main
-#    sudo ./upgrade.sh v1.3.0       # move to a release tag, a branch or a commit
+#    sudo ./upgrade.sh v1.4.0       # move to a release tag, a branch or a commit
 #
 #  Optional env:
 #    SERVICES="tor dashboard"   rebuild and recreate only these services
@@ -17,6 +17,9 @@
 #                               in .env); they are also tried the public way
 #    ORIGIN_LOCK=1              install the Cloudflare origin lock if it is not there yet
 #    UPDATE_WWW=1               also move the www submodule to the recorded commit
+#
+#  A demo instance that is running (profile "demo") is moved to the new image at the
+#  end. A problem there is reported and does not fail the upgrade.
 #
 #  What it does, in order: pre-flight checks, database dump, git checkout,
 #  .env fixes and checks, origin lock update, image build, containers recreated one by one
@@ -283,6 +286,35 @@ build_and_start() {
   fi
 }
 
+demo_running() { docker compose --profile demo ps --status running --services 2>/dev/null | grep -qx demo-dashboard; }
+
+# demo-dashboard runs the dashboard image that was just built. Started only if it
+# was running before, and only when the dashboard image was part of this run.
+refresh_demo() { # was-running
+  [[ "$1" == "1" ]] || return 0
+  if [[ -n "${SERVICES:-}" ]]; then
+    local -a wanted
+    read -r -a wanted <<< "$SERVICES"
+    in_list dashboard "${wanted[@]}" || return 0
+  fi
+  info "Moving the demo instance to the new image..."
+  if ! docker compose --profile demo up -d --no-build demo-postgres; then
+    warn "The demo database did not start. Check: docker compose --profile demo logs demo-postgres"
+    return 0
+  fi
+  COMPOSE_PROFILES=demo wait_healthy demo-postgres 90 || warn "demo-postgres is not healthy."
+  if ! docker compose --profile demo up -d --no-deps --no-build demo-dashboard; then
+    warn "The demo dashboard did not start. Check: docker compose --profile demo logs demo-dashboard"
+    return 0
+  fi
+  if COMPOSE_PROFILES=demo wait_healthy demo-dashboard 150; then
+    success "Demo instance is on the new image."
+  else
+    warn "The demo dashboard is not healthy. Check: docker compose --profile demo logs demo-dashboard"
+  fi
+  return 0
+}
+
 final_checks() {
   local domain www urls url host code hdrs bad=0 version
   version="$(docker compose exec -T dashboard python3 -c 'from darkweb_scanner import __version__; print(__version__)' 2>/dev/null || true)"
@@ -350,7 +382,11 @@ main() {
   migrate_env
   remove_paste_cron
   update_origin_lock
+  # Asked before the build: a full run may remove containers it does not know.
+  local demo_was_running=0
+  if demo_running; then demo_was_running=1; fi
   build_and_start
+  refresh_demo "$demo_was_running"
   echo ""
   if final_checks; then
     success "Upgrade complete."

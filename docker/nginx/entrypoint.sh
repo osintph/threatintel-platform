@@ -13,6 +13,10 @@ DOMAIN="${DOMAIN:-}"
 SSL_EMAIL="${SSL_EMAIL:-}"
 WWW_DOMAIN="${WWW_DOMAIN:-}"
 THREATWATCH_DOMAIN="${THREATWATCH_DOMAIN:-}"
+DEMO_DOMAIN="${DEMO_DOMAIN:-}"
+# Name of an existing certificate that covers DEMO_DOMAIN (a wildcard, for example).
+# Empty: the demo gets a certificate of its own, like the other names.
+DEMO_CERT_NAME="${DEMO_CERT_NAME:-}"
 CERT_DIR="${CERT_DIR:-/etc/nginx/certs}"
 LE_LIVE="${LE_LIVE:-/etc/letsencrypt/live}"
 CONF="${NGINX_CONF_OUT:-/etc/nginx/conf.d/darkweb.conf}"
@@ -57,6 +61,7 @@ ensure_all_certs() {
   ensure_cert "" "$DOMAIN"
   [[ -n "$WWW_DOMAIN" ]] && ensure_cert "www-" "$WWW_DOMAIN"
   [[ -n "$THREATWATCH_DOMAIN" ]] && ensure_cert "threatwatch-" "$THREATWATCH_DOMAIN"
+  [[ -n "$DEMO_DOMAIN" ]] && ensure_cert "demo-" "${DEMO_CERT_NAME:-$DEMO_DOMAIN}"
   return 0
 }
 
@@ -78,7 +83,7 @@ lineage_damaged() {
 # loops), so a damaged lineage is only reported, with the command that repairs it.
 warn_damaged_lineages() {
   local d
-  for d in "$DOMAIN" "$WWW_DOMAIN" "$THREATWATCH_DOMAIN"; do
+  for d in "$DOMAIN" "$WWW_DOMAIN" "$THREATWATCH_DOMAIN" "${DEMO_CERT_NAME:-$DEMO_DOMAIN}"; do
     [[ -n "$d" ]] || continue
     lineage_damaged "$d" || continue
     log "WARNING: the certificate files for $d were overwritten by an older version of this script."
@@ -87,9 +92,16 @@ warn_damaged_lineages() {
   return 0
 }
 
+# Names certbot may be asked for. With DEMO_CERT_NAME the demo shares a certificate
+# that is issued elsewhere (a wildcard cannot be ordered through the webroot).
+own_cert_names() {
+  printf '%s\n' "$DOMAIN" "$WWW_DOMAIN" "$THREATWATCH_DOMAIN"
+  [[ -n "$DEMO_CERT_NAME" ]] || printf '%s\n' "$DEMO_DOMAIN"
+}
+
 request_missing_certs() {
   local d
-  for d in "$DOMAIN" "$WWW_DOMAIN" "$THREATWATCH_DOMAIN"; do
+  for d in $(own_cert_names); do
     [[ -n "$d" ]] || continue
     has_le_cert "$d" && continue
     certbot certonly --webroot --webroot-path "$WEBROOT" \
@@ -111,6 +123,54 @@ proxy_headers() {
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Host $host;
         proxy_set_header X-Forwarded-Proto $scheme;
+EOF
+}
+
+# The demo dashboard is optional. The name is a variable, so nginx starts and the
+# other sites work when it is not running; the demo alone then answers 502.
+write_demo_vhost() {
+  cat >> "$CONF" <<EOF
+server {
+    listen 80;
+    server_name ${DEMO_DOMAIN};
+    location /.well-known/acme-challenge/ { root $WEBROOT; }
+    location / { return 301 https://\$host\$request_uri; }
+}
+server {
+    listen 443 ssl;
+    server_name ${DEMO_DOMAIN};
+    ssl_certificate     $CERT_DIR/demo-cert.pem;
+    ssl_certificate_key $CERT_DIR/demo-key.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers $TLS_CIPHERS;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_tickets off;
+    add_header Strict-Transport-Security "max-age=63072000" always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header X-Robots-Tag "noindex, nofollow" always;
+
+    set \$demo_dashboard http://demo-dashboard:8080;
+
+    location /.well-known/acme-challenge/ { root $WEBROOT; }
+    location = /healthz { return 404; }
+
+    location ~ ^/(login|register|totp/verify|totp/setup)\$ {
+        limit_req zone=login burst=10 nodelay;
+        proxy_pass \$demo_dashboard;
+$(proxy_headers)
+        proxy_read_timeout 120s;
+        proxy_connect_timeout 10s;
+    }
+    location / {
+        proxy_pass \$demo_dashboard;
+$(proxy_headers)
+        proxy_read_timeout 120s;
+        proxy_connect_timeout 10s;
+    }
+}
 EOF
 }
 
@@ -320,6 +380,11 @@ server {
 EOF
     log "threatwatch vhost configured for: ${THREATWATCH_DOMAIN}"
   fi
+
+  if [[ -n "$DEMO_DOMAIN" ]]; then
+    write_demo_vhost
+    log "demo vhost configured for: ${DEMO_DOMAIN}"
+  fi
   log "Config written."
 }
 
@@ -330,7 +395,7 @@ if [[ -n "$DOMAIN" && -n "$SSL_EMAIL" ]]; then
   ensure_all_certs
 
   NEED_CERTBOT=false
-  for d in "$DOMAIN" "$WWW_DOMAIN" "$THREATWATCH_DOMAIN"; do
+  for d in $(own_cert_names); do
     [[ -n "$d" ]] && ! has_le_cert "$d" && NEED_CERTBOT=true
   done
 

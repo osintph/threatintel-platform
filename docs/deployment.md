@@ -196,7 +196,7 @@ No additional setup required. Uses free public sources (crt.sh, HackerTarget, ip
 ```bash
 cd ~/threatintel-platform
 sudo ./upgrade.sh            # tip of main
-sudo ./upgrade.sh v1.3.0     # or a release tag
+sudo ./upgrade.sh v1.4.0     # or a release tag
 ```
 
 The script takes a verified database dump, checks out the release, rebuilds and recreates the containers, and checks at the end that nginx answers 200 for each site. The dashboard brings the database schema up to date when it starts. See the [runbook](runbook.md#upgrading) for what each step does and how to roll back.

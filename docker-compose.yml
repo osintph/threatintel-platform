@@ -92,7 +92,7 @@ services:
     # gunicorn, not Flask's development server. Exactly one worker process: the crawl,
     # Quick Scan and Channel Monitor keep their job state in memory. Long requests run
     # in the 8 threads; --timeout only restarts a worker whose main loop has stopped.
-    command:
+    command: &dashboard-command
       - gunicorn
       - --bind=0.0.0.0:8080
       - --workers=1
@@ -122,6 +122,8 @@ services:
       - SSL_EMAIL=${SSL_EMAIL:-}
       - WWW_DOMAIN=${WWW_DOMAIN:-}
       - THREATWATCH_DOMAIN=threatwatch.osintph.info
+      - DEMO_DOMAIN=${DEMO_DOMAIN:-}
+      - DEMO_CERT_NAME=${DEMO_CERT_NAME:-}
     ports:
       - "80:80"
       - "443:443"
@@ -133,6 +135,79 @@ services:
       - ./www-threatwatch:/var/www/threatwatch:ro
     networks:
       - scanner_net
+      # Only so that nginx can reach demo-dashboard. It exists whether or not the demo runs.
+      - demo_net
+
+  # ── Demo instance (optional: docker compose --profile demo) ─────────────────
+  # The same image with its own database, data volume, secrets and network. demo_net
+  # has outbound internet for the live feeds and no route to postgres, tor or dashboard.
+  # See "Demo instance" in docs/runbook.md.
+  demo-postgres:
+    logging: *default-logging
+    image: postgres:16-alpine@sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139
+    restart: unless-stopped
+    profiles:
+      - demo
+    env_file:
+      - path: .env.demo
+        required: false
+    environment:
+      - POSTGRES_DB=darkweb_scanner_demo
+      - POSTGRES_USER=scanner_demo
+    volumes:
+      - demo_pg_data:/var/lib/postgresql/data
+    networks:
+      - demo_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scanner_demo -d darkweb_scanner_demo"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  demo-dashboard:
+    logging: *default-logging
+    image: darkweb-scanner-dashboard
+    pull_policy: never
+    restart: unless-stopped
+    profiles:
+      - demo
+    depends_on:
+      demo-postgres:
+        condition: service_healthy
+    env_file:
+      - path: .env.demo
+        required: false
+    # Set here as well as in .env.demo: whatever that file holds, this instance
+    # sends no mail, alerts or digests and has no Telegram account.
+    environment:
+      - DEMO_MODE=1
+      - SMTP_HOST=
+      - SMTP_USER=
+      - SMTP_PASSWORD=
+      - ALERT_EMAIL_FROM=
+      - ALERT_EMAIL_TO=
+      - ALERT_WEBHOOK_URL=
+      - MAILGUN_API_KEY=
+      - MAILGUN_DOMAIN=
+      - MAILGUN_FROM=
+      - TELEGRAM_API_ID=
+      - TELEGRAM_API_HASH=
+      - TELEGRAM_PHONE=
+      - TELEGRAM_CHANNELS=
+    # No ./config mount: production's keyword and seed lists stay out of the demo.
+    volumes:
+      - demo_app_data:/app/data
+    expose:
+      - "8080"
+    networks:
+      - demo_net
+    command: *dashboard-command
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
 volumes:
   tor_data:
@@ -141,7 +216,11 @@ volumes:
   letsencrypt:
   certbot_webroot:
   pg_data:
+  demo_pg_data:
+  demo_app_data:
 
 networks:
   scanner_net:
+    driver: bridge
+  demo_net:
     driver: bridge

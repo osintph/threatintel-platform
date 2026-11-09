@@ -50,6 +50,9 @@ logs/
 # Docker
 .docker/
 
+# Secrets of the demo instance (scripts/demo-env.sh)
+.env.demo
+
 # Backups
 *.bak
 backups/
