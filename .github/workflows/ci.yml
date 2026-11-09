@@ -11,7 +11,7 @@ jobs:
     name: Lint & Type Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -39,7 +39,7 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -83,7 +83,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -109,7 +109,7 @@ jobs:
     name: Shell scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: shellcheck (deploy, upgrade and ops scripts)
         run: shellcheck -x upgrade.sh ops/cf-origin-lock/cf-origin-lock ops/cf-origin-lock/install.sh docker/nginx/entrypoint.sh docker/tor/entrypoint.sh scripts/update-cloudflare-ips.sh tests/nginx/test_entrypoint.sh tests/tor/test_entrypoint.sh tests/deploy/test_env_secrets.sh tests/upgrade/test_upgrade_steps.sh scripts/restore-test.sh tests/scripts/test_restore_test.sh
@@ -130,7 +130,7 @@ jobs:
     name: Docker Build Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build app image
         run: docker build -f docker/app/Dockerfile -t darkweb-scanner:test .
