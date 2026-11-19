@@ -5,6 +5,18 @@ The format follows **Keep a Changelog**. This project adheres to **Semantic Vers
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-11-20
+
+Security release: the nginx image is rebuilt on nginx 1.31.9, which fixes the NGINX2Root vulnerabilities disclosed on 2026-11-18. Nothing else changes.
+
+### Upgrade notes
+
+- Upgrade with `sudo ./upgrade.sh v1.3.1`, or rebuild only nginx with `SERVICES=nginx sudo ./upgrade.sh v1.3.1`. No database or `.env` change.
+
+### Security
+
+- **nginx 1.31.9 (NGINX2Root).** The nginx base image moves from `nginx:alpine` (nginx 1.31.8) to `nginx:1.31.9-alpine`, still pinned by digest. 1.31.9 fixes CVE-2026-123007, CVE-2026-123633, CVE-2026-123634, CVE-2026-121810 and CVE-2026-113425. The base is now pinned to an explicit version tag rather than the floating `alpine` tag, which still pointed at 1.31.8 when the fixes were published.
+
 ## [1.3.0] - 2026-11-07
 
 Reliability and clean-up release, from the November 2026 audit: long work runs as limited background jobs, user patterns cannot freeze the process, the crawl's state is in the database, Channel Monitor runs one job at a time within server-side limits, the dashboard has a content security policy, the schema is versioned with Alembic, and unused features are removed.

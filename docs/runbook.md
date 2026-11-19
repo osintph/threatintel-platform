@@ -21,7 +21,7 @@ Day-to-day operations for a production install. Commands are run as root from th
 ```bash
 cd /path/to/install
 sudo ./upgrade.sh            # tip of main
-sudo ./upgrade.sh v1.3.0     # a release tag, branch or commit
+sudo ./upgrade.sh v1.3.1     # a release tag, branch or commit
 ```
 
 What it does, in order:

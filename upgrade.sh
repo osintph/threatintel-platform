@@ -5,7 +5,7 @@
 #
 #  Usage (as root, from the install directory):
 #    sudo ./upgrade.sh              # move to the tip of main
-#    sudo ./upgrade.sh v1.3.0       # move to a release tag, a branch or a commit
+#    sudo ./upgrade.sh v1.3.1       # move to a release tag, a branch or a commit
 #
 #  Optional env:
 #    SERVICES="tor dashboard"   rebuild and recreate only these services

@@ -1,5 +1,5 @@
 # Base image pinned by digest; .github/dependabot.yml proposes updates monthly.
-FROM nginx:alpine@sha256:b2f80f8f88146b0772fdcc7d92cea621aa8c2889fa8d07ed61d4884fcea53e09
+FROM nginx:1.31.9-alpine@sha256:90b6bd2aec278b16b98221d64deb1d6d35d164567f507ab0716e6053878315aa
 
 RUN apk add --no-cache openssl certbot certbot-nginx bash
 

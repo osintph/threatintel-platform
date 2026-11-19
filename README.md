@@ -2,7 +2,7 @@
 
 A self-hosted, open-source threat intelligence platform built for the Philippine and Southeast Asian security landscape. Crawls .onion networks, monitors Telegram channels, tracks ransomware groups, profiles threat actors, and delivers a daily intelligence digest — all from a single Docker Compose deployment.
 
-**Version: 1.3.0 · License: AGPL-3.0**
+**Version: 1.3.1 · License: AGPL-3.0**
 
 ---
 
@@ -118,10 +118,12 @@ The script installs Docker, clones the repo, generates secrets (including the on
 ```bash
 cd ~/threatintel-platform
 sudo ./upgrade.sh            # tip of main
-sudo ./upgrade.sh v1.3.0     # or a release tag
+sudo ./upgrade.sh v1.3.1     # or a release tag
 ```
 
 `upgrade.sh` dumps the database first, checks out the release, fixes known `.env` issues (and removes settings that are no longer used, after keeping a copy), rebuilds the images from the lock file, recreates the containers one by one and ends by checking that nginx answers 200 for each site. Details and rollback: [docs/runbook.md](docs/runbook.md#upgrading).
+
+**Upgrading to 1.3.1:** a security release that only rebuilds nginx on nginx 1.31.9 (the NGINX2Root fixes). `SERVICES=nginx sudo ./upgrade.sh v1.3.1` is enough; nothing else changes. See [CHANGELOG.md](CHANGELOG.md).
 
 **Upgrading to 1.3.0:** the database schema is upgraded at the first start (the paste monitor tables and the OAuth columns are dropped; `upgrade.sh` dumps the database first); the paste monitor and the public `/api/digest/subscribe` and `/api/send-brief` endpoints are gone; Channel Monitor runs one job at a time and never asks Telegram for a login code; if its session is not signed in, a job ends with an error that names `make channel-monitor-auth`. See the upgrade notes in [CHANGELOG.md](CHANGELOG.md).
 
